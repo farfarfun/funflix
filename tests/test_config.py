@@ -62,7 +62,7 @@ class TestToAsyncUrl:
 
 
 @pytest.fixture
-def fake_nltsecret(monkeypatch):
+def fake_funsecret(monkeypatch):
     """装一个假的 funsecret 模块，避免测试读到真实密钥库。"""
 
     def install(value, *, raises: Exception | None = None):
@@ -81,31 +81,31 @@ def fake_nltsecret(monkeypatch):
 
 
 class TestResolveDatabaseUrl:
-    def test_uses_value_from_nltsecret(self, fake_nltsecret) -> None:
-        fake_nltsecret("postgresql+asyncpg://u:p@host/db")
+    def test_uses_value_from_funsecret(self, fake_funsecret) -> None:
+        fake_funsecret("postgresql+asyncpg://u:p@host/db")
         assert resolve_database_url() == "postgresql+asyncpg://u:p@host/db"
 
-    def test_falls_back_when_not_configured(self, fake_nltsecret) -> None:
-        fake_nltsecret(None)
+    def test_falls_back_when_not_configured(self, fake_funsecret) -> None:
+        fake_funsecret(None)
         assert resolve_database_url() == DEFAULT_DATABASE_URL
 
-    def test_falls_back_when_value_is_empty(self, fake_nltsecret) -> None:
-        fake_nltsecret("")
+    def test_falls_back_when_value_is_empty(self, fake_funsecret) -> None:
+        fake_funsecret("")
         assert resolve_database_url() == DEFAULT_DATABASE_URL
 
-    def test_falls_back_when_nltsecret_missing(self, monkeypatch) -> None:
+    def test_falls_back_when_funsecret_missing(self, monkeypatch) -> None:
         """没装 funsecret 也要能跑起来 —— 否则"clone 下来直接跑"就不成立。"""
         monkeypatch.setitem(sys.modules, "funsecret", None)
         assert resolve_database_url() == DEFAULT_DATABASE_URL
 
-    def test_falls_back_when_read_secret_raises(self, fake_nltsecret) -> None:
+    def test_falls_back_when_read_secret_raises(self, fake_funsecret) -> None:
         """密钥库损坏不该让整个应用起不来。"""
-        fake_nltsecret(None, raises=RuntimeError("密钥库损坏"))
+        fake_funsecret(None, raises=RuntimeError("密钥库损坏"))
         assert resolve_database_url() == DEFAULT_DATABASE_URL
 
-    def test_does_not_log_full_url(self, fake_nltsecret, caplog) -> None:
+    def test_does_not_log_full_url(self, fake_funsecret, caplog) -> None:
         """URL 可能带账号密码，日志里只该出现方言。"""
-        fake_nltsecret("postgresql+asyncpg://user:secret-password@host/db")
+        fake_funsecret("postgresql+asyncpg://user:secret-password@host/db")
         with caplog.at_level("INFO", logger=config_module.__name__):
             resolve_database_url()
         assert "secret-password" not in caplog.text
@@ -113,35 +113,35 @@ class TestResolveDatabaseUrl:
 
 
 class TestSettingsPrecedence:
-    def test_env_var_wins_over_nltsecret(self, monkeypatch, fake_nltsecret) -> None:
+    def test_env_var_wins_over_funsecret(self, monkeypatch, fake_funsecret) -> None:
         """这个顺序是安全底线：测试/CI 必须能强制指向临时库，
         否则跑一次测试就连到生产库上了。"""
-        fake_nltsecret("postgresql+asyncpg://u:p@prod/db")
+        fake_funsecret("postgresql+asyncpg://u:p@prod/db")
         monkeypatch.setenv("FUNFLIX_DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
         assert Settings().database_url == "sqlite+aiosqlite:///./test.db"
 
-    def test_nltsecret_used_when_env_absent(self, monkeypatch, fake_nltsecret) -> None:
-        fake_nltsecret("postgresql+asyncpg://u:p@host/db")
+    def test_funsecret_used_when_env_absent(self, monkeypatch, fake_funsecret) -> None:
+        fake_funsecret("postgresql+asyncpg://u:p@host/db")
         monkeypatch.delenv("FUNFLIX_DATABASE_URL", raising=False)
 
         assert Settings().database_url == "postgresql+asyncpg://u:p@host/db"
 
-    def test_sync_url_from_nltsecret_is_upgraded(self, monkeypatch, fake_nltsecret) -> None:
+    def test_sync_url_from_funsecret_is_upgraded(self, monkeypatch, fake_funsecret) -> None:
         """密钥库里存的是同步驱动，直接拿来建异步引擎会在运行期才炸。"""
-        fake_nltsecret("postgresql://u:p@host/db")
+        fake_funsecret("postgresql://u:p@host/db")
         monkeypatch.delenv("FUNFLIX_DATABASE_URL", raising=False)
 
         assert Settings().database_url == "postgresql+asyncpg://u:p@host/db"
 
-    def test_sync_url_from_env_is_also_upgraded(self, monkeypatch, fake_nltsecret) -> None:
-        fake_nltsecret(None)
+    def test_sync_url_from_env_is_also_upgraded(self, monkeypatch, fake_funsecret) -> None:
+        fake_funsecret(None)
         monkeypatch.setenv("FUNFLIX_DATABASE_URL", "sqlite:///./x.db")
 
         assert Settings().database_url == "sqlite+aiosqlite:///./x.db"
 
-    def test_is_sqlite_reflects_resolved_url(self, monkeypatch, fake_nltsecret) -> None:
-        fake_nltsecret("postgresql+asyncpg://u:p@host/db")
+    def test_is_sqlite_reflects_resolved_url(self, monkeypatch, fake_funsecret) -> None:
+        fake_funsecret("postgresql+asyncpg://u:p@host/db")
         monkeypatch.delenv("FUNFLIX_DATABASE_URL", raising=False)
         assert Settings().is_sqlite is False
 
