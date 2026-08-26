@@ -229,6 +229,9 @@ def parse_channel_page(html: str, channel: str) -> tuple[list[CollectedMessage],
 
 class TelegramChannelCollector:
     name = "telegram-web-preview-v1"
+    #: 最后问。它的模式能匹配任意裸标识串（"某频道名" 也算命中），
+    #: 先问就会把腾讯文档的 URL 一起抢走。
+    detect_priority = 900
 
     def __init__(self, client: httpx.AsyncClient | None = None, page_delay: float = 1.0) -> None:
         self._client = client

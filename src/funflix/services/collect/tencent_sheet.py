@@ -42,7 +42,7 @@ _API = "https://docs.qq.com/dop-api/opendoc"
 
 #: 从各种写法里取文档 ID：/smartsheet/<id>、/sheet/<id>、/doc/<id>
 #: 只认表格路径。**不能**包含 `/doc/` —— 那是文本文档，
-#: 结构与编码完全不同，由 TencentDocCollector 负责。
+#: 结构与编码完全不同，由 TencentTextCollector 负责。
 _DOC_PATTERNS = (
     re.compile(r"^https?://docs\.qq\.com/(?:smartsheet|sheet)/(?P<id>[A-Za-z0-9]{8,})", re.I),
 )
@@ -61,7 +61,7 @@ _OFFSET_KEY = "tencent_sheet_offsets"
 _TOTAL_KEY = "tencent_sheet_totals"
 
 
-class TencentDocsError(RuntimeError):
+class TencentSheetError(RuntimeError):
     """接口结构与预期不符 —— 多半是腾讯改版了。"""
 
 
@@ -75,22 +75,22 @@ def _decode_smartsheet(payload: dict[str, Any]) -> list[Any]:
             "smartsheet"
         ]
     except (KeyError, IndexError, TypeError) as exc:
-        raise TencentDocsError(f"响应中找不到 smartsheet 字段（接口可能已改版）：{exc}") from exc
+        raise TencentSheetError(f"响应中找不到 smartsheet 字段（接口可能已改版）：{exc}") from exc
 
     try:
         raw = base64.urlsafe_b64decode(blob + "=" * (-len(blob) % 4))
     except Exception as exc:
-        raise TencentDocsError(f"smartsheet 字段不是合法 base64url：{exc}") from exc
+        raise TencentSheetError(f"smartsheet 字段不是合法 base64url：{exc}") from exc
 
     try:
         decompressed = zlib.decompress(raw)
     except zlib.error as exc:
-        raise TencentDocsError(f"smartsheet 数据 zlib 解压失败：{exc}") from exc
+        raise TencentSheetError(f"smartsheet 数据 zlib 解压失败：{exc}") from exc
 
     try:
         return json.loads(decompressed)
     except json.JSONDecodeError as exc:
-        raise TencentDocsError(f"解压后不是合法 JSON：{exc}") from exc
+        raise TencentSheetError(f"解压后不是合法 JSON：{exc}") from exc
 
 
 def parse_page_context(payload: dict[str, Any]) -> dict[str, Any]:
@@ -99,7 +99,7 @@ def parse_page_context(payload: dict[str, Any]) -> dict[str, Any]:
         config = json.loads(payload["clientVars"]["collab_client_vars"]["smartsheetConfig"])
         return json.loads(config["pageCtx"])
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise TencentDocsError(f"读不到 pageCtx：{exc}") from exc
+        raise TencentSheetError(f"读不到 pageCtx：{exc}") from exc
 
 
 def parse_sheet_ids(payload: dict[str, Any]) -> list[str]:
@@ -111,7 +111,7 @@ def parse_sheet_ids(payload: dict[str, Any]) -> list[str]:
         blob = payload["clientVars"]["collab_client_vars"]["smartsheetPermission"]
         rules = json.loads(base64.b64decode(blob + "=" * (-len(blob) % 4)))
     except Exception as exc:
-        raise TencentDocsError(
+        raise TencentSheetError(
             f"读不到 smartsheetPermission 里的 sheet 清单（接口可能已改版）：{exc}"
         ) from exc
 
@@ -122,7 +122,7 @@ def parse_sheet_ids(payload: dict[str, Any]) -> list[str]:
             if sheet_id and sheet_id not in seen:
                 seen.append(sheet_id)
     if not seen:
-        raise TencentDocsError("权限规则里没有任何 sheet_id")
+        raise TencentSheetError("权限规则里没有任何 sheet_id")
     return seen
 
 
@@ -209,8 +209,11 @@ def parse_sheet_chunk(ops: list[Any]) -> tuple[dict[str, str], dict[str, dict[st
     return columns, rows
 
 
-class TencentDocsCollector:
+class TencentSheetCollector:
     name = "tencent-docs-smartsheet-v1"
+    #: 先于文本文档问：智能表格的 URL 形如 /sheet/ 或 /smartsheet/，
+    #: 比文本文档的模式更具体。
+    detect_priority = 10
 
     def __init__(
         self,

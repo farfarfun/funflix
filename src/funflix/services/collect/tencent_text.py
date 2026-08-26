@@ -1,6 +1,11 @@
 """腾讯文档「文本文档」采集器（padType=doc）。
 
-与 smartsheet 采集器是两回事，别混：
+与 `tencent_sheet.py`（智能表格）是两回事，两者同域名但格式毫无共同之处：
+
+> 注意 `SourceType.TENCENT_DOC` 的**枚举值**仍是历史命名 `"tencent_doc"`
+> （表格那个是 `"tencent_docs"`，只差一个 s）。值落在 source 与 raw_document
+> 两张表里，改了库里已有的行就再也匹配不上采集器，那些源会静默停止采集，
+> 所以只改了模块与类名。想让两边一致得配一次数据迁移。
 
 | | smartsheet | doc |
 |---|---|---|
@@ -54,7 +59,7 @@ _STATE_KEY = "tencent_doc_rev"
 _MAX_BLOCK_CHARS = 4000
 
 
-class TencentDocError(RuntimeError):
+class TencentTextError(RuntimeError):
     """响应结构与预期不符 —— 多半是腾讯改版了。"""
 
 
@@ -65,7 +70,7 @@ def extract_plain_text(payload: dict[str, Any]) -> str:
             "commands"
         ]
     except (KeyError, IndexError, TypeError) as exc:
-        raise TencentDocError(f"响应里找不到 commands（接口可能已改版）：{exc}") from exc
+        raise TencentTextError(f"响应里找不到 commands（接口可能已改版）：{exc}") from exc
 
     chunks: list[str] = []
     for command in commands if isinstance(commands, list) else []:
@@ -74,7 +79,7 @@ def extract_plain_text(payload: dict[str, Any]) -> str:
                 chunks.append(mutation["s"])
 
     if not chunks:
-        raise TencentDocError("commands 里没有任何文本内容")
+        raise TencentTextError("commands 里没有任何文本内容")
 
     text = "".join(chunks)
     # 超链接字段码 → 「显示文本 url」，两者都留：显示文本常含剧名
@@ -118,8 +123,10 @@ def split_blocks(text: str, max_chars: int = _MAX_BLOCK_CHARS) -> list[str]:
     return blocks
 
 
-class TencentDocCollector:
+class TencentTextCollector:
     name = "tencent-doc-v1"
+    #: 排在智能表格之后 —— 两者同域名，先问更具体的那个。
+    detect_priority = 20
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client
@@ -173,7 +180,7 @@ class TencentDocCollector:
             # 大文档腾讯会分块返回，而本采集器只发一次请求。
             # 继续跑会拿着半份内容当全量、还推进版本号，属于静默丢数据 ——
             # 宁可显式失败。分块协议尚未逆向，见 docs/DESIGN.md。
-            raise TencentDocError(
+            raise TencentTextError(
                 f"文档 {doc_id} 是分块返回的（isChunked=true），当前采集器只支持单次全量拉取。"
                 f"继续处理会静默丢失内容，故中止。"
             )

@@ -6,7 +6,7 @@
 因此它比 RuleExtractor 更准（年份直接读「年份」列，而不是从文本里正则猜），
 也比 LLM 抽取器便宜无穷倍 —— 十万行表格逐行调模型是纯粹的浪费。
 
-输入约定是采集层渲染的 `列名：值` 格式，见 collect/tencent_docs.py 的 render_row。
+输入约定是采集层渲染的 `列名：值` 格式，见 collect/tencent_sheet.py 的 render_row。
 """
 
 from __future__ import annotations

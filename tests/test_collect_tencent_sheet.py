@@ -10,9 +10,9 @@ import pytest
 from funflix.base.enums import SourceType
 from funflix.models import Source
 from funflix.services.collect.registry import detect_source, supported_source_types
-from funflix.services.collect.tencent_docs import (
-    TencentDocsCollector,
-    TencentDocsError,
+from funflix.services.collect.tencent_sheet import (
+    TencentSheetCollector,
+    TencentSheetError,
     cell_to_text,
     parse_page_context,
     parse_sheet_chunk,
@@ -98,10 +98,10 @@ class TestNormalizeIdentifier:
     )
     def test_extracts_doc_id_ignoring_tab(self, url: str) -> None:
         """一个文档 = 一个 Source：tab 参数不参与身份判定。"""
-        assert TencentDocsCollector.normalize_identifier(url) == DOC_ID
+        assert TencentSheetCollector.normalize_identifier(url) == DOC_ID
 
     def test_rejects_unrelated_url(self) -> None:
-        assert TencentDocsCollector.normalize_identifier("https://example.com/x") is None
+        assert TencentSheetCollector.normalize_identifier("https://example.com/x") is None
 
     def test_registry_detects_tencent_before_telegram(self) -> None:
         """Telegram 的兜底模式能匹配裸标识串，顺序错了会抢走腾讯的 URL。"""
@@ -127,7 +127,7 @@ class TestNormalizeIdentifier:
         然后在三层解码的第一步就炸。
         """
         assert (
-            TencentDocsCollector.normalize_identifier("https://docs.qq.com/doc/DR2xUcFdrSVhJTkZu")
+            TencentSheetCollector.normalize_identifier("https://docs.qq.com/doc/DR2xUcFdrSVhJTkZu")
             is None
         )
         assert detect_source("https://docs.qq.com/doc/DR2xUcFdrSVhJTkZu") == (
@@ -146,7 +146,7 @@ class TestDecoding:
         assert (ctx["ver"], ctx["total_row"]) == (52844, 39466)
 
     def test_parses_columns_and_rows(self) -> None:
-        from funflix.services.collect.tencent_docs import _decode_smartsheet
+        from funflix.services.collect.tencent_sheet import _decode_smartsheet
 
         payload = build_payload(rows={"rAAA": text_row("剧集甲", "https://pan.quark.cn/s/a1")})
         columns, rows = parse_sheet_chunk(_decode_smartsheet(payload))
@@ -156,17 +156,17 @@ class TestDecoding:
 
     def test_broken_structure_raises_instead_of_returning_empty(self) -> None:
         """三层解码任一层变了都要炸 —— 静默返回空列表会被误读成"没有更新"。"""
-        with pytest.raises(TencentDocsError, match="smartsheet"):
+        with pytest.raises(TencentSheetError, match="smartsheet"):
             parse_sheet_ids({"clientVars": {}})
 
     def test_corrupt_payload_raises(self) -> None:
-        from funflix.services.collect.tencent_docs import _decode_smartsheet
+        from funflix.services.collect.tencent_sheet import _decode_smartsheet
 
         broken = build_payload()
         broken["clientVars"]["collab_client_vars"]["initialAttributedText"]["text"][0][
             "smartsheet"
         ] = "not-valid-base64-zlib"
-        with pytest.raises(TencentDocsError):
+        with pytest.raises(TencentSheetError):
             _decode_smartsheet(broken)
 
 
@@ -204,7 +204,7 @@ class TestCellRendering:
         assert "备注" not in rendered
 
 
-def _collector(pages: dict) -> TencentDocsCollector:
+def _collector(pages: dict) -> TencentSheetCollector:
     """按 (tab, startrow) 返回预置 payload。"""
     requests: list[tuple[str | None, int]] = []
 
@@ -215,7 +215,7 @@ def _collector(pages: dict) -> TencentDocsCollector:
         return httpx.Response(200, json=pages.get((tab, start), build_payload(rows={})))
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    collector = TencentDocsCollector(client=client, chunk_delay=0)
+    collector = TencentSheetCollector(client=client, chunk_delay=0)
     collector.requests = requests  # type: ignore[attr-defined]
     return collector
 

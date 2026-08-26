@@ -5,9 +5,9 @@ import pytest
 
 from funflix.base.enums import SourceType
 from funflix.models import Source
-from funflix.services.collect.tencent_doc import (
-    TencentDocCollector,
-    TencentDocError,
+from funflix.services.collect.tencent_text import (
+    TencentTextCollector,
+    TencentTextError,
     extract_plain_text,
     split_blocks,
 )
@@ -79,7 +79,7 @@ class TestExtractPlainText:
         assert extract_plain_text(payload) == "前半后半"
 
     def test_missing_commands_raises(self) -> None:
-        with pytest.raises(TencentDocError, match="commands"):
+        with pytest.raises(TencentTextError, match="commands"):
             extract_plain_text({"clientVars": {}})
 
     def test_no_text_content_raises(self) -> None:
@@ -87,7 +87,7 @@ class TestExtractPlainText:
         payload["clientVars"]["collab_client_vars"]["initialAttributedText"]["text"][0]["commands"][
             0
         ]["mutations"] = [{"ty": "mp"}]
-        with pytest.raises(TencentDocError, match="没有任何文本"):
+        with pytest.raises(TencentTextError, match="没有任何文本"):
             extract_plain_text(payload)
 
 
@@ -113,8 +113,8 @@ class TestSplitBlocks:
         assert split_blocks("") == []
 
 
-def _collector(payload: dict) -> TencentDocCollector:
-    return TencentDocCollector(
+def _collector(payload: dict) -> TencentTextCollector:
+    return TencentTextCollector(
         client=httpx.AsyncClient(
             transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))
         )
@@ -134,14 +134,14 @@ def _source(extra: dict | None = None) -> Source:
 class TestNormalizeIdentifier:
     def test_extracts_doc_id(self) -> None:
         assert (
-            TencentDocCollector.normalize_identifier(f"https://docs.qq.com/doc/{DOC_ID}?dver=")
+            TencentTextCollector.normalize_identifier(f"https://docs.qq.com/doc/{DOC_ID}?dver=")
             == DOC_ID
         )
 
     def test_rejects_smartsheet_url(self) -> None:
         """表格由另一个采集器负责，两者结构完全不同。"""
         assert (
-            TencentDocCollector.normalize_identifier("https://docs.qq.com/smartsheet/DT0xZd3")
+            TencentTextCollector.normalize_identifier("https://docs.qq.com/smartsheet/DT0xZd3")
             is None
         )
 
@@ -173,7 +173,7 @@ class TestFetch:
         继续处理并推进版本号 = 静默丢数据，是最难发现的一类 bug。
         """
         payload = build_payload("剧集甲", chunked=True)
-        with pytest.raises(TencentDocError, match="isChunked"):
+        with pytest.raises(TencentTextError, match="isChunked"):
             await _collector(payload).fetch(_source())
 
     async def test_backfill_is_a_noop(self) -> None:
