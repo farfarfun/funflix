@@ -4,19 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funflix"
-version = "0.1.1"
+version = "0.1.2"
 description = "影视资源分享文本的结构化采集、解析与网盘链接校验"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
-authors = [
-    { name = "牛哥", email = "niuliangtao@qq.com" },
-    { name = "farfarfun", email = "farfarfun@qq.com" },
-]
-maintainers = [
-    { name = "牛哥", email = "niuliangtao@qq.com" },
-    { name = "farfarfun", email = "farfarfun@qq.com" },
-]
+license = "MIT"
 keywords = ["media", "netdisk", "fastapi", "sqlalchemy"]
 classifiers = [
     "Programming Language :: Python :: 3.12",
@@ -42,6 +34,20 @@ dependencies = [
     "nltsecret",
 ]
 
+[[project.maintainers]]
+name = "牛哥"
+email = "niuliangtao@qq.com"
+
+[[project.maintainers]]
+name = "farfarfun"
+email = "farfarfun@qq.com"
+[[project.authors]]
+name = "牛哥"
+email = "niuliangtao@qq.com"
+
+[[project.authors]]
+name = "farfarfun"
+email = "farfarfun@qq.com"
 [project.optional-dependencies]
 pg = ["asyncpg>=0.29"]
 llm = ["anthropic>=0.40"]
@@ -66,7 +72,6 @@ Releases = "https://github.com/farfarfun/funflix/releases"
 packages = ["src/funflix"]
 
 [tool.setuptools]
-license-files = []
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
