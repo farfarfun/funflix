@@ -297,10 +297,20 @@ class TencentSheetCollector:
             for sheet_id in pending:
                 start = offsets[sheet_id]
                 target = totals.get(sheet_id, 0)
+                # 列定义**只随第 0 片下发**，后面每一片都是空的。
+                # 不先取一次的话，补历史渲染出来的每一行都是
+                # `fn99gF：https://...` 这种原始字段 ID —— 抽取器认不出标题列，
+                # 链接全部变成「未归属」。实测线上 482 条未归属资源全部出自这里。
+                columns = await self._sheet_columns(client, doc_id, sheet_id)
+                if columns:
+                    pages += 1
+
                 while pages < budget and start < target:
                     payload = await self._get(client, doc_id, sheet_id, start)
                     pages += 1
-                    columns, rows = parse_sheet_chunk(_decode_smartsheet(payload))
+                    chunk_columns, rows = parse_sheet_chunk(_decode_smartsheet(payload))
+                    # 后续片偶尔也会带列定义（比如中途加了列），合并进来
+                    columns = {**columns, **chunk_columns}
                     if not rows:
                         # 空片：可能是接口抖动，也可能 total_row 不准。
                         # 不当成补完，下轮从同一偏移重试。
@@ -327,6 +337,25 @@ class TencentSheetCollector:
             backfill_cursor=str(sum(offsets.values())),
             backfill_done=not remaining,
         )
+
+    async def _sheet_columns(
+        self, client: httpx.AsyncClient, doc_id: str, sheet_id: str
+    ) -> dict[str, str]:
+        """取一个 sheet 的列定义（字段ID → 列名）。
+
+        列定义只随第 0 片下发，非 0 偏移的片一个都不带。追新路径天然从第 0 片
+        开始所以没事；补历史是从存下来的偏移接着往下扫的，不单独取一次就永远
+        拿不到列名。
+        """
+        try:
+            payload = await self._get(client, doc_id, sheet_id, 0)
+            columns, _ = parse_sheet_chunk(_decode_smartsheet(payload))
+            return columns
+        except Exception as exc:
+            # 拿不到列名不该让整轮补历史失败 —— 退化成原始字段 ID，
+            # 内容仍然入库，只是抽取质量差一些。
+            logger.warning("sheet %s 取列定义失败：%s", sheet_id, exc)
+            return {}
 
     def _to_messages(
         self,

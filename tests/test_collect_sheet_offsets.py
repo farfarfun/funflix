@@ -85,3 +85,118 @@ class TestRunnerReopensBackfill:
 
         await collect_source(session, source, _C())
         assert source.backfill_done is False, "还有没扫到的行，补历史必须重新打开"
+
+
+@pytest.mark.asyncio
+class TestBackfillResolvesColumnNames:
+    """补历史必须自己去取一次列定义。
+
+    列定义只随第 0 片下发，非 0 偏移的片一片都不带（实测 offset=60/120
+    都是 0 个列定义）。追新天然从第 0 片开始所以没事；补历史是从存下来的
+    偏移接着往下扫的，不单独取一次就永远拿不到列名，渲染出来每行都是
+    `fn99gF：https://...` 这种原始字段 ID —— 抽取器认不出标题列，
+    链接全部变成「未归属」。线上 482 条未归属资源全部出自这条路径。
+    """
+
+    async def test_columns_are_fetched_for_backfilled_chunks(self, session) -> None:
+        import base64
+        import json
+        import zlib
+
+        import httpx
+
+        from funflix.base.enums import SourceType
+        from funflix.models import Source
+        from funflix.services.collect.tencent_sheet import _OFFSET_KEY as OK
+        from funflix.services.collect.tencent_sheet import _TOTAL_KEY as TK
+        from funflix.services.collect.tencent_sheet import TencentSheetCollector
+
+        seen_offsets: list[int] = []
+
+        def _payload(start: int) -> dict:
+            """第 0 片带列定义，其余片只有行 —— 与线上实测行为一致。"""
+            ops: list = [{"c": {"k2": {"k1": {f"r{start}": {"k1": {"fAAA": "值"}}}}}}]
+            if start == 0:
+                ops.append({"c": {"k3": {"k3": {"fAAA": {"k30": "剧名"}}}}})
+            blob = base64.urlsafe_b64encode(zlib.compress(json.dumps(ops).encode())).decode()
+            return {
+                "clientVars": {
+                    "collab_client_vars": {
+                        "initialAttributedText": {"text": [{"smartsheet": blob}]}
+                    }
+                }
+            }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            start = int(request.url.params.get("startRow", 0))
+            seen_offsets.append(start)
+            return httpx.Response(200, json=_payload(start))
+
+        collector = TencentSheetCollector(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), chunk_delay=0
+        )
+        source = Source(
+            source_type=SourceType.TENCENT_DOCS,
+            url="https://docs.qq.com/smartsheet/DT0abc",
+            identifier="DT0abc",
+            enabled=True,
+            extra={OK: {"s1": 120}, TK: {"s1": 600}},
+            backfill_pages_per_fetch=2,
+        )
+        session.add(source)
+        await session.commit()
+
+        await collector.backfill(source)
+
+        assert 0 in seen_offsets, (
+            f"补历史没有去取第 0 片的列定义，请求过的偏移={seen_offsets} —— "
+            "拿不到列名，每一行都会渲染成原始字段 ID"
+        )
+
+    async def test_backfilled_rows_render_with_real_column_names(self, session) -> None:
+        """终点判据：落库的文本里是「剧名：」而不是「fAAA：」。"""
+        import base64
+        import json
+        import zlib
+
+        import httpx
+
+        from funflix.base.enums import SourceType
+        from funflix.models import Source
+        from funflix.services.collect.tencent_sheet import _OFFSET_KEY as OK
+        from funflix.services.collect.tencent_sheet import _TOTAL_KEY as TK
+        from funflix.services.collect.tencent_sheet import TencentSheetCollector
+
+        def _payload(start: int) -> dict:
+            ops: list = [{"c": {"k2": {"k1": {f"r{start}": {"k1": {"fAAA": "某剧"}}}}}}]
+            if start == 0:
+                ops.append({"c": {"k3": {"k3": {"fAAA": {"k30": "剧名"}}}}})
+            blob = base64.urlsafe_b64encode(zlib.compress(json.dumps(ops).encode())).decode()
+            return {
+                "clientVars": {
+                    "collab_client_vars": {
+                        "initialAttributedText": {"text": [{"smartsheet": blob}]}
+                    }
+                }
+            }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_payload(int(request.url.params.get("startRow", 0))))
+
+        collector = TencentSheetCollector(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), chunk_delay=0
+        )
+        source = Source(
+            source_type=SourceType.TENCENT_DOCS,
+            url="https://docs.qq.com/smartsheet/DT0abc",
+            identifier="DT0abc",
+            enabled=True,
+            extra={OK: {"s1": 120}, TK: {"s1": 600}},
+            backfill_pages_per_fetch=2,
+        )
+        session.add(source)
+        await session.commit()
+
+        result = await collector.backfill(source)
+        assert result.messages
+        assert "剧名：" in result.messages[0].text, result.messages[0].text
