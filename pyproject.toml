@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funflix"
-version = "0.1.5"
+version = "0.1.6"
 description = "影视资源分享文本的结构化采集、解析与网盘链接校验"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,6 +33,7 @@ dependencies = [
     # 数据库地址与 LLM 凭证都从这里读
     "funsecret",
 ]
+license-files = ["LICENSE"]
 
 [[project.maintainers]]
 name = "牛哥"
