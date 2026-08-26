@@ -38,13 +38,10 @@ def upgrade() -> None:
         "ON media USING gin (norm_key gin_trgm_ops)"
     )
     op.execute(
-        "CREATE INDEX IF NOT EXISTS ix_media_title_trgm "
-        "ON media USING gin (title gin_trgm_ops)"
+        "CREATE INDEX IF NOT EXISTS ix_media_title_trgm ON media USING gin (title gin_trgm_ops)"
     )
     # 标签名也要能模糊搜
-    op.execute(
-        "CREATE INDEX IF NOT EXISTS ix_tag_name_trgm ON tag USING gin (name gin_trgm_ops)"
-    )
+    op.execute("CREATE INDEX IF NOT EXISTS ix_tag_name_trgm ON tag USING gin (name gin_trgm_ops)")
 
 
 def downgrade() -> None:
