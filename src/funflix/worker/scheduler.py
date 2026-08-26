@@ -20,8 +20,9 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.config import Settings, get_settings
@@ -103,6 +104,107 @@ async def stale_summary(session: AsyncSession) -> StaleSummary:
     )
 
 
+@dataclass(slots=True)
+class StageCounts:
+    """一个阶段当前的数据量：待处理 / 处理中 / 已完成。"""
+
+    pending: int = 0
+    running: int = 0
+    done: int = 0
+
+    def group(self) -> str:
+        return f"{self.pending}/{self.running}/{self.done}"
+
+
+@dataclass(slots=True)
+class ProgressSnapshot:
+    """三条队列当前各态数据量的快照，用于运行时心跳打印。"""
+
+    collect: StageCounts = field(default_factory=StageCounts)
+    parse: StageCounts = field(default_factory=StageCounts)
+    verify: StageCounts = field(default_factory=StageCounts)
+
+    def line(self) -> str:
+        return (
+            f"采集[{self.collect.group()}] 解析[{self.parse.group()}] 校验[{self.verify.group()}]"
+        )
+
+
+async def progress_snapshot(session: AsyncSession) -> ProgressSnapshot:
+    """三条队列当前各状态的数据量。只读，供每隔几秒打一行心跳日志用。
+
+    刻意不复用 `services/stats.py::collect_stats` —— 它还会算 extraction/media/
+    resource_orphan 等一堆更重的查询（含一个 NOT EXISTS 子查询），心跳每几秒跑
+    一次，只需要 parse_status / check_status 两个分组，不需要拖上那些。
+    """
+    now = utcnow()
+
+    source_row = (
+        await session.execute(
+            select(
+                func.sum(case((Source.enabled, 1), else_=0)),
+                func.sum(
+                    case(
+                        (
+                            Source.enabled
+                            & Source.lease_until.isnot(None)
+                            & (Source.lease_until > now),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                func.sum(
+                    case(
+                        (
+                            Source.enabled
+                            & or_(Source.lease_until.is_(None), Source.lease_until <= now)
+                            & or_(Source.next_fetch_at.is_(None), Source.next_fetch_at <= now),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+            ).select_from(Source)
+        )
+    ).one()
+    collect_enabled, collect_running, collect_pending = (int(v or 0) for v in source_row)
+
+    async def group(model: Any, column: Any) -> dict[Any, int]:
+        rows = await session.execute(
+            select(column, func.count()).select_from(model).group_by(column)
+        )
+        return {key: value for key, value in rows.all()}
+
+    raw_by_status = await group(RawDocument, RawDocument.parse_status)
+    parse_pending = raw_by_status.get(ParseStatus.PENDING, 0)
+    parse_running = raw_by_status.get(ParseStatus.RUNNING, 0)
+    parse_total = sum(raw_by_status.values())
+
+    resource_by_check = await group(Resource, Resource.check_status)
+    verify_pending = resource_by_check.get(CheckStatus.UNCHECKED, 0)
+    verify_running = resource_by_check.get(CheckStatus.CHECKING, 0)
+    verify_total = sum(resource_by_check.values())
+
+    return ProgressSnapshot(
+        collect=StageCounts(
+            pending=collect_pending,
+            running=collect_running,
+            done=collect_enabled - collect_pending - collect_running,
+        ),
+        parse=StageCounts(
+            pending=parse_pending,
+            running=parse_running,
+            done=parse_total - parse_pending - parse_running,
+        ),
+        verify=StageCounts(
+            pending=verify_pending,
+            running=verify_running,
+            done=verify_total - verify_pending - verify_running,
+        ),
+    )
+
+
 class Worker:
     """把三条队列轮流推进的常驻循环。
 
@@ -166,12 +268,43 @@ class Worker:
             )
         return report
 
+    async def _progress_loop(self, stop: asyncio.Event, interval: int) -> None:
+        """每隔 `interval` 秒打一行心跳：三条队列当前各态的数据量。
+
+        与 `run_once` 的批处理循环完全独立 —— 只读快照，不消费任何任务，
+        跑崩了也不该拖累主循环，异常兜在这里自己重试。
+        """
+        while not stop.is_set():
+            try:
+                async with self._session_factory() as session:
+                    snapshot = await progress_snapshot(session)
+                logger.info("worker 进度：%s", snapshot.line())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("worker 进度查询失败，%ss 后重试", interval)
+
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                pass
+
+    def _spawn_progress_loop(self, stop: asyncio.Event) -> asyncio.Task[None] | None:
+        interval = self.settings.worker_progress_seconds
+        if interval <= 0:
+            return None
+        return asyncio.create_task(
+            self._progress_loop(stop, interval), name="funflix-worker-progress"
+        )
+
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
         """一直跑，直到 `stop` 被置位或任务被取消。"""
         stop = stop or asyncio.Event()
         interval = self.settings.worker_poll_seconds
         await self.startup_check()
         logger.info("worker 启动，轮询间隔 %ss，租约 %s", interval, self._lease)
+
+        progress_task = self._spawn_progress_loop(stop)
 
         while not stop.is_set():
             try:
@@ -189,6 +322,13 @@ class Worker:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except TimeoutError:
                 pass  # 正常的轮询间隔到点
+
+        if progress_task is not None:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
 
         logger.info("worker 已停止")
 

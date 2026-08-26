@@ -129,6 +129,8 @@ class Settings(BaseSettings):
     worker_verify_rate: float = 1.0
     #: 强制使用某个抽取器；留空则按来源类型自动选
     worker_extractor: str | None = None
+    #: 心跳进度日志的打印间隔；<= 0 关闭
+    worker_progress_seconds: int = 5
 
     # --- 摄入 ---
     #: 单次批量提交的最大条数

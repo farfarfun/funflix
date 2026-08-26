@@ -205,6 +205,9 @@ def worker(
     verify_batch: Annotated[int | None, typer.Option(help="每轮校验多少条")] = None,
     collect_batch: Annotated[int | None, typer.Option(help="每轮采集多少个源")] = None,
     extractor: Annotated[str | None, typer.Option(help="强制抽取器，留空按源类型自动选")] = None,
+    progress_interval: Annotated[
+        int | None, typer.Option(help="心跳进度日志间隔秒数，<=0 关闭，覆盖配置")
+    ] = None,
 ) -> None:
     """常驻后台 worker：周期性地采集、解析、校验。
 
@@ -212,6 +215,8 @@ def worker(
     同一条任务不会被两个进程重复处理；进程崩了，租约过期后任务自动回到队列。
     `run` 没有这层保护，只适合手动跑一次。
     """
+    import logging
+
     from funflix.worker import Worker
 
     settings = get_settings().model_copy(
@@ -224,9 +229,14 @@ def worker(
                 "worker_verify_batch": verify_batch,
                 "worker_collect_batch": collect_batch,
                 "worker_extractor": extractor,
+                "worker_progress_seconds": progress_interval,
             }.items()
             if v is not None
         }
+    )
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
     instance = Worker(settings)

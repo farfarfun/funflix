@@ -21,7 +21,7 @@ from funflix.models import Base, LinkCheck, RawDocument, Resource, Source, utcno
 from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS
 from funflix.services.verify.base import CheckOutcome
 from funflix.worker.claim import claim_documents, claim_resources, claim_sources
-from funflix.worker.scheduler import Worker, stale_summary
+from funflix.worker.scheduler import Worker, progress_snapshot, stale_summary
 from funflix.worker.tasks import run_parse_batch, run_verify_batch
 
 # --- 夹具 --------------------------------------------------------------------
@@ -481,6 +481,54 @@ class TestScheduler:
         stop.set()
 
         await asyncio.wait_for(task, timeout=2)
+
+
+class TestProgressSnapshot:
+    """心跳快照：三条队列各态（待处理/处理中/已完成）的数据量。"""
+
+    @pytest.mark.asyncio
+    async def test_counts_each_stage_by_state(self, session) -> None:
+        now = utcnow()
+
+        # 采集：Source 没有状态列，靠 lease_until / next_fetch_at 拼三态
+        session.add(make_source(1))  # 无租约、无 next_fetch_at -> 待处理
+        session.add(make_source(2, lease_until=now + timedelta(minutes=5)))  # 租约未过期 -> 处理中
+        session.add(make_source(3, next_fetch_at=now + timedelta(hours=1)))  # 还没到点 -> 已完成
+        session.add(make_source(4, enabled=False))  # 禁用，不计入任何一档
+
+        # 解析
+        session.add(make_doc(1, parse_status=ParseStatus.PENDING))
+        session.add(make_doc(2, parse_status=ParseStatus.RUNNING))
+        session.add(make_doc(3, parse_status=ParseStatus.DONE))
+        session.add(make_doc(4, parse_status=ParseStatus.FAILED))
+
+        # 校验
+        session.add(make_resource(1, check_status=CheckStatus.UNCHECKED))
+        session.add(make_resource(2, check_status=CheckStatus.CHECKING))
+        session.add(make_resource(3, check_status=CheckStatus.VALID))
+        session.add(make_resource(4, check_status=CheckStatus.INVALID))
+
+        await session.commit()
+
+        snapshot = await progress_snapshot(session)
+
+        assert (snapshot.collect.pending, snapshot.collect.running, snapshot.collect.done) == (
+            1,
+            1,
+            1,
+        )
+        assert (snapshot.parse.pending, snapshot.parse.running, snapshot.parse.done) == (1, 1, 2)
+        assert (snapshot.verify.pending, snapshot.verify.running, snapshot.verify.done) == (
+            1,
+            1,
+            2,
+        )
+        assert snapshot.line() == "采集[1/1/1] 解析[1/1/2] 校验[1/1/2]"
+
+    @pytest.mark.asyncio
+    async def test_empty_db_is_all_zero(self, session) -> None:
+        snapshot = await progress_snapshot(session)
+        assert snapshot.line() == "采集[0/0/0] 解析[0/0/0] 校验[0/0/0]"
 
 
 @pytest.mark.asyncio
