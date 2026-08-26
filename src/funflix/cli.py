@@ -386,6 +386,35 @@ def db_retag(
     _ok("标签重新归类完成")
 
 
+@db_app.command("requeue")
+def db_requeue(
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """把「新支持的网盘」的历史资源放回校验队列。
+
+    落库时还不支持的网盘会被写成 unsupported 且不排复查时间，之后即使加了
+    探针也永远不会被领取 —— 新链接正常校验、老链接静默地一直停在 unsupported。
+    加完探针跑一次这个。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.maintenance import requeue_now_checkable
+    from funflix.services.verify.registry import supported_providers
+
+    _dim("当前可校验：" + ", ".join(p.value for p in supported_providers()))
+    if not yes and not typer.confirm("将把这些网盘的 unsupported 资源改回待校验，继续？"):
+        raise typer.Abort()
+
+    async def _do() -> int:
+        async with session_scope() as session:
+            return await requeue_now_checkable(session)
+
+    count = _run(_do)
+    if count:
+        _ok(f"已重新排队 {count} 条资源")
+    else:
+        typer.echo("没有需要重新排队的资源")
+
+
 @db_app.command("info")
 def db_info() -> None:
     """显示当前连接的数据库（只显示方言，URL 含密码不打印）。"""

@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from funflix.models import Base, Source, Tag, TagKind, media_tag
+from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus
+from funflix.models import Base, Resource, Source, Tag, TagKind, media_tag, utcnow
 from funflix.services.text.normalize import classify_tag
 
 #: 重建时保留的表。采集源是**配置**，不是采集回来的数据。
@@ -144,6 +145,29 @@ async def retag_all(session: AsyncSession) -> RetagReport:
     report.recounted = await recount_tags(session)
     await session.commit()
     return report
+
+
+async def requeue_now_checkable(session: AsyncSession) -> int:
+    """把「新支持的网盘」的历史资源放回校验队列。返回被重新排队的条数。
+
+    落库时不在 `CHECKABLE_PROVIDERS` 里的 provider 会被写成
+    `unsupported` + `next_check_at=NULL`，而领取条件要求 `next_check_at` 到期，
+    所以这些行**永远不会被领取**。
+
+    于是新增一个探针（比如 UC）之后，库里已有的那批链接会静默地一直不被校验 ——
+    新链接正常校验、老链接永远停在 unsupported，很难注意到。
+    加完探针记得跑一次这个，或者 `funflix db requeue`。
+    """
+    result = await session.execute(
+        update(Resource)
+        .where(
+            Resource.check_status == CheckStatus.UNSUPPORTED,
+            Resource.provider.in_(CHECKABLE_PROVIDERS),
+        )
+        .values(check_status=CheckStatus.UNCHECKED, next_check_at=utcnow())
+    )
+    await session.commit()
+    return result.rowcount or 0
 
 
 async def recount_tags(session: AsyncSession) -> int:

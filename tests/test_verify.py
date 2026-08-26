@@ -23,7 +23,7 @@ class TestRegistry:
         assert_registry_matches_enum()
 
     def test_supported_providers(self) -> None:
-        assert supported_providers() == [Provider.ALIPAN, Provider.QUARK]
+        assert supported_providers() == [Provider.ALIPAN, Provider.QUARK, Provider.UC]
 
     def test_unsupported_provider_has_no_probe(self) -> None:
         assert get_probe(Provider.BAIDU) is None

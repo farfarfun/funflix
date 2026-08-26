@@ -8,10 +8,12 @@ from funflix.base.enums import CHECKABLE_PROVIDERS, Provider
 from funflix.services.verify.alipan import AlipanProbe
 from funflix.services.verify.base import LinkProbe
 from funflix.services.verify.quark import QuarkProbe
+from funflix.services.verify.uc import UCProbe
 
 _REGISTRY: dict[Provider, Callable[[], LinkProbe]] = {
     Provider.QUARK: QuarkProbe,
     Provider.ALIPAN: AlipanProbe,
+    Provider.UC: UCProbe,
 }
 
 

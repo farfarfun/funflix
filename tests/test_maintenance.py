@@ -207,3 +207,61 @@ class TestRetag:
         await session.refresh(stale)
         assert stale.kind.value == correct
         assert stale.media_count == 1
+
+
+@pytest.mark.asyncio
+class TestRequeueNowCheckable:
+    """新增探针后，库里已有的那批链接必须能被放回队列。
+
+    落库时不支持的 provider 会写成 unsupported + next_check_at=NULL，
+    而领取条件要求 next_check_at 到期 —— 这些行永远不会被领取。
+    于是加了 UC 探针之后，新的 UC 链接正常校验、老的永远停在 unsupported，
+    两者混在一起很难注意到。
+    """
+
+    async def test_requeues_newly_supported_provider(self, session) -> None:
+        from funflix.base.enums import CheckStatus
+        from funflix.services.maintenance import requeue_now_checkable
+
+        stale = _resource(1)
+        stale.provider = Provider.UC
+        stale.check_status = CheckStatus.UNSUPPORTED
+        stale.next_check_at = None
+        session.add(stale)
+        await session.commit()
+
+        assert await requeue_now_checkable(session) == 1
+        await session.refresh(stale)
+        assert stale.check_status is CheckStatus.UNCHECKED
+        assert stale.next_check_at is not None
+
+    async def test_leaves_still_unsupported_alone(self, session) -> None:
+        """百度还没有探针，不能因为这条命令就被排进队列空转。"""
+        from funflix.base.enums import CheckStatus
+        from funflix.services.maintenance import requeue_now_checkable
+
+        other = _resource(2)
+        other.provider = Provider.BAIDU
+        other.check_status = CheckStatus.UNSUPPORTED
+        other.next_check_at = None
+        session.add(other)
+        await session.commit()
+
+        assert await requeue_now_checkable(session) == 0
+        await session.refresh(other)
+        assert other.check_status is CheckStatus.UNSUPPORTED
+
+    async def test_does_not_disturb_already_checked(self, session) -> None:
+        """已有结论的资源不能被这条命令重置掉。"""
+        from funflix.base.enums import CheckStatus
+        from funflix.services.maintenance import requeue_now_checkable
+
+        done = _resource(3)
+        done.provider = Provider.UC
+        done.check_status = CheckStatus.VALID
+        session.add(done)
+        await session.commit()
+
+        assert await requeue_now_checkable(session) == 0
+        await session.refresh(done)
+        assert done.check_status is CheckStatus.VALID

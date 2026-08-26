@@ -158,3 +158,36 @@ class TestRegisteredProbesUseTheSkeleton:
         for provider in supported_providers():
             probe = get_probe(provider)
             assert isinstance(probe, AnonymousHttpProbe), f"{provider.value} 没走骨架"
+
+
+@pytest.mark.asyncio
+class TestUCReusesQuarkCodes:
+    """UC 与夸克是同一套接口，业务码通用。
+
+    实测（2026-08，pc-api.uc.cn，假分享 ID）返回
+    `{"status":404,"code":41006,"message":"分享不存在"}` ——
+    41006 正是夸克那边的"分享没了"码。所以 UC 直接复用 quark.classify，
+    不另抄一份码表：抄一份就意味着夸克那边加了新码之后，UC 还在把它当未知响应。
+    """
+
+    async def test_gone_code_is_invalid(self) -> None:
+        from funflix.services.verify.uc import UCProbe
+
+        client = _client(
+            lambda r: httpx.Response(404, json={"code": 41006, "message": "分享不存在"})
+        )
+        outcome = await UCProbe(client).check(REF)
+        assert outcome.status is CheckStatus.INVALID
+
+    async def test_unknown_code_is_error(self) -> None:
+        from funflix.services.verify.uc import UCProbe
+
+        client = _client(lambda r: httpx.Response(200, json={"code": 99999, "message": "新情况"}))
+        outcome = await UCProbe(client).check(REF)
+        assert outcome.status is CheckStatus.ERROR
+
+    async def test_shares_the_quark_code_table(self) -> None:
+        """两者用的是同一个 classify 函数对象，不是两份内容相同的副本。"""
+        from funflix.services.verify import quark, uc
+
+        assert uc.quark_classify is quark.classify
