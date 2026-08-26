@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from funflix.base.backoff import backoff
 from funflix.base.enums import CheckStatus, Provider
 from funflix.models import LinkCheck, Resource, utcnow
+from funflix.services.counters import refresh_for_resource
 from funflix.services.verify.base import CheckOutcome, LinkProbe, LinkRef
 from funflix.services.verify.registry import get_probe
 
@@ -152,14 +153,22 @@ async def check_resource(
         # 让一条早已失效的链接被永远复查下去。
         resource.check_attempts += 1
     else:
-        resource.check_attempts = (
-            resource.check_attempts + 1 if outcome.status is baseline else 1
-        )
+        resource.check_attempts = resource.check_attempts + 1 if outcome.status is baseline else 1
     resource.check_status = outcome.status
     resource.last_checked_at = now
     resource.next_check_at = _next_check_at(resource, outcome)
     if outcome.title and not resource.title_raw:
         resource.title_raw = outcome.title[:512]
+
+    # 链接的「可用性」变了，挂着它的作品的 valid_resource_count 就得跟着变。
+    # 一条链接可能属于多部作品（合集），所以按 resource 反查全部关联作品。
+    #
+    # 比较基准用 baseline 而不是 before：worker 领取时 before 已经是 checking
+    # 占位，拿它比会让「原本 valid、这次判定失效」算成「没变化」而跳过重算，
+    # 计数就永远停在旧值 —— 恰恰是最需要更新的那种情况。
+    if (outcome.status is CheckStatus.VALID) != (baseline is CheckStatus.VALID):
+        await session.flush()
+        await refresh_for_resource(session, resource.id)
 
     return VerifyReport(
         resource_id=resource.id,

@@ -85,83 +85,42 @@ def status(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="展开采集源明细")] = False,
 ) -> None:
     """查看流水线各环节的记录数。"""
-    from sqlalchemy import func, select
+    from sqlalchemy import select
 
     from funflix.base.db import session_scope
-    from funflix.models import (
-        Extraction,
-        LinkCheck,
-        Media,
-        RawDocument,
-        Resource,
-        Source,
-        media_resource,
-    )
+    from funflix.models import Source
+    from funflix.services.stats import PipelineStats, collect_stats
 
-    async def _fetch() -> dict:
+    async def _fetch() -> tuple[PipelineStats, list[Source]]:
         async with session_scope() as session:
+            stats = await collect_stats(session)
+            # 明细只有 --verbose 才用得到，不值得塞进 collect_stats 的返回里
+            sources = list(await session.scalars(select(Source).order_by(Source.id)))
+            return stats, sources
 
-            async def count(model, *conditions) -> int:
-                stmt = select(func.count()).select_from(model)
-                if conditions:
-                    stmt = stmt.where(*conditions)
-                return await session.scalar(stmt) or 0
-
-            async def group(model, column) -> dict:
-                rows = await session.execute(
-                    select(column, func.count()).select_from(model).group_by(column)
-                )
-                return dict(rows.all())
-
-            return {
-                "sources_total": await count(Source),
-                "sources_enabled": await count(Source, Source.enabled),
-                "sources_failing": await count(Source, Source.consecutive_failures > 0),
-                "sources": list(await session.scalars(select(Source).order_by(Source.id))),
-                "raw_total": await count(RawDocument),
-                "raw_by_status": await group(RawDocument, RawDocument.parse_status),
-                "extraction_total": await count(Extraction),
-                "extraction_by_extractor": await group(Extraction, Extraction.model),
-                "media_total": await count(Media),
-                "media_by_type": await group(Media, Media.media_type),
-                "resource_total": await count(Resource),
-                "resource_by_check": await group(Resource, Resource.check_status),
-                "resource_by_provider": await group(Resource, Resource.provider),
-                # 未归属 = 在关联表里没有任何作品指向它
-                "resource_orphan": await count(
-                    Resource,
-                    ~select(media_resource.c.resource_id)
-                    .where(media_resource.c.resource_id == Resource.id)
-                    .exists(),
-                ),
-                "media_resource_total": await count(media_resource),
-                "check_total": await count(LinkCheck),
-            }
-
-    data = _run(_fetch)
+    data, sources = _run(_fetch)
     _dim(f"数据库 {get_settings().database_url.split('://', 1)[0]}\n")
 
     def section(index: int, name: str, total: int, note: str = "") -> None:
         _heading(f"{index}. {name}")
         typer.echo(f"   总数 {total}" + (f"   {note}" if note else ""))
 
-    def breakdown(counts: dict, highlight: set[str] | None = None) -> None:
+    def breakdown(counts: dict[str, int], highlight: set[str] | None = None) -> None:
         if not counts:
             _dim("   （无记录）")
             return
-        for key, value in sorted(counts.items(), key=lambda kv: -kv[1]):
-            label = getattr(key, "value", str(key))
+        for label, value in sorted(counts.items(), key=lambda kv: -kv[1]):
             color = typer.colors.YELLOW if highlight and label in highlight else None
             typer.secho(f"     {label:<14} {value}", fg=color)
 
     section(
         1,
         "采集源 source",
-        data["sources_total"],
-        f"启用 {data['sources_enabled']}   连续失败 {data['sources_failing']}",
+        data.sources_total,
+        f"启用 {data.sources_enabled}   连续失败 {data.sources_failing}",
     )
-    if verbose and data["sources"]:
-        for s in data["sources"]:
+    if verbose and sources:
+        for s in sources:
             typer.echo(
                 f"     #{s.id} {s.source_type.value}/{s.identifier}  "
                 f"水位 {s.cursor_message_id or '-'}  已采 {s.total_collected}  "
@@ -169,30 +128,30 @@ def status(
             )
     typer.echo()
 
-    section(2, "原始文本 raw_document", data["raw_total"])
-    breakdown(data["raw_by_status"], {ParseStatus.FAILED.value, ParseStatus.PENDING.value})
+    section(2, "原始文本 raw_document", data.raw_total)
+    breakdown(data.raw_by_status, {ParseStatus.FAILED.value, ParseStatus.PENDING.value})
     typer.echo()
 
-    section(3, "抽取留档 extraction", data["extraction_total"])
-    breakdown(data["extraction_by_extractor"])
+    section(3, "抽取留档 extraction", data.extraction_total)
+    breakdown(data.extraction_by_model)
     typer.echo()
 
-    section(4, "作品 media", data["media_total"])
-    breakdown(data["media_by_type"])
+    section(4, "作品 media", data.media_total)
+    breakdown(data.media_by_type)
     typer.echo()
 
     section(
         5,
         "资源 resource",
-        data["resource_total"],
-        f"未归属作品 {data['resource_orphan']}   作品↔资源关联 {data['media_resource_total']}",
+        data.resource_total,
+        f"未归属作品 {data.resource_orphan}   作品↔资源关联 {data.media_resource_total}",
     )
-    breakdown(data["resource_by_check"], {CheckStatus.INVALID.value, CheckStatus.ERROR.value})
+    breakdown(data.resource_by_check, {CheckStatus.INVALID.value, CheckStatus.ERROR.value})
     _dim("   按网盘：")
-    breakdown(data["resource_by_provider"])
+    breakdown(data.resource_by_provider)
     typer.echo()
 
-    section(6, "校验历史 link_check", data["check_total"])
+    section(6, "校验历史 link_check", data.check_total)
 
 
 # --- run ---------------------------------------------------------------------

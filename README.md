@@ -21,10 +21,11 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 | M0 采集源 + Telegram 采集器 + 水位 | ✅ 已完成 |
 | M1 数据模型 + 迁移 + 原始文本接口 | ✅ 已完成 |
 | M2 链接扫描 + 文本分段 + 剧名归一 | ✅ 已完成 |
-| M3 LLM 抽取 | 待开发 |
-| M4 网盘校验（夸克 / 阿里云盘，匿名探针） | 待开发 |
-| M5 worker 租约 + 启动补偿 | 待开发 |
-| M6 查询接口 | 待开发 |
+| M3 LLM 抽取 | ✅ 已完成 |
+| M4 网盘校验（夸克 / 阿里云盘，匿名探针） | ✅ 已完成 |
+| M5 worker 租约 + 常驻调度 | ✅ 已完成 |
+| M6 查询接口 | ✅ 已完成（SQLite 走 LIKE，FTS5 后端待补） |
+| M7 其余网盘探针、admin 接口鉴权 | 待开发 |
 
 ## 快速开始
 
@@ -77,6 +78,39 @@ funflix serve --reload
 | `POST` | `/api/v1/raw/bulk` | 批量提交 |
 | `GET` | `/api/v1/raw` | 按状态 / 来源翻页，不返回全文 |
 | `GET` | `/api/v1/raw/{id}` | 详情，含全文 |
+
+### 查询
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/media` | 搜索 / 浏览作品，支持 `keyword`、`media_type`、`year`、`valid_only` 与翻页 |
+| `GET` | `/api/v1/media/{id}` | 作品详情，含全部网盘资源与标签 |
+| `GET` | `/api/v1/resources` | 按 `provider` / `check_status` 翻页看链接 |
+| `GET` | `/api/v1/resources/{id}` | 单条资源 |
+| `GET` | `/api/v1/stats` | 流水线各环节记录数与分布（`funflix status` 的 HTTP 版）|
+
+`/media` 的关键词匹配走 `services/search.py` 的后端抽象：PostgreSQL 上用 `pg_trgm`
+容错匹配并按相似度排序，其余方言回落 `LIKE`，调用方无感知。
+
+> ⚠️ DESIGN §7.3 还规划了 `SqliteFtsBackend`（FTS5 虚拟表），目前**尚未实现**。
+> 也就是说 SQLite 部署上关键词搜索仍是 `LIKE %x%` 全表扫描 —— 几千条无所谓，
+> 上万条就会明显变慢。数据量起来之前先用 PostgreSQL，或者补上 FTS5 后端。
+
+### 鉴权
+
+写接口（`POST`/`PATCH`/`DELETE /sources`、`/sources/{id}/collect`）需要 `X-API-Key`：
+
+```bash
+export FUNFLIX_ADMIN_API_KEY=$(openssl rand -hex 32)
+curl -X POST localhost:8000/api/v1/sources \
+     -H "X-API-Key: $FUNFLIX_ADMIN_API_KEY" \
+     -d '{"url": "https://t.me/s/某频道"}'
+```
+
+未配置该变量时管理接口一律返回 403（默认关闭比默认放行安全）。CLI 不走 HTTP，不受影响。
+
+> ⚠️ 查询接口目前仍是开放的，其中 `/resources` 会成页返回网盘链接与**提取码**，
+> 整库可在 `总数/200` 次请求内翻完。要暴露到公网的话，先给它也加上鉴权或限流。
 
 ## 设计要点
 

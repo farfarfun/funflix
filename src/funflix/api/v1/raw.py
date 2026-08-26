@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
-from funflix.api.deps import SessionDep, SettingsDep
+from funflix.api.deps import PageDep, SessionDep, SettingsDep
 from funflix.base.enums import ParseStatus, SourceType
 from funflix.models import RawDocument
 from funflix.schemas.raw import (
@@ -89,11 +89,10 @@ async def create_raw_documents(
 @router.get("", response_model=Page[RawDocumentSummary])
 async def list_raw_documents(
     session: SessionDep,
+    paging: PageDep,
     parse_status: ParseStatus | None = None,
     source_type: SourceType | None = None,
     source_name: str | None = None,
-    page: int = Query(default=1, ge=1),
-    size: int = Query(default=20, ge=1, le=200),
 ) -> Page[RawDocumentSummary]:
     """按状态 / 来源翻页查看原始文本，不返回全文。"""
     conditions = []
@@ -109,14 +108,14 @@ async def list_raw_documents(
         select(RawDocument)
         .where(*conditions)
         .order_by(RawDocument.id.desc())
-        .offset((page - 1) * size)
-        .limit(size)
+        .offset(paging.offset)
+        .limit(paging.size)
     )
     return Page[RawDocumentSummary](
         items=[RawDocumentSummary.model_validate(r) for r in rows],
         total=total or 0,
-        page=page,
-        size=size,
+        page=paging.page,
+        size=paging.size,
     )
 
 

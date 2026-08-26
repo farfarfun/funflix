@@ -43,6 +43,8 @@ class SearchBackend(Protocol):
 
     async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]: ...
 
+    async def count(self, session: AsyncSession, query: SearchQuery) -> int: ...
+
 
 def _apply_filters(stmt: Select, query: SearchQuery) -> Select:
     """非关键词的筛选条件，两个后端共用。"""
@@ -70,17 +72,36 @@ class LikeSearchBackend:
 
     name = "like"
 
+    def _keyword_clause(self, query: SearchQuery):
+        """关键词条件；无关键词时返回 None。search 与 count 共用。
+
+        用 `icontains(autoescape=True)` 而不是手拼 `ilike(f"%{kw}%")` ——
+        后者会把用户输入里的 `%` 和 `_` 当成通配符：搜 `%` 命中全表，
+        搜 `S01_1080p` 里的下划线能匹配任意字符。分享标题里这两个符号很常见。
+        """
+        if not query.keyword:
+            return None
+        key = norm_key(query.keyword)
+        conditions = [Media.title.icontains(query.keyword, autoescape=True)]
+        if key:
+            conditions.append(Media.norm_key.icontains(key, autoescape=True))
+        return or_(*conditions)
+
     async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
         stmt = select(Media)
-        if query.keyword:
-            key = norm_key(query.keyword)
-            conditions = [Media.title.ilike(f"%{query.keyword}%")]
-            if key:
-                conditions.append(Media.norm_key.ilike(f"%{key}%"))
-            stmt = stmt.where(or_(*conditions))
+        clause = self._keyword_clause(query)
+        if clause is not None:
+            stmt = stmt.where(clause)
         stmt = _apply_filters(stmt, query)
         stmt = stmt.order_by(Media.id.desc()).offset(query.offset).limit(query.limit)
         return list(await session.scalars(stmt))
+
+    async def count(self, session: AsyncSession, query: SearchQuery) -> int:
+        stmt = select(func.count()).select_from(Media)
+        clause = self._keyword_clause(query)
+        if clause is not None:
+            stmt = stmt.where(clause)
+        return await session.scalar(_apply_filters(stmt, query)) or 0
 
 
 class PgTrgmSearchBackend:
@@ -92,21 +113,25 @@ class PgTrgmSearchBackend:
 
     name = "pg_trgm"
 
+    def _similarity(self, query: SearchQuery):
+        key = norm_key(query.keyword) or query.keyword
+        return key, func.similarity(Media.norm_key, key)
+
+    def _keyword_clause(self, query: SearchQuery, key: str, similarity):
+        return or_(
+            similarity > _TRGM_THRESHOLD,
+            # 子串命中要保底放行：短关键词（「误杀」查「误杀2」）
+            # 的 trigram 相似度可能低于阈值，但用户明显想要它。
+            Media.norm_key.contains(key, autoescape=True),
+            Media.title.icontains(query.keyword, autoescape=True),
+        )
+
     async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
         stmt = select(Media)
 
         if query.keyword:
-            key = norm_key(query.keyword) or query.keyword
-            similarity = func.similarity(Media.norm_key, key)
-            stmt = stmt.where(
-                or_(
-                    similarity > _TRGM_THRESHOLD,
-                    # 子串命中要保底放行：短关键词（「误杀」查「误杀2」）
-                    # 的 trigram 相似度可能低于阈值，但用户明显想要它。
-                    Media.norm_key.contains(key),
-                    Media.title.ilike(f"%{query.keyword}%"),
-                )
-            )
+            key, similarity = self._similarity(query)
+            stmt = stmt.where(self._keyword_clause(query, key, similarity))
             stmt = _apply_filters(stmt, query)
             stmt = stmt.order_by(similarity.desc(), Media.id.desc())
         else:
@@ -115,6 +140,13 @@ class PgTrgmSearchBackend:
 
         stmt = stmt.offset(query.offset).limit(query.limit)
         return list(await session.scalars(stmt))
+
+    async def count(self, session: AsyncSession, query: SearchQuery) -> int:
+        stmt = select(func.count()).select_from(Media)
+        if query.keyword:
+            key, similarity = self._similarity(query)
+            stmt = stmt.where(self._keyword_clause(query, key, similarity))
+        return await session.scalar(_apply_filters(stmt, query)) or 0
 
 
 def get_backend(session_or_bind: Any) -> SearchBackend:
@@ -130,3 +162,11 @@ async def search_media(session: AsyncSession, query: SearchQuery) -> list[Media]
     backend = get_backend(session)
     logger.debug("搜索后端=%s 关键词=%r", backend.name, query.keyword)
     return await backend.search(session, query)
+
+
+async def count_media(session: AsyncSession, query: SearchQuery) -> int:
+    """与 `search_media` 同条件的总数，供翻页用。
+
+    `limit` / `offset` 在这里无意义，会被忽略。
+    """
+    return await get_backend(session).count(session, query)

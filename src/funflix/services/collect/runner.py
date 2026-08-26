@@ -21,6 +21,7 @@ from funflix.services.ingest import ingest_document
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass(slots=True)
 class CollectReport:
     source_id: int

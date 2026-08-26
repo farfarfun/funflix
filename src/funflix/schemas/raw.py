@@ -9,6 +9,20 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from funflix.base.enums import ParseStatus, SourceType
 
+# Page 已挪到 schemas.common（media / resource 等模块同样要用）。
+# 这里保留再导出，避免 `from funflix.schemas.raw import Page` 的旧引用失效。
+from funflix.schemas.common import Page
+
+__all__ = [
+    "BatchIngestResult",
+    "IngestResult",
+    "Page",
+    "RawDocumentBatchCreate",
+    "RawDocumentCreate",
+    "RawDocumentOut",
+    "RawDocumentSummary",
+]
+
 
 class RawDocumentCreate(BaseModel):
     """提交一条原始分享文本。"""
@@ -75,10 +89,3 @@ class RawDocumentSummary(BaseModel):
     collected_at: datetime
     parse_status: ParseStatus
     parse_attempts: int
-
-
-class Page[T](BaseModel):
-    items: list[T]
-    total: int
-    page: int
-    size: int

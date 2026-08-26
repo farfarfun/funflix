@@ -26,6 +26,7 @@ from funflix.models import (
     utcnow,
 )
 from funflix.models.media import UNKNOWN_YEAR
+from funflix.services.counters import refresh_media_counters
 from funflix.services.extract.base import ExtractedItem, ExtractionOutcome, Extractor
 from funflix.services.text.linkscan import ScannedLink
 from funflix.services.text.normalize import tag_norm_key
@@ -193,7 +194,8 @@ async def _link_media_resource(session: AsyncSession, media: Media, resource: Re
             media_id=media.id, resource_id=resource.id, created_at=utcnow()
         )
     )
-    media.resource_count += 1
+    # 计数不在这里 +1：`_persist` 收尾时按关联表重算一次。
+    # 自增要求每条会改变关联的路径都记得配反向操作，漏一处就永久对不上。
     return True
 
 
@@ -229,11 +231,13 @@ async def _upsert_tags(session: AsyncSession, media: Media, item: ExtractedItem)
 async def _persist(
     session: AsyncSession, doc: RawDocument, outcome: ExtractionOutcome, report: ParseReport
 ) -> None:
+    touched: set[int] = set()
     for item in outcome.items:
         media, created = await _upsert_media(session, item)
         report.media_created += int(created)
         report.media_reused += int(not created)
         report.tags_linked += await _upsert_tags(session, media, item)
+        touched.add(media.id)
         for link in item.links:
             resource, is_new = await _upsert_resource(session, link, doc=doc, item=item)
             report.resources_created += int(is_new)
@@ -247,6 +251,10 @@ async def _persist(
         report.resources_created += int(is_new)
         report.resources_updated += int(not is_new)
     report.unattributed_links = len(outcome.unattributed_links)
+
+    # 本次碰过的作品，按关联表把两个冗余计数拉回一致
+    await session.flush()
+    await refresh_media_counters(session, touched)
 
 
 async def parse_document(
