@@ -101,57 +101,78 @@ def status(
     data, sources = _run(_fetch)
     _dim(f"数据库 {get_settings().database_url.split('://', 1)[0]}\n")
 
-    def section(index: int, name: str, total: int, note: str = "") -> None:
-        _heading(f"{index}. {name}")
-        typer.echo(f"   总数 {total}" + (f"   {note}" if note else ""))
-
-    def breakdown(counts: dict[str, int], highlight: set[str] | None = None) -> None:
-        if not counts:
-            _dim("   （无记录）")
-            return
+    def rows_of(counts: dict[str, int], highlight: set[str] | None = None) -> list[list[Any]]:
+        """分档明细转成表格行，占比让「哪一档最堵」一眼可见。"""
+        total = sum(counts.values()) or 1
+        out = []
         for label, value in sorted(counts.items(), key=lambda kv: -kv[1]):
-            color = typer.colors.YELLOW if highlight and label in highlight else None
-            typer.secho(f"     {label:<14} {value}", fg=color)
+            mark = " ⚠" if highlight and label in highlight and value else ""
+            out.append([label + mark, value, f"{value * 100 / total:.0f}%"])
+        return out
 
-    section(
-        1,
-        "采集源 source",
-        data.sources_total,
-        f"启用 {data.sources_enabled}   连续失败 {data.sources_failing}",
+    _heading("流水线总览")
+    _table(
+        [
+            [
+                "1 采集源 source",
+                data.sources_total,
+                f"启用 {data.sources_enabled} / 连续失败 {data.sources_failing}",
+            ],
+            ["2 原始文本 raw_document", data.raw_total, ""],
+            ["3 抽取留档 extraction", data.extraction_total, ""],
+            ["4 作品 media", data.media_total, ""],
+            [
+                "5 资源 resource",
+                data.resource_total,
+                f"未归属 {data.resource_orphan} / 作品↔资源 {data.media_resource_total}",
+            ],
+            ["6 校验历史 link_check", data.check_total, ""],
+        ],
+        ["环节", "总数", "备注"],
     )
+
+    sections = [
+        (
+            "原始文本 · 解析状态",
+            data.raw_by_status,
+            {ParseStatus.FAILED.value, ParseStatus.PENDING.value},
+        ),
+        ("抽取留档 · 按抽取器", data.extraction_by_model, None),
+        ("作品 · 按类型", data.media_by_type, None),
+        (
+            "资源 · 按校验状态",
+            data.resource_by_check,
+            {CheckStatus.INVALID.value, CheckStatus.ERROR.value},
+        ),
+        ("资源 · 按网盘", data.resource_by_provider, None),
+    ]
+    for title, counts, highlight in sections:
+        typer.echo()
+        _heading(title)
+        if counts:
+            _table(rows_of(counts, highlight), ["项", "数量", "占比"])
+        else:
+            _dim("  （无记录）")
+
     if verbose and sources:
-        for s in sources:
-            typer.echo(
-                f"     #{s.id} {s.source_type.value}/{s.identifier}  "
-                f"水位 {s.cursor_message_id or '-'}  已采 {s.total_collected}  "
-                f"{'启用' if s.enabled else '停用'}"
-            )
-    typer.echo()
-
-    section(2, "原始文本 raw_document", data.raw_total)
-    breakdown(data.raw_by_status, {ParseStatus.FAILED.value, ParseStatus.PENDING.value})
-    typer.echo()
-
-    section(3, "抽取留档 extraction", data.extraction_total)
-    breakdown(data.extraction_by_model)
-    typer.echo()
-
-    section(4, "作品 media", data.media_total)
-    breakdown(data.media_by_type)
-    typer.echo()
-
-    section(
-        5,
-        "资源 resource",
-        data.resource_total,
-        f"未归属作品 {data.resource_orphan}   作品↔资源关联 {data.media_resource_total}",
-    )
-    breakdown(data.resource_by_check, {CheckStatus.INVALID.value, CheckStatus.ERROR.value})
-    _dim("   按网盘：")
-    breakdown(data.resource_by_provider)
-    typer.echo()
-
-    section(6, "校验历史 link_check", data.check_total)
+        typer.echo()
+        _heading("采集源明细")
+        _table(
+            [
+                [
+                    s.id,
+                    f"{s.source_type.value}/{s.identifier[:20]}",
+                    s.cursor_message_id or "-",
+                    s.backfill_cursor_id or "-",
+                    "已补完" if s.backfill_done else "补历史中",
+                    s.total_collected,
+                    s.total_backfilled,
+                    "启用" if s.enabled else "停用",
+                ]
+                for s in sources
+            ],
+            ["ID", "源", "高水位", "低水位", "回溯", "追新", "回溯数", "状态"],
+        )
 
 
 # --- run ---------------------------------------------------------------------
@@ -667,9 +688,27 @@ def collect(
             reports = []
             bar = _progress(targets, "采集", "源")
             for target in bar:
+                # 一个源可能翻上百页、跑几分钟。源级进度条只会停在那里不动，
+                # 分不清是在正常翻页还是卡死了 —— 所以把页级进度实时打出来。
+                label = target.identifier[:18]
+                inner = tqdm(total=None, desc=f"  ↳ {label}", unit="页", leave=False, position=1)
+
+                def _tick(p, _bar=inner) -> None:
+                    _bar.total = p.budget or None
+                    _bar.n = p.pages
+                    stage = "追新" if p.stage == "fetch" else "补历史"
+                    where = f" @{p.position}" if p.position else ""
+                    extra = f" {p.detail}" if p.detail else ""
+                    _bar.set_postfix_str(f"{stage} {p.messages}条{where}{extra}")
+                    _bar.refresh()
+
                 if hasattr(bar, "set_postfix_str"):
-                    bar.set_postfix_str(target.identifier[:20])
-                reports.append((target.identifier, await collect_source(session, target)))
+                    bar.set_postfix_str(label)
+                try:
+                    report = await collect_source(session, target, on_progress=_tick)
+                finally:
+                    inner.close()
+                reports.append((target.identifier, report))
             await session.commit()
             return reports
 

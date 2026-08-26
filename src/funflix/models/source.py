@@ -54,7 +54,13 @@ class Source(TimestampMixin, Base):
     #: 历史是否已补完。到顶后置 True，此后每轮只追新，不再往前空跑。
     backfill_done: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=False)
     #: 单轮往前回溯几页。与 max_pages_per_fetch（往后追新）互不影响。
-    backfill_pages_per_fetch: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=5)
+    #:
+    #: 默认 20 是按实测算的：Telegram 预览页固定每页 20 条，所以一轮约 400 条。
+    #: 一个 7 万条的频道要补完需要约 180 轮 —— 已经不短，但原来的默认值 5
+    #: （每轮 100 条）要 718 轮，接入一个老频道基本等于补不完，
+    #: 而表面上每轮都「采集成功」，很难意识到是配置太小而不是没数据。
+    #: 频道大就用 `funflix source set <id> --backfill-pages N` 再调大。
+    backfill_pages_per_fetch: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=20)
     #: 累计回溯到的条数，用于观察补历史的进度
     total_backfilled: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
 

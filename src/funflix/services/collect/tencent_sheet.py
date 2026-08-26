@@ -31,7 +31,7 @@ import httpx
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
-from funflix.services.collect.base import CollectedMessage, FetchResult
+from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ def parse_sheet_chunk(ops: list[Any]) -> tuple[dict[str, str], dict[str, dict[st
     return columns, rows
 
 
-class TencentSheetCollector:
+class TencentSheetCollector(SupportsProgress):
     name = "tencent-docs-smartsheet-v1"
     #: 先于文本文档问：智能表格的 URL 形如 /sheet/ 或 /smartsheet/，
     #: 比文本文档的模式更具体。
@@ -321,6 +321,14 @@ class TencentSheetCollector:
                     messages.extend(self._to_messages(doc_id, sheet_id, columns, rows))
                     start += _CHUNK_SIZE
                     offsets[sheet_id] = start
+                    self._report(
+                        "backfill",
+                        pages,
+                        budget,
+                        len(messages),
+                        position=f"{start}/{target}",
+                        detail=f"sheet {sheet_id}",
+                    )
                     if pages < budget and start < target:
                         await asyncio.sleep(self._chunk_delay)
                 if pages >= budget:

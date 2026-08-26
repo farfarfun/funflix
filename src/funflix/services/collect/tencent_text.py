@@ -36,7 +36,7 @@ import httpx
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
-from funflix.services.collect.base import CollectedMessage, FetchResult
+from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ def split_blocks(text: str, max_chars: int = _MAX_BLOCK_CHARS) -> list[str]:
     return blocks
 
 
-class TencentTextCollector:
+class TencentTextCollector(SupportsProgress):
     name = "tencent-doc-v1"
     #: 排在智能表格之后 —— 两者同域名，先问更具体的那个。
     detect_priority = 20

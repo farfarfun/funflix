@@ -228,3 +228,68 @@ class TestBackfillCursorBootstrap:
         await session.commit()
 
         assert source.backfill_cursor_id == "120"
+
+
+@pytest.mark.asyncio
+class TestProgressHook:
+    """采集途中的页级进度上报。
+
+    采一个源可能翻上百页、跑好几分钟，而它对外只是「一个源」——
+    没有页级回调就只能盯着一个不动的进度条，分不清是在正常翻页还是卡死了。
+    """
+
+    async def test_hook_fires_per_page(self, session) -> None:
+        from funflix.services.collect.base import CollectProgress, SupportsProgress
+
+        seen: list[CollectProgress] = []
+
+        class _C(SupportsProgress):
+            name = "fake"
+
+            @staticmethod
+            def normalize_identifier(url):
+                return "demo"
+
+            async def fetch(self, src):
+                for page in (1, 2, 3):
+                    self._report("fetch", page, 5, page * 20, position=1000 - page)
+                return FetchResult(messages=[], truncated=False)
+
+            async def backfill(self, src):
+                self._report("backfill", 1, 5, 7)
+                return FetchResult(backfill_done=True)
+
+        source = await _make_source(session)
+        await session.commit()
+
+        await collect_source(session, source, _C(), on_progress=seen.append)
+
+        stages = [p.stage for p in seen]
+        assert stages == ["fetch", "fetch", "fetch", "backfill"]
+        assert [p.pages for p in seen[:3]] == [1, 2, 3]
+        assert seen[0].budget == 5
+        assert seen[2].messages == 60
+        assert seen[0].position == "999"
+
+    async def test_no_hook_is_fine(self, session) -> None:
+        """不关心进度的调用方（worker）不传回调，采集器不能因此报错。"""
+        from funflix.services.collect.base import SupportsProgress
+
+        class _C(SupportsProgress):
+            name = "fake"
+
+            @staticmethod
+            def normalize_identifier(url):
+                return "demo"
+
+            async def fetch(self, src):
+                self._report("fetch", 1, 1, 0)
+                return FetchResult(messages=[])
+
+            async def backfill(self, src):
+                return FetchResult(backfill_done=True)
+
+        source = await _make_source(session)
+        await session.commit()
+        report = await collect_source(session, source, _C())
+        assert report.ok

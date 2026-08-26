@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
@@ -51,6 +52,68 @@ class FetchResult:
     #: 频道会有一段没翻完的区间 —— 这些都得让补历史重新启动，否则那批内容
     #: 永远采不到，而每轮采集还都显示成功。
     backfill_pending: bool = False
+
+
+@dataclass(slots=True)
+class CollectProgress:
+    """一次采集途中的实时进度。
+
+    采集一个源可能翻上百页、跑好几分钟，而它对外只是「一个源」——
+    光看源级进度条完全不知道是在正常翻页还是卡住了。这个结构让采集器
+    把「翻到第几页、拿到多少条、当前翻到哪个 ID」实时报出来。
+    """
+
+    #: 阶段：`fetch`（追新）或 `backfill`（补历史）
+    stage: str
+    #: 本轮已翻页数
+    pages: int
+    #: 本轮页数上限
+    budget: int
+    #: 本轮累计取到的消息条数
+    messages: int
+    #: 当前翻到的位置（Telegram 是消息 ID，表格是行偏移），仅供展示
+    position: str | None = None
+    #: 多 sheet 的源用来说明正在处理哪个
+    detail: str | None = None
+
+
+#: 进度回调。采集器每翻完一页调一次；不关心进度的调用方不设即可。
+ProgressHook = Callable[[CollectProgress], None]
+
+
+class SupportsProgress:
+    """给采集器混入的进度上报能力。
+
+    做成可选的 mixin 而不是塞进 `Collector` 协议：不是每个采集器都分页，
+    也不该强迫每个实现都去处理一个它用不上的参数。
+    """
+
+    _progress: ProgressHook | None = None
+
+    def set_progress(self, hook: ProgressHook | None) -> None:
+        self._progress = hook
+
+    def _report(
+        self,
+        stage: str,
+        pages: int,
+        budget: int,
+        messages: int,
+        position: Any = None,
+        detail: str | None = None,
+    ) -> None:
+        if self._progress is None:
+            return
+        self._progress(
+            CollectProgress(
+                stage=stage,
+                pages=pages,
+                budget=budget,
+                messages=messages,
+                position=None if position is None else str(position),
+                detail=detail,
+            )
+        )
 
 
 @runtime_checkable

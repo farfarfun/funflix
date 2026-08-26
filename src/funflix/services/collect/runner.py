@@ -15,7 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from funflix.base.backoff import MAX_BACKOFF, backoff
 from funflix.models import Source, utcnow
 from funflix.schemas.raw import RawDocumentCreate
-from funflix.services.collect.base import CollectedMessage, Collector, FetchResult
+from funflix.services.collect.base import (
+    CollectedMessage,
+    Collector,
+    FetchResult,
+    ProgressHook,
+    SupportsProgress,
+)
 from funflix.services.collect.registry import get_collector
 from funflix.services.ingest import ingest_document
 
@@ -49,10 +55,19 @@ async def collect_source(
     session: AsyncSession,
     source: Source,
     collector: Collector | None = None,
+    on_progress: ProgressHook | None = None,
 ) -> CollectReport:
-    """采集一个源，把新消息写成 RawDocument 并推进水位。"""
+    """采集一个源，把新消息写成 RawDocument 并推进水位。
+
+    Args:
+        on_progress: 翻页进度回调。采集一个源可能翻上百页、跑好几分钟，
+            而它对外只是「一个源」—— 没有这个回调就只能干等，
+            分不清是在正常翻页还是卡死了。
+    """
     report = CollectReport(source_id=source.id, cursor_before=source.cursor_message_id)
     collector = collector or get_collector(source.source_type)
+    if on_progress is not None and isinstance(collector, SupportsProgress):
+        collector.set_progress(on_progress)
     now = utcnow()
     source.last_fetched_at = now
 

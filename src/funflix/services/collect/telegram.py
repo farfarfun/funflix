@@ -24,7 +24,7 @@ import httpx
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
-from funflix.services.collect.base import CollectedMessage, FetchResult
+from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +230,7 @@ def parse_channel_page(html: str, channel: str) -> tuple[list[CollectedMessage],
     return messages, parser.title
 
 
-class TelegramChannelCollector:
+class TelegramChannelCollector(SupportsProgress):
     name = "telegram-web-preview-v1"
     #: 最后问。它的模式能匹配任意裸标识串（"某频道名" 也算命中），
     #: 先问就会把腾讯文档的 URL 一起抢走。
@@ -299,6 +299,7 @@ class TelegramChannelCollector:
                     if message.numeric_id is not None and message.numeric_id < oldest:
                         collected[message.numeric_id] = message
                 oldest = min(fresh)
+                self._report("backfill", pages, budget, len(collected), position=oldest)
                 if oldest <= 1:
                     done = True
                     break
@@ -370,6 +371,9 @@ class TelegramChannelCollector:
                     break
 
                 before = oldest
+                self._report(
+                    "fetch", pages, source.max_pages_per_fetch, len(collected), position=oldest
+                )
                 if pages < source.max_pages_per_fetch:
                     await asyncio.sleep(self._page_delay)
             else:
