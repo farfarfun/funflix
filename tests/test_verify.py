@@ -55,11 +55,14 @@ class TestQuarkClassify:
         outcome = quark_classify({"code": 41013, "message": "操作过于频繁"}, 429)
         assert outcome.status is CheckStatus.RATE_LIMITED
 
-    def test_unknown_response_is_error_not_invalid(self) -> None:
-        """接口改版时必须归 ERROR —— 归 INVALID 会把整库资源误杀一遍。"""
-        outcome = quark_classify({"code": 12345, "message": "某种新情况"}, 200)
-        assert outcome.status is CheckStatus.ERROR
-        assert not outcome.is_conclusive
+    def test_unknown_response_returns_none(self) -> None:
+        """看不懂的响应返回 None，由骨架归到 ERROR。
+
+        classify 自己**不造** INVALID 兜底 —— 接口改版时那会把整库资源误杀一遍。
+        「归 ERROR」这件事由 AnonymousHttpProbe 统一保证，见
+        TestUnknownResponseBecomesError。
+        """
+        assert quark_classify({"code": 12345, "message": "某种新情况"}, 200) is None
 
 
 class TestAlipanClassify:
@@ -76,9 +79,8 @@ class TestAlipanClassify:
         outcome = alipan_classify({"has_pwd": True, "share_name": "示例"}, 200)
         assert outcome.status is CheckStatus.NEED_PASSWORD
 
-    def test_unknown_code_is_error(self) -> None:
-        outcome = alipan_classify({"code": "SomeNewError"}, 400)
-        assert outcome.status is CheckStatus.ERROR
+    def test_unknown_code_returns_none(self) -> None:
+        assert alipan_classify({"code": "SomeNewError"}, 400) is None
 
 
 class TestCheckOutcome:

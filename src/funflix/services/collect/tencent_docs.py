@@ -29,15 +29,14 @@ from typing import Any
 
 import httpx
 
+from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult
 
 logger = logging.getLogger(__name__)
 
-_UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
+#: 统一到 base.http，避免五个文件各抄一份
+_UA = DEFAULT_UA
 
 _API = "https://docs.qq.com/dop-api/opendoc"
 
