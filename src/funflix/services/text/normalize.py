@@ -208,14 +208,31 @@ _EMOJI_RE = re.compile(
     "[\U0001f300-\U0001faff\U00002600-\U000027bf\U0000fe00-\U0000fe0f\U00002190-\U000021ff]+"
 )
 
-_EPISODE_PATTERNS = (
+#: 光杆季号（`S01`、`S2`）。它跟 `第N季` 是同一个东西 ——
+#: **是作品身份，不是集数噪声**，所以单独拎出来，不参与标题清洗。
+_BARE_SEASON_RE = re.compile(r"\bS\d{1,2}\b", re.I)
+
+#: 第一季。视为隐含默认值，从标题里剥掉，见 `clean_title` 里的说明。
+_SEASON_ONE_RE = re.compile(r"\bS0*1\b", re.I)
+
+#: `S01E05` 这种「季+集」写法。清洗标题时只剥掉集号、**留下季号** ——
+#: 整段剥掉的话，「某剧 S01E05」会洗成「某剧」，而「某剧 S01」洗成「某剧 S01」，
+#: 同一季的两条分享反而成了两部作品。
+_SEASON_EPISODE_RE = re.compile(
+    r"\b(?P<season>S\d{1,2})\s*E\d{1,3}(?:\s*[-~]\s*E?\d{1,3})?\b", re.I
+)
+
+#: 从标题里剥掉的集数噪声。不含光杆季号，见 `_BARE_SEASON_RE`。
+_TITLE_EPISODE_PATTERNS = (
     re.compile(r"全\s*\d+\s*[集话話期]"),
     re.compile(r"更新至\s*(?:第)?\s*\d+\s*[集话話期]?"),
     re.compile(r"第\s*\d+\s*[-~－]\s*\d+\s*[集话話期]"),
-    re.compile(r"\bS\d{1,2}\s*E\d{1,3}(?:\s*[-~]\s*E?\d{1,3})?\b", re.I),
     re.compile(r"\bEP?\d{1,3}(?:\s*[-~]\s*EP?\d{1,3})?\b", re.I),
-    re.compile(r"\bS\d{1,2}\b", re.I),
 )
+
+#: 识别集数信息时用的全集模式 —— 这里要认季+集与光杆季号，
+#: 「能不能识别出来」和「要不要从标题里剥掉」是两件事。
+_EPISODE_PATTERNS = (*_TITLE_EPISODE_PATTERNS, _SEASON_EPISODE_RE, _BARE_SEASON_RE)
 
 #: 作品类型的判定关键词。命中越靠前的越优先。
 _MEDIA_TYPE_KEYWORDS: tuple[tuple[MediaType, tuple[str, ...]], ...] = (
@@ -279,7 +296,17 @@ def clean_title(raw: str) -> str:
         prev = text
         text = _BRACKET_RE.sub(" ", text)
 
-    for pattern in _EPISODE_PATTERNS:
+    # 季+集写法只剥集号，季号按下面的规则处理（S01E05 → S01 → 再被剥掉）
+    text = _SEASON_EPISODE_RE.sub(lambda m: f" {m.group('season')} ", text)
+    # 第一季是**隐含的默认值**：绝大多数剧只有一季，`某剧 S01E01-E20` 与
+    # `某剧 全20集` 说的是同一部，留着 S01 会把它们拆成两部 —— 而这种写法
+    # 在真实语料里非常常见。S02 及以后才是真正区分作品身份的信息，予以保留。
+    text = _SEASON_ONE_RE.sub(" ", text)
+
+    # 注意用的是 _TITLE_EPISODE_PATTERNS：光杆季号（S01）不在里面。
+    # 它和 `第一季` 一样属于作品身份，剥掉会把 S01 和 S02 归成同一部 ——
+    # 中文写法一直是对的，英文写法曾经走的是被错并的那条路。
+    for pattern in _TITLE_EPISODE_PATTERNS:
         text = pattern.sub(" ", text)
 
     # 点号/下划线分隔的发布名（Some.Title.2024.1080p）先还原成空格，再逐词剔噪声
@@ -336,8 +363,15 @@ def _to_simplified(text: str) -> str:
 
 
 def extract_year(text: str) -> int | None:
-    """提取年份。同时出现多个时取第一个 —— 标题里的年份通常在最前面。"""
-    cleaned = _RESOLUTION_RE.sub(" ", unicodedata.normalize("NFKC", text))
+    """提取上映年份。同时出现多个时取第一个 —— 标题里的年份通常在最前面。
+
+    先把**完整日期**剥掉再找年份。分享文案里「2025年8月25日更新」这类
+    发帖日期极常见，不剥的话它会被当成上映年份 —— 而 `_upsert_media` 按
+    `(norm_key, media_type, year)` 认作品，于是同一部片按发帖日期裂成好几个
+    media，链接各分一半。`clean_title` 一直是剥日期的，这里漏了，两边对不上。
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    cleaned = _DATE_RE.sub(" ", _RESOLUTION_RE.sub(" ", normalized))
     match = _YEAR_RE.search(cleaned)
     return int(match.group(1)) if match else None
 
