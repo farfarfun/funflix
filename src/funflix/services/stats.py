@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.models import (
@@ -59,7 +59,17 @@ def _label(key: Any) -> str:
 
 
 async def collect_stats(session: AsyncSession) -> PipelineStats:
-    """把整条流水线的计数聚合成一个对象。"""
+    """把整条流水线的计数聚合成一个对象。
+
+    总数**从分组结果求和得来**，不再为每张表单独跑一次 `COUNT(*)`。
+    分组列（parse_status / model / media_type / check_status / provider）
+    全部是 NOT NULL，所以求和与 `COUNT(*)` 逐字相等 —— 这一点是前提，
+    哪天某个分组列变成可空，就得把对应的总数改回独立 COUNT，
+    否则 NULL 那一组不进分组结果，总数会少算。
+
+    这样每张表只扫一遍而不是两遍：resource 表原本要被扫四次
+    （总数、按状态、按网盘、孤儿反连接），现在三次。
+    """
 
     async def count(model: Any, *conditions: Any) -> int:
         stmt = select(func.count()).select_from(model)
@@ -73,19 +83,36 @@ async def collect_stats(session: AsyncSession) -> PipelineStats:
         )
         return {_label(key): value for key, value in rows.all()}
 
+    # 采集源的三个计数合成一次扫描
+    source_row = (
+        await session.execute(
+            select(
+                func.count(),
+                func.sum(case((Source.enabled, 1), else_=0)),
+                func.sum(case((Source.consecutive_failures > 0, 1), else_=0)),
+            ).select_from(Source)
+        )
+    ).one()
+
+    raw_by_status = await group(RawDocument, RawDocument.parse_status)
+    extraction_by_model = await group(Extraction, Extraction.model)
+    media_by_type = await group(Media, Media.media_type)
+    resource_by_check = await group(Resource, Resource.check_status)
+    resource_by_provider = await group(Resource, Resource.provider)
+
     return PipelineStats(
-        sources_total=await count(Source),
-        sources_enabled=await count(Source, Source.enabled),
-        sources_failing=await count(Source, Source.consecutive_failures > 0),
-        raw_total=await count(RawDocument),
-        raw_by_status=await group(RawDocument, RawDocument.parse_status),
-        extraction_total=await count(Extraction),
-        extraction_by_model=await group(Extraction, Extraction.model),
-        media_total=await count(Media),
-        media_by_type=await group(Media, Media.media_type),
-        resource_total=await count(Resource),
-        resource_by_check=await group(Resource, Resource.check_status),
-        resource_by_provider=await group(Resource, Resource.provider),
+        sources_total=source_row[0] or 0,
+        sources_enabled=int(source_row[1] or 0),
+        sources_failing=int(source_row[2] or 0),
+        raw_total=sum(raw_by_status.values()),
+        raw_by_status=raw_by_status,
+        extraction_total=sum(extraction_by_model.values()),
+        extraction_by_model=extraction_by_model,
+        media_total=sum(media_by_type.values()),
+        media_by_type=media_by_type,
+        resource_total=sum(resource_by_check.values()),
+        resource_by_check=resource_by_check,
+        resource_by_provider=resource_by_provider,
         resource_orphan=await count(
             Resource,
             ~select(media_resource.c.resource_id)

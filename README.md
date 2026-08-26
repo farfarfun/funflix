@@ -92,6 +92,19 @@ funflix serve --reload
 `/media` 的关键词匹配走 `services/search.py` 的后端抽象：PostgreSQL 上用 `pg_trgm`
 容错匹配并按相似度排序，其余方言回落 `LIKE`，调用方无感知。
 
+PostgreSQL 上的三条实测结论（`tests/test_search_pg.py`，5 万行）：
+
+| | 结果 |
+| --- | --- |
+| 3 字以上关键词 | 走 GIN 位图索引，**0.235ms** |
+| 2 个汉字的关键词 | 全表扫描 **81.9ms**，无解 —— pg_trgm 要三元组，两个字提不出完整 trigram |
+| 刚批量导入完 | 暂时走不了索引，见下 |
+
+> 📌 **批量导入后记得 VACUUM**。GIN 索引默认开着 fastupdate，新行先进一个待合并
+> 列表；合并前规划器认为索引很贵（实测位图扫描启动代价 2515 vs 合并后 64），
+> 于是绕开它走全表扫描。autovacuum 会自动处理，赶时间就手动
+> `VACUUM ANALYZE media;`。
+
 > ⚠️ DESIGN §7.3 还规划了 `SqliteFtsBackend`（FTS5 虚拟表），目前**尚未实现**。
 > 也就是说 SQLite 部署上关键词搜索仍是 `LIKE %x%` 全表扫描 —— 几千条无所谓，
 > 上万条就会明显变慢。数据量起来之前先用 PostgreSQL，或者补上 FTS5 后端。
@@ -130,3 +143,18 @@ ruff format .       # 格式化
 # 改了模型后生成迁移
 alembic revision --autogenerate -m "描述"
 ```
+
+### 跑 PostgreSQL 那部分测试
+
+默认测试全在 SQLite 上，走的是 `LikeSearchBackend`；而**生产上真正跑的是
+`PgTrgmSearchBackend`**，两者的关键词子句一行代码都不共用。所以 SQLite 全绿
+并不能说明 PG 上是对的。`tests/test_search_pg.py` 补这一块，默认跳过：
+
+```bash
+export FUNFLIX_TEST_PG_URL='postgresql+asyncpg://用户@/库名'
+pytest tests/test_search_pg.py
+```
+
+其中 `test_keyword_query_uses_the_trgm_index` 断言的是**查询计划**而不是结果。
+`similarity(a,b) > 阈值` 和 `a % b` 结果完全一样，只有后者走索引 —— 写错了
+结果依旧正确、测试依旧全绿，只是慢几百倍。这种退化只有查执行计划才拦得住。

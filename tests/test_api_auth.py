@@ -100,11 +100,32 @@ class TestClosedWhenUnconfigured:
 
 @pytest.mark.asyncio
 class TestReadEndpointsStayOpen:
-    """查询接口不上锁 —— 上锁的是写，不是读。"""
+    """面向使用者的查询接口不上锁。"""
 
     @pytest.mark.parametrize(
         "path",
-        ["/api/v1/sources", "/api/v1/media", "/api/v1/resources", "/api/v1/stats", "/healthz"],
+        ["/api/v1/sources", "/api/v1/media", "/api/v1/stats", "/healthz"],
     )
     async def test_readable_without_key(self, keyless, path) -> None:
         assert (await keyless.get(path)).status_code == 200
+
+
+@pytest.mark.asyncio
+class TestResourceEnumerationIsLocked:
+    """`/resources` 列表是运维视角，不是产品视角。
+
+    它按网盘 / 校验状态成页吐出整库的链接与提取码，整库能在
+    `总数/200` 次请求内翻完 —— 等于把索引整个交出去。
+    产品接口 `/media`、`/media/{id}` 保持开放。
+    """
+
+    async def test_list_requires_key(self, keyed) -> None:
+        assert (await keyed.get("/api/v1/resources")).status_code == 401
+
+    async def test_list_works_with_key(self, keyed) -> None:
+        resp = await keyed.get("/api/v1/resources", headers={"X-API-Key": KEY})
+        assert resp.status_code == 200
+
+    async def test_single_lookup_stays_open(self, keyless) -> None:
+        """按 id 查单条不上锁：id 本来就由 /media/{id} 给出。"""
+        assert (await keyless.get("/api/v1/resources/99999")).status_code == 404

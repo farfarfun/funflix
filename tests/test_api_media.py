@@ -185,21 +185,72 @@ class TestGetMedia:
     async def test_404_for_missing(self, client, seeded) -> None:
         assert (await client.get("/api/v1/media/99999")).status_code == 404
 
+    async def test_resources_are_capped(self, client, session, seeded, monkeypatch) -> None:
+        """热门剧集会被很多频道反复分享，关联只增不删，全量返回能到几 MB。"""
+        monkeypatch.setattr("funflix.api.v1.media.MAX_DETAIL_RESOURCES", 3)
+        hit = seeded["hit"]
+        for i in range(10):
+            hit.resources.append(_resource(f"bulk{i:04d}", status=CheckStatus.INVALID))
+        await session.commit()
+        await refresh_media_counters(session, [hit.id])
+        await session.commit()
+
+        body = (await client.get(f"/api/v1/media/{hit.id}")).json()
+        assert len(body["resources"]) == 3, "应当被截断"
+        assert body["resource_count"] == 11, "但总数仍是真实值"
+
+    async def test_valid_resources_come_first(self, client, session, seeded, monkeypatch) -> None:
+        """截断时优先保留能用的 —— 使用者要的就是一条可用链接。"""
+        monkeypatch.setattr("funflix.api.v1.media.MAX_DETAIL_RESOURCES", 2)
+        hit = seeded["hit"]
+        for i in range(8):
+            hit.resources.append(_resource(f"dead{i:04d}", status=CheckStatus.INVALID))
+        await session.commit()
+
+        body = (await client.get(f"/api/v1/media/{hit.id}")).json()
+        assert body["resources"][0]["check_status"] == "valid"
+
+    async def test_truncation_does_not_delete_associations(
+        self, client, session, seeded, monkeypatch
+    ) -> None:
+        """截断只影响展示，绝不能动数据。
+
+        直接给关系属性赋值会被 ORM 当成「这就是全部关联」，flush 时把没列进来的
+        关联行删掉 —— 那样截断展示就变成了截断数据。所以用 set_committed_value。
+        """
+        monkeypatch.setattr("funflix.api.v1.media.MAX_DETAIL_RESOURCES", 2)
+        hit = seeded["hit"]
+        for i in range(6):
+            hit.resources.append(_resource(f"keep{i:04d}", status=CheckStatus.INVALID))
+        await session.commit()
+
+        await client.get(f"/api/v1/media/{hit.id}")
+
+        await refresh_media_counters(session, [hit.id])
+        await session.commit()
+        body = (await client.get("/api/v1/media", params={"keyword": "误杀"})).json()
+        assert body["items"][0]["resource_count"] == 7, "关联被删掉了"
+
 
 @pytest.mark.asyncio
 class TestListResources:
-    async def test_lists_resources(self, client, seeded) -> None:
-        body = (await client.get("/api/v1/resources")).json()
+    """列表接口要管理员 key —— 它能成页吐出整库的链接与提取码。"""
+
+    async def test_requires_admin_key(self, client, seeded) -> None:
+        assert (await client.get("/api/v1/resources")).status_code == 403
+
+    async def test_lists_resources(self, admin_client, seeded) -> None:
+        body = (await admin_client.get("/api/v1/resources")).json()
         assert body["total"] == 1
         assert body["items"][0]["url"].endswith("aaa111")
 
-    async def test_filters_by_check_status(self, client, seeded) -> None:
-        assert (await client.get("/api/v1/resources", params={"check_status": "invalid"})).json()[
-            "total"
-        ] == 0
+    async def test_filters_by_check_status(self, admin_client, seeded) -> None:
+        assert (
+            await admin_client.get("/api/v1/resources", params={"check_status": "invalid"})
+        ).json()["total"] == 0
 
-    async def test_filters_by_provider(self, client, seeded) -> None:
-        body = (await client.get("/api/v1/resources", params={"provider": "alipan"})).json()
+    async def test_filters_by_provider(self, admin_client, seeded) -> None:
+        body = (await admin_client.get("/api/v1/resources", params={"provider": "alipan"})).json()
         assert body["total"] == 0
 
     async def test_404_for_missing(self, client, seeded) -> None:
@@ -230,3 +281,37 @@ class TestStats:
         body = (await client.get("/api/v1/stats")).json()
         assert body["media_total"] == 0
         assert body["raw_by_status"] == {}
+
+    async def test_totals_agree_with_breakdowns(self, client, seeded) -> None:
+        """总数是从分组求和得来的，必须与分组对得上。
+
+        分组列都是 NOT NULL，所以求和等价于 COUNT(*)。哪天某列变成可空，
+        NULL 那一组不会进分组结果，这条断言就会先炸 —— 这正是它的用处。
+        """
+        body = (await client.get("/api/v1/stats")).json()
+        assert body["media_total"] == sum(body["media_by_type"].values())
+        assert body["resource_total"] == sum(body["resource_by_check"].values())
+        assert body["resource_total"] == sum(body["resource_by_provider"].values())
+        assert body["raw_total"] == sum(body["raw_by_status"].values())
+
+    async def test_issues_a_bounded_number_of_queries(self, session, engine, seeded) -> None:
+        """统计接口无鉴权无缓存，查询条数就是它的成本上限。
+
+        原本每张表都要「一次 COUNT + 一次 GROUP BY」两遍扫描，共 14 条。
+        """
+        from sqlalchemy import event
+
+        from funflix.services.stats import collect_stats
+
+        seen: list[str] = []
+
+        def _record(conn, cursor, statement, params, context, executemany) -> None:
+            seen.append(statement)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", _record)
+        try:
+            await collect_stats(session)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", _record)
+
+        assert len(seen) <= 9, f"统计查询涨到了 {len(seen)} 条：\n" + "\n".join(seen)

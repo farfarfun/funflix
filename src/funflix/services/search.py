@@ -22,8 +22,13 @@ from funflix.services.text.normalize import norm_key
 
 logger = logging.getLogger(__name__)
 
-#: pg_trgm 相似度阈值。低于它的结果基本是噪声。
-_TRGM_THRESHOLD = 0.2
+#: 相似度阈值不在这里 —— 它由 `pg_trgm.similarity_threshold` 这个 GUC 提供，
+#: 随连接参数下发（`Settings.search_trgm_threshold` → base/db.py）。
+#: 写进 WHERE 里的话就必须用 `similarity()` 函数形式，那样索引会失效。
+#:
+#: 另一件必须知道的事：**2 个汉字的关键词在 PG 上也走不了索引**。
+#: pg_trgm 要三元组，2 字关键词提不出完整 trigram，`%` 和 `LIKE` 都退化成全表扫描
+#: （实测 5 万行 81.9ms）。这是 pg_trgm 的固有限制，不是这里写错了。
 
 
 @dataclass(slots=True)
@@ -119,7 +124,15 @@ class PgTrgmSearchBackend:
 
     def _keyword_clause(self, query: SearchQuery, key: str, similarity):
         return or_(
-            similarity > _TRGM_THRESHOLD,
+            # 用 `%` 操作符而不是 `similarity(a, b) > 阈值`。
+            #
+            # 两者语义相同，但只有操作符形式能走 GIN gin_trgm_ops 索引 ——
+            # 函数调用形式规划器只能全表扫描，而且它 OR 在最前面，会把整个
+            # 子句一起拖下水，另外两个分支的索引也用不上了。
+            # 实测 5 万行、3 字关键词：63.9ms → 0.235ms。
+            #
+            # 阈值来自 `pg_trgm.similarity_threshold`，由连接参数下发，见 base/db.py。
+            Media.norm_key.bool_op("%")(key),
             # 子串命中要保底放行：短关键词（「误杀」查「误杀2」）
             # 的 trigram 相似度可能低于阈值，但用户明显想要它。
             Media.norm_key.contains(key, autoescape=True),

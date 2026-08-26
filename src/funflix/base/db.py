@@ -47,6 +47,15 @@ def create_engine(settings: Settings | None = None) -> AsyncEngine:
         kwargs["pool_size"] = 10
         kwargs["max_overflow"] = 20
         kwargs["pool_pre_ping"] = True
+        if settings.database_url.startswith("postgresql"):
+            # 相似度阈值随连接下发，而不是每次查询前先 SET 一条。
+            # `%` 操作符从这个 GUC 取阈值 —— 不设的话回落到 PG 默认的 0.3，
+            # 只是匹配更严，不会出错。
+            kwargs["connect_args"] = {
+                "server_settings": {
+                    "pg_trgm.similarity_threshold": str(settings.search_trgm_threshold)
+                }
+            }
 
     engine = create_async_engine(settings.database_url, **kwargs)
     if settings.is_sqlite:

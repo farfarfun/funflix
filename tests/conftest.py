@@ -8,8 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from funflix.api.app import create_app
+from funflix.base.config import Settings, get_settings
 from funflix.base.db import get_session
 from funflix.models import Base
+
+#: 测试用的管理员 key。写接口与 /resources 列表要它。
+ADMIN_KEY = "test-admin-key"
 
 
 @pytest_asyncio.fixture
@@ -50,4 +54,23 @@ async def client(engine) -> AsyncIterator[AsyncClient]:
     # 绕过 lifespan：真实 lifespan 会连全局引擎，测试要用的是上面的内存库
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def admin_client(engine) -> AsyncIterator[AsyncClient]:
+    """带管理员 key 的客户端，用于需要鉴权的接口。"""
+    app = create_app()
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def _override() -> AsyncIterator[AsyncSession]:
+        async with maker() as s:
+            yield s
+
+    app.dependency_overrides[get_session] = _override
+    app.dependency_overrides[get_settings] = lambda: Settings(admin_api_key=ADMIN_KEY)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://test", headers={"X-API-Key": ADMIN_KEY}
+    ) as c:
         yield c

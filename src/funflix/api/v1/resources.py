@@ -2,6 +2,14 @@
 
 与 `/media` 的区别是视角：这里按链接本身筛（哪个网盘、校验成不成功），
 用于运维排查「夸克最近是不是大面积失效了」这类问题。
+
+**列表接口要 `X-API-Key`**：它按 `provider` / `check_status` 成页吐出整库的
+链接与提取码，整库可在 `总数/200` 次请求内翻完 —— 那是把索引整个交出去，
+和「按作品查详情时附带它的链接」不是一个量级。面向使用者的产品接口是
+`/media` 与 `/media/{id}`，它们保持开放。
+
+单条 `/resources/{id}` 也保持开放：知道 id 才查得到，`/media/{id}` 本来
+就会返回这些 id。
 """
 
 from __future__ import annotations
@@ -9,7 +17,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 from sqlalchemy import func, select
 
-from funflix.api.deps import PageDep, SessionDep, get_or_404
+from funflix.api.deps import AdminDep, PageDep, SessionDep, get_or_404
 from funflix.base.enums import CheckStatus, Provider
 from funflix.models import Resource
 from funflix.schemas.common import Page
@@ -22,6 +30,7 @@ router = APIRouter(prefix="/resources", tags=["resources"])
 async def list_resources(
     session: SessionDep,
     paging: PageDep,
+    _: AdminDep,
     provider: Provider | None = None,
     check_status: CheckStatus | None = None,
 ) -> Page[ResourceOut]:
