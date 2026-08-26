@@ -148,10 +148,14 @@ async def check_resource(
     )
 
     if baseline is CheckStatus.CHECKING:
-        # 领取前的结论不可知（比如上一个 worker 崩在了这条上）。
-        # 保守地累加而不是重置 —— 宁可早一点停止复查，也不要因为反复重置
-        # 让一条早已失效的链接被永远复查下去。
-        resource.check_attempts += 1
+        # 领取前的结论不可知（上一个 worker 崩在了这条上）。
+        #
+        # 这里**不动** check_attempts：`claim_resources` 重捞时已经替这次崩溃加过一次了
+        # （worker/claim.py 的 decide）。两处都加就会重复计数 —— 一次崩溃加一次、
+        # 本次判定再加一次，于是「崩溃一次 + 判失效一次」就凑满
+        # _INVALID_CONFIRM_TIMES，把一条**实际只探测过一次**的链接永久退休，
+        # 而 §6.4 要求的是确认两次失效。
+        pass
     else:
         resource.check_attempts = resource.check_attempts + 1 if outcome.status is baseline else 1
     resource.check_status = outcome.status

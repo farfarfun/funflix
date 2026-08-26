@@ -481,3 +481,45 @@ class TestScheduler:
         stop.set()
 
         await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.asyncio
+class TestReclaimDoesNotDoubleCount:
+    """崩溃重捞只能算一次，不能既在领取时加又在判定时加。
+
+    两处都加的话，「崩溃一次 + 判失效一次」就凑满 _INVALID_CONFIRM_TIMES，
+    把一条**实际只探测过一次**的链接永久退休 —— 而 §6.4 要求的是确认两次失效。
+    """
+
+    async def test_crash_plus_one_invalid_still_gets_rechecked(self, session, monkeypatch) -> None:
+        from funflix.services.verify.runner import check_resource
+        from funflix.worker.claim import claim_resources
+
+        now = utcnow()
+        resource = make_resource(
+            1,
+            check_status=CheckStatus.CHECKING,
+            lease_until=now - timedelta(hours=1),
+            next_check_at=now - timedelta(hours=1),
+            check_attempts=0,
+        )
+        session.add(resource)
+        await session.commit()
+
+        claimed = await claim_resources(session, limit=5)
+        await session.refresh(resource)
+        assert resource.check_attempts == 1, "重捞记一次崩溃"
+
+        await check_resource(
+            session,
+            resource,
+            StubProbe(CheckStatus.INVALID),
+            prior_status=claimed.priors.get(resource.id),
+        )
+        await session.commit()
+        await session.refresh(resource)
+
+        assert resource.check_attempts == 1, "判定不该再加一次 —— 崩溃已经计过了"
+        assert resource.next_check_at is not None, (
+            "只真正探测过一次就不再复查，等于把 §6.4 的「确认两次」砍成了一次"
+        )

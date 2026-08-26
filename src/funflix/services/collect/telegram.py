@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 #: 统一到 base.http，避免五个文件各抄一份
 _UA = DEFAULT_UA
 
+#: 追赶模式下，下一轮从哪一页接着往回翻（存在 Source.extra 里）
+CATCHUP_BEFORE_KEY = "catchup_before"
+
 #: 从 t.me 的各种 URL 写法里取频道名：t.me/x、t.me/s/x、@x、裸频道名
 _CHANNEL_PATTERNS = (
     re.compile(r"^https?://t\.me/s/(?P<name>[A-Za-z0-9_]{3,})", re.I),
@@ -317,18 +320,26 @@ class TelegramChannelCollector:
 
         从最新页开始，按 `?before=` 逐页向更早回溯，直到追上水位。
         首次采集（无水位）只取一页 —— 否则接入一个老频道会把整个历史拉下来。
+
+        **追赶模式**：上一轮页数用完（`truncated`）时，会把停在哪一页记进
+        `extra[CATCHUP_BEFORE_KEY]`，这一轮从那里接着往回翻，而不是又从最新页重来。
+        不接着翻的话，每轮都在重采最新的那几页、永远够不到中间那段，
+        停机一天就等于丢一天 —— 而且每轮都"采集成功"，看不出任何异常。
         """
         channel = source.identifier
         cursor = None
         if source.cursor_message_id and source.cursor_message_id.isdigit():
             cursor = int(source.cursor_message_id)
 
+        resume = (source.extra or {}).get(CATCHUP_BEFORE_KEY)
+        resume_before = int(resume) if str(resume or "").isdigit() else None
+
         client = self._client or httpx.AsyncClient(timeout=20.0, follow_redirects=True)
         collected: dict[int, CollectedMessage] = {}
         pages = 0
         truncated = False
         title: str | None = None
-        before: int | None = None
+        before: int | None = resume_before
 
         try:
             while pages < max(1, source.max_pages_per_fetch):
@@ -372,4 +383,6 @@ class TelegramChannelCollector:
             pages_fetched=pages,
             truncated=truncated,
             title=title,
+            # 追赶未完成就记下停在哪；完成了就把这个键清掉（None = 清除）
+            state={CATCHUP_BEFORE_KEY: str(before) if truncated and before else None},
         )

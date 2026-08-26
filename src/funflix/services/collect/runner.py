@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from funflix.base.backoff import MAX_BACKOFF, backoff
 from funflix.models import Source, utcnow
 from funflix.schemas.raw import RawDocumentCreate
-from funflix.services.collect.base import CollectedMessage, Collector
+from funflix.services.collect.base import CollectedMessage, Collector, FetchResult
 from funflix.services.collect.registry import get_collector
 from funflix.services.ingest import ingest_document
 
@@ -82,7 +82,10 @@ async def collect_source(
     if result.state:
         # 采集器自定义水位（如文档版本号）。合并而非覆盖，
         # 让采集器只上报本轮变化的部分即可。
-        source.extra = {**source.extra, **result.state}
+        # 值为 None 表示「清掉这个键」—— 否则采集器没法把一个用完的续翻位置抹掉，
+        # 下一轮会从一个陈旧的位置接着翻。
+        merged = {**source.extra, **result.state}
+        source.extra = {k: v for k, v in merged.items() if v is not None}
 
     created, duplicated, skipped = await _ingest_messages(session, source, result.messages)
     report.created += created
@@ -95,12 +98,7 @@ async def collect_source(
         (m.numeric_id for m in result.messages if m.numeric_id is not None),
         default=None,
     )
-    if newest is not None:
-        current = int(source.cursor_message_id) if _is_int(source.cursor_message_id) else None
-        if current is None or newest > current:
-            source.cursor_message_id = str(newest)
-            newest_msg = next(m for m in result.messages if m.numeric_id == newest)
-            source.cursor_published_at = newest_msg.published_at
+    _advance_cursor(source, result, newest)
 
     # 低水位的起点。没有它就无从往前回溯。
     #
@@ -203,6 +201,53 @@ async def _ingest_messages(
         else:
             created += 1
     return created, duplicated, skipped
+
+
+#: 追赶未完成时，本轮见过的最大消息 ID 暂存在 `Source.extra` 的这个键下。
+PENDING_CURSOR_KEY = "pending_cursor"
+
+
+def _advance_cursor(source: Source, result: FetchResult, newest: int | None) -> None:
+    """推进高水位，但**只在本轮把新消息取全了的时候**推。
+
+    采集器是从最新往回翻页的，翻到水位就停；页数用完则报 `truncated=True`，
+    意味着「最新的一段取到了，中间还有一段没取」。
+
+    这时候若直接把水位推到最新那条，中间那段就永久丢了：下一轮从新水位往回看，
+    第一页就全是已见过的 ID，立刻停止 —— 而 `backfill_done` 一旦为 True，
+    补历史也不会启动。停机一天再上线 = 静默丢掉一天的消息，且没有任何报错。
+
+    一个标量水位表达不了「最新 100 条已采、中间 1900 条待采」，所以追赶期间
+    把「追赶完该落到哪」暂存进 `extra[pending_cursor]`，水位原地不动；
+    等某一轮真的翻过了旧水位（`truncated=False`），再一次性落到整段追赶里
+    见过的最大 ID 上。
+    """
+    current = int(source.cursor_message_id) if _is_int(source.cursor_message_id) else None
+    pending = source.extra.get(PENDING_CURSOR_KEY)
+    pending_id = int(pending) if _is_int(str(pending) if pending is not None else None) else None
+
+    highest = max((v for v in (newest, pending_id) if v is not None), default=None)
+    if highest is None:
+        return
+
+    if result.truncated:
+        # 还在追赶中：只记住终点，不动水位
+        if pending_id is None or highest > pending_id:
+            source.extra = {**source.extra, PENDING_CURSOR_KEY: str(highest)}
+        return
+
+    if current is None or highest > current:
+        source.cursor_message_id = str(highest)
+        newest_msg = next(
+            (m for m in result.messages if m.numeric_id == highest),
+            None,
+        )
+        if newest_msg is not None:
+            source.cursor_published_at = newest_msg.published_at
+
+    if pending is not None:
+        # 追赶结束，状态用完就清 —— 留着会让下一轮从一个陈旧的位置接着翻
+        source.extra = {k: v for k, v in source.extra.items() if k != PENDING_CURSOR_KEY}
 
 
 def _is_int(value: str | None) -> bool:
