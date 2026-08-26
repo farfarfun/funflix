@@ -12,6 +12,7 @@ from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.backoff import MAX_BACKOFF, backoff
 from funflix.models import Source, utcnow
 from funflix.schemas.raw import RawDocumentCreate
 from funflix.services.collect.base import CollectedMessage, Collector
@@ -19,10 +20,6 @@ from funflix.services.collect.registry import get_collector
 from funflix.services.ingest import ingest_document
 
 logger = logging.getLogger(__name__)
-
-#: 失败退避上限
-_MAX_BACKOFF = timedelta(hours=6)
-
 
 @dataclass(slots=True)
 class CollectReport:
@@ -47,10 +44,6 @@ class CollectReport:
         return self.error is None
 
 
-def _backoff(failures: int) -> timedelta:
-    return min(timedelta(seconds=60 * 2**failures), _MAX_BACKOFF)
-
-
 async def collect_source(
     session: AsyncSession,
     source: Source,
@@ -65,7 +58,7 @@ async def collect_source(
     if collector is None:
         report.error = f"没有 {source.source_type.value} 类型的采集器"
         source.last_error = report.error
-        source.next_fetch_at = now + _MAX_BACKOFF
+        source.next_fetch_at = now + MAX_BACKOFF
         return report
 
     try:
@@ -73,7 +66,7 @@ async def collect_source(
     except Exception as exc:  # 网络抖动、页面改版、被限流都收敛到这里
         source.consecutive_failures += 1
         source.last_error = f"{type(exc).__name__}: {exc}"
-        source.next_fetch_at = now + _backoff(source.consecutive_failures)
+        source.next_fetch_at = now + backoff(source.consecutive_failures)
         report.error = source.last_error
         logger.warning("采集失败 source=%s: %s", source.identifier, source.last_error)
         return report

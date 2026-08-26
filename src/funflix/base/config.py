@@ -100,6 +100,27 @@ class Settings(BaseSettings):
     #: 管理类接口（reparse / recheck / stats）的鉴权 key；为空则这些接口关闭。
     admin_api_key: str | None = None
 
+    # --- 后台 worker（见 docs/DESIGN.md §5）---
+    #: API 进程内是否顺带跑后台 worker。
+    #:
+    #: 默认**关闭**，与设计文档不同，理由是两个：一是开着的话 `funflix serve`
+    #: 会自己开始调 LLM 和探网盘，一条会真实花钱的副作用不该由"起个 API"隐式触发；
+    #: 二是 uvicorn 多 worker 部署时每个进程都会起一份，租约虽然能防重复处理，
+    #: 但白白多出几倍的空转轮询。生产建议用独立的 `funflix worker` 进程。
+    worker_enabled: bool = False
+    #: 两轮扫描之间的间隔
+    worker_poll_seconds: int = 60
+    #: 任务租约时长。必须显著长于单条任务的正常耗时（LLM 调用可能几十秒），
+    #: 否则任务还在跑租约就过期了，会被另一个 worker 重复领取，白烧一次 token。
+    worker_lease_seconds: int = 300
+    worker_collect_batch: int = 5
+    worker_parse_batch: int = 20
+    worker_verify_batch: int = 20
+    #: 每个网盘每秒最多几次探测
+    worker_verify_rate: float = 1.0
+    #: 强制使用某个抽取器；留空则按来源类型自动选
+    worker_extractor: str | None = None
+
     # --- 摄入 ---
     #: 单次批量提交的最大条数
     ingest_max_batch: int = 200

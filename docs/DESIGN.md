@@ -12,7 +12,7 @@
 | 迁移 | Alembic（`render_as_batch=True`） | SQLite 的 ALTER 限制 |
 | 抽取 | 全量 LLM（Claude，结构化输出） | 每条原始文本一次调用 |
 | 网盘 | fundrive 2.0 + 自研 HTTP 探针 | 见 §6 |
-| 后台 | FastAPI `BackgroundTasks` + 库内状态机 + 启动补偿 | 见 §5 |
+| 后台 | 库内状态机 + 租约领取 + `asyncio` 常驻循环 | 见 §5 |
 | 凭证 | funsecret（fundrive 原生配置方式） | 不入库不入 git |
 
 ### SQLite → PG 的兼容约束
@@ -255,18 +255,41 @@ LLM 出错代价最高的是链接，所以链接走**双轨**：
 
 ## 5. 后台任务执行
 
-你选了 `BackgroundTasks`。它本身**不持久、进程重启即丢**，所以设计上把可靠性放在库里，`BackgroundTasks` 只当"触发器"：
+可靠性放在库里，进程只是执行器。实现在 `funflix/worker/`：
 
 1. **状态即队列**：`parse_status` / `check_status` + `lease_until` + `attempts` 就是任务表。
-2. **租约领取**：worker 执行前把状态置 `running` 并写 `lease_until = now + 5min`。崩溃后租约过期，任务自动可被重捞。
-3. **启动补偿**：FastAPI `lifespan` 启动时扫一遍
-   `parse_status in (pending, running) AND lease_until < now`
-   `check_status = unchecked OR next_check_at < now`
-   重新投递。这让整体退化为 **at-least-once**，而不是"丢了就没了"。
-4. **周期扫描**：`asyncio` 常驻任务，每 60s 跑一次上面的补偿查询，兼做失效链接的 TTL 复查。
-5. **逃生舱**：`funflix worker` CLI 跑同一套 claim 逻辑，脱离 API 进程独立消费。想上 Celery/arq 时，只需把 claim 循环换成 broker 消费，模型层不动。
+2. **租约领取**（`worker/claim.py`）：核心是一条**带守卫的 UPDATE** ——
 
-重试：指数退避 `min(2^attempts * 60s, 6h)`，`attempts > 5` 置终态 `failed` / `error`。
+   ```sql
+   UPDATE raw_document SET parse_status='running', lease_until=:until
+    WHERE id=:id AND <与候选查询完全相同的条件>
+   ```
+
+   `rowcount == 1` 才算领到。两个 worker 同时盯上同一行时只有一个能命中，
+   另一个拿到 0 行自动跳过。不用 `FOR UPDATE SKIP LOCKED` 是因为 SQLite 不支持，
+   而 schema 必须两库通吃（§1）。守卫条件与候选查询共用同一份表达式，避免二者各自演化。
+3. **过期租约即补偿**：候选条件同时接受「pending 且无租约」与「running 且租约已过期」，
+   崩溃遗留的任务在租约到期后自动回到队列 —— 补偿是领取逻辑的一部分，
+   **不需要**单独的启动扫描。启动时只做一次只读体检并打日志。
+
+   刻意不在启动时强清租约：多 worker 部署下，此刻未过期的租约可能正被另一个
+   活着的进程持有，清掉它就会造成同一条任务被两个进程同时处理 —— 正是租约要防的事。
+4. **毒任务防护**：逐行领取（而非一条 UPDATE 批量领）是为了分辨每一行是「新任务」
+   还是「上一个 worker 崩溃后被重捞的任务」。后者计入 `attempts`，够次数后置终态；
+   否则一条能让进程崩溃的文档会被无限重捞，worker 起来、崩掉、再起来，永远卡在它上面。
+5. **周期扫描**（`worker/scheduler.py`）：`asyncio` 常驻循环，默认每 60s 把
+   采集 → 解析 → 校验各推进一批。顺序有意为之：本轮采到的新文本能被本轮解析吃掉，
+   产出的资源又能被本轮校验捡走，一轮走完整条流水线。
+6. **逃生舱**：`funflix worker` CLI 跑同一套 claim 逻辑，脱离 API 进程独立消费；
+   `--once` 只跑一轮。想上 Celery/arq 时只需替换轮询循环，模型层不动。
+
+进程内 worker（`FUNFLIX_WORKER_ENABLED`）**默认关闭**：一是开着的话 `funflix serve`
+会自己开始调 LLM、探网盘，一条真实花钱的副作用不该由"起个 API"隐式触发；
+二是 uvicorn 多 worker 部署时每个进程都会起一份，租约虽能防重复处理，但白白多出几倍空转。
+生产建议用独立的 `funflix worker` 进程。
+
+重试：指数退避 `min(60s * 2^attempts, 6h)`（`base/backoff.py`，三条流水线共用），
+解析 `attempts >= 5` 置终态 `failed`。校验不设终态 —— 探测很便宜，靠退避封顶即可。
 
 ---
 
@@ -448,13 +471,13 @@ funflix = "funflix.cli:app"
 
 | 阶段 | 内容 | 产出 |
 | --- | --- | --- |
-| M1 | config / db / models / alembic / `POST /raw` + `GET /raw/{id}` | 原始文本能进能出 |
-| M2 | `linkscan` 正则 + `normalize` 归一 + 单测 | 纯函数层，无外部依赖，先测扎实 |
-| M3 | LLM 抽取 + `extraction` 缓存 + 落库 pipeline | 端到端出结构化数据 |
-| M4 | verify 抽象 + quark/alipan 两个匿名探针 + 限流 | 校验闭环 |
-| M5 | worker claim/lease + 启动补偿 + 周期扫描 | 可靠性 |
-| M6 | `/search` + SearchBackend + media 聚合 | 对外查询 |
-| M7 | 其余网盘探针、admin stats、CLI 批量导入 | 铺开 |
+| M1 ✅ | config / db / models / alembic / `POST /raw` + `GET /raw/{id}` | 原始文本能进能出 |
+| M2 ✅ | `linkscan` 正则 + `normalize` 归一 + 单测 | 纯函数层，无外部依赖，先测扎实 |
+| M3 ✅ | LLM 抽取 + `extraction` 缓存 + 落库 pipeline | 端到端出结构化数据 |
+| M4 ✅ | verify 抽象 + quark/alipan 两个匿名探针 + 限流 | 校验闭环 |
+| M5 ✅ | worker claim/lease + 周期扫描 + `funflix worker` | 可靠性 |
+| M6 🚧 | `/search` + SearchBackend + media 聚合 | 服务层与 CLI 已有；缺 HTTP 路由与 SqliteFtsBackend |
+| M7 🚧 | 其余网盘探针、admin stats、CLI 批量导入 | 批量导入已有；缺其余探针与 admin 接口 |
 
 ---
 

@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.backoff import backoff
 from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, MediaType, ParseStatus, Quality
 from funflix.models import (
     Extraction,
@@ -32,8 +32,9 @@ from funflix.services.text.normalize import tag_norm_key
 
 logger = logging.getLogger(__name__)
 
-_MAX_PARSE_ATTEMPTS = 5
-_MAX_BACKOFF = timedelta(hours=6)
+#: 连续失败这么多次后置终态 failed，不再自动重试。
+#: worker 领取时也要用它判断"崩溃重捞"是否已经捞够次数，故为公开常量。
+MAX_PARSE_ATTEMPTS = 5
 
 
 @dataclass(slots=True)
@@ -56,10 +57,6 @@ class ParseReport:
     @property
     def ok(self) -> bool:
         return self.error is None
-
-
-def _backoff(attempts: int) -> timedelta:
-    return min(timedelta(seconds=60 * 2**attempts), _MAX_BACKOFF)
 
 
 async def _load_cached(
@@ -309,12 +306,12 @@ async def parse_document(
         doc.parse_attempts += 1
         doc.parse_error = f"{type(exc).__name__}: {exc}"
         doc.lease_until = None
-        if doc.parse_attempts >= _MAX_PARSE_ATTEMPTS:
+        if doc.parse_attempts >= MAX_PARSE_ATTEMPTS:
             doc.parse_status = ParseStatus.FAILED
             doc.next_parse_at = None
         else:
             doc.parse_status = ParseStatus.PENDING
-            doc.next_parse_at = now + _backoff(doc.parse_attempts)
+            doc.next_parse_at = now + backoff(doc.parse_attempts)
         report.status = doc.parse_status
         report.error = doc.parse_error
         logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)

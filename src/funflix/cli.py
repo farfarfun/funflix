@@ -213,6 +213,82 @@ def run(
     parse(extractor=extractor, limit=limit, doc_id=None, force=False)
 
 
+# --- worker ------------------------------------------------------------------
+
+
+@app.command()
+def worker(
+    once: Annotated[bool, typer.Option("--once", help="只跑一轮就退出，不常驻")] = False,
+    interval: Annotated[int | None, typer.Option(help="轮询间隔秒数，覆盖配置")] = None,
+    lease: Annotated[int | None, typer.Option(help="任务租约秒数，覆盖配置")] = None,
+    parse_batch: Annotated[int | None, typer.Option(help="每轮解析多少条")] = None,
+    verify_batch: Annotated[int | None, typer.Option(help="每轮校验多少条")] = None,
+    collect_batch: Annotated[int | None, typer.Option(help="每轮采集多少个源")] = None,
+    extractor: Annotated[str | None, typer.Option(help="强制抽取器，留空按源类型自动选")] = None,
+) -> None:
+    """常驻后台 worker：周期性地采集、解析、校验。
+
+    与 `run` 的区别是它带**租约**：多个 worker 可以同时跑同一个库，
+    同一条任务不会被两个进程重复处理；进程崩了，租约过期后任务自动回到队列。
+    `run` 没有这层保护，只适合手动跑一次。
+    """
+    from funflix.worker import Worker
+
+    settings = get_settings().model_copy(
+        update={
+            k: v
+            for k, v in {
+                "worker_poll_seconds": interval,
+                "worker_lease_seconds": lease,
+                "worker_parse_batch": parse_batch,
+                "worker_verify_batch": verify_batch,
+                "worker_collect_batch": collect_batch,
+                "worker_extractor": extractor,
+            }.items()
+            if v is not None
+        }
+    )
+
+    instance = Worker(settings)
+
+    if once:
+
+        async def _one() -> Any:
+            await instance.startup_check()
+            return await instance.run_once()
+
+        report = _run(_one)
+        _table(
+            [
+                ["采集", report.collect.claimed, report.collect.succeeded, report.collect.failed],
+                ["解析", report.parse.claimed, report.parse.succeeded, report.parse.failed],
+                ["校验", report.verify.claimed, report.verify.succeeded, report.verify.failed],
+            ],
+            ["队列", "领取", "成功", "失败"],
+        )
+        reclaimed = report.collect.reclaimed + report.parse.reclaimed + report.verify.reclaimed
+        if reclaimed:
+            _warn(f"重捞了 {reclaimed} 条上次未收尾的任务")
+        if report.idle:
+            typer.echo("三条队列都没有到点的任务")
+        else:
+            _ok("一轮完成")
+        return
+
+    _dim(
+        f"轮询 {settings.worker_poll_seconds}s，租约 {settings.worker_lease_seconds}s，"
+        f"批次 采集{settings.worker_collect_batch}/"
+        f"解析{settings.worker_parse_batch}/校验{settings.worker_verify_batch}"
+    )
+    _heading("worker 运行中，Ctrl-C 停止")
+    try:
+        _run(instance.run_forever)
+    except KeyboardInterrupt:
+        # asyncio.run 会把 KeyboardInterrupt 透上来，这里只是让它安静退出
+        typer.echo()
+        _ok("worker 已停止")
+
+
 # --- serve -------------------------------------------------------------------
 
 

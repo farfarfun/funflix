@@ -9,6 +9,7 @@ from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.backoff import backoff
 from funflix.base.enums import CheckStatus, Provider
 from funflix.models import LinkCheck, Resource, utcnow
 from funflix.services.verify.base import CheckOutcome, LinkProbe, LinkRef
@@ -28,7 +29,6 @@ _RECHECK_TTL: dict[CheckStatus, timedelta | None] = {
 
 #: 连续这么多次判定失效后，不再浪费请求
 _INVALID_CONFIRM_TIMES = 2
-_MAX_BACKOFF = timedelta(hours=6)
 
 
 class RateLimiter:
@@ -82,8 +82,7 @@ def _next_check_at(resource: Resource, outcome: CheckOutcome):
 
     if outcome.status in {CheckStatus.RATE_LIMITED, CheckStatus.ERROR}:
         # 不是关于链接的结论 —— 退避重试，不要当成失效
-        backoff = min(timedelta(seconds=60 * 2**resource.check_attempts), _MAX_BACKOFF)
-        return now + backoff
+        return now + backoff(resource.check_attempts)
 
     ttl = _RECHECK_TTL.get(outcome.status)
     return now + ttl if ttl else None
@@ -94,9 +93,21 @@ async def check_resource(
     resource: Resource,
     probe: LinkProbe | None = None,
     limiter: RateLimiter | None = None,
+    *,
+    prior_status: CheckStatus | None = None,
 ) -> VerifyReport:
-    """校验一条资源，写入历史并更新最新状态。"""
+    """校验一条资源，写入历史并更新最新状态。
+
+    Args:
+        prior_status: 领取任务前的真实结论。worker 领取时会把 `check_status`
+            置成 `checking` 占位，那不是一个结论 —— 拿它跟本次结果比较，
+            "连续两次失效"永远算不出来（每轮都被重置成 1），§6.4 里
+            "确认两次失效后停止复查"就永远不会触发，失效链接会被无限复查。
+            CLI 直接校验单条资源时不传，此时用资源当前状态即可。
+    """
     before = resource.check_status
+    #: 判断"本次结论是否延续上一次"的基准。
+    baseline = prior_status if prior_status is not None else before
     probe = probe or get_probe(resource.provider)
 
     if probe is None:
@@ -135,7 +146,15 @@ async def check_resource(
         )
     )
 
-    resource.check_attempts = resource.check_attempts + 1 if outcome.status is before else 1
+    if baseline is CheckStatus.CHECKING:
+        # 领取前的结论不可知（比如上一个 worker 崩在了这条上）。
+        # 保守地累加而不是重置 —— 宁可早一点停止复查，也不要因为反复重置
+        # 让一条早已失效的链接被永远复查下去。
+        resource.check_attempts += 1
+    else:
+        resource.check_attempts = (
+            resource.check_attempts + 1 if outcome.status is baseline else 1
+        )
     resource.check_status = outcome.status
     resource.last_checked_at = now
     resource.next_check_at = _next_check_at(resource, outcome)
@@ -145,7 +164,7 @@ async def check_resource(
     return VerifyReport(
         resource_id=resource.id,
         status=outcome.status,
-        before=before,
+        before=baseline,
         detail=outcome.detail,
         latency_ms=outcome.latency_ms,
     )
