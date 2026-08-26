@@ -2,7 +2,7 @@
 
 影视资源分享文本的结构化采集、解析与网盘链接校验。
 
-完整设计见 [docs/DESIGN.md](docs/DESIGN.md)。
+完整设计见 [docs/DESIGN.md](docs/DESIGN.md)，已知待优化项见 [docs/TODO.md](docs/TODO.md)。
 
 ## 流水线
 
