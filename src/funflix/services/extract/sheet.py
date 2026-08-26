@@ -22,6 +22,7 @@ from funflix.services.text.normalize import (
     clean_title,
     extract_episode_info,
     extract_quality,
+    extract_tags,
     extract_year,
     guess_media_type,
     looks_like_catalog,
@@ -192,7 +193,8 @@ class SheetExtractor:
             media_type=media_type,
             episode_info=extract_episode_info(episode_text),
             quality=extract_quality(quality_text) if quality_text else Quality.UNKNOWN,
-            # 一行就是一部作品 —— 行内所有链接都归它，不存在归属歧义
+            # 一行就是一部作品 —— 行内所有链接和井号标签都归它，不存在归属歧义
+            tags=extract_tags(content),
             links=links,
         )
 

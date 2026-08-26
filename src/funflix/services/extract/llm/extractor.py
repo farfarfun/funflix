@@ -15,7 +15,7 @@ from funflix.services.extract.base import ExtractedItem, ExtractionOutcome
 from funflix.services.extract.llm.client import LLMClient, LLMResult, build_default_client
 from funflix.services.extract.llm.prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_user_message
 from funflix.services.text.linkscan import ScannedLink, scan_links
-from funflix.services.text.normalize import clean_title, norm_key
+from funflix.services.text.normalize import clean_title, extract_tags, norm_key
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,9 @@ def _optional_str(value: Any) -> str | None:
     return text or None
 
 
-def parse_payload(payload: dict[str, Any], links: list[ScannedLink]) -> ExtractionOutcome:
+def parse_payload(
+    payload: dict[str, Any], links: list[ScannedLink], source_text: str = ""
+) -> ExtractionOutcome:
     """把模型返回的原始 payload 校验成结构化结果。
 
     校验而非信任：模型可能给出越界序号、空标题、把同一个链接分给多部作品。
@@ -119,6 +121,18 @@ def parse_payload(payload: dict[str, Any], links: list[ScannedLink]) -> Extracti
             )
         )
 
+    # 井号标签由确定性函数从原文抽，不问 LLM —— `#悬疑` 是作者的明确标注，
+    # 正则拿得又准又便宜，没必要花 token 让模型转述一遍。
+    #
+    # 只在**整条文本恰好对应一部作品**时才挂上去。一条文本含多部作品时，
+    # 无从知道某个标签属于哪一部，全挂等于把恐怖片的标签安到喜剧上，
+    # 污染的是筛选导航 —— 宁可少标也不错标（与 extract_tags 的取舍一致）。
+    if source_text and len(items) == 1:
+        items[0].tags = extract_tags(source_text)
+        stats["tags_attached"] = len(items[0].tags)
+    elif len(items) > 1:
+        stats["tags_skipped_multi_item"] = True
+
     unattributed = [link for i, link in enumerate(links) if i not in claimed]
     stats["links_total"] = len(links)
     stats["links_attributed"] = len(claimed)
@@ -155,7 +169,7 @@ class LLMExtractor:
 
     def rehydrate(self, payload: dict[str, Any], content: str) -> ExtractionOutcome:
         """从 extraction.output 还原，不再调用模型。"""
-        outcome = parse_payload(payload, scan_links(content))
+        outcome = parse_payload(payload, scan_links(content), content)
         outcome.extractor_name = self.name
         return outcome
 
@@ -164,7 +178,7 @@ class LLMExtractor:
         user_message = build_user_message(content, format_link_lines(links))
 
         result: LLMResult = await self._client.extract(SYSTEM_PROMPT, user_message)
-        outcome = parse_payload(result.payload, links)
+        outcome = parse_payload(result.payload, links, content)
         outcome.extractor_name = result.model
         outcome.extractor_version = PROMPT_VERSION
         outcome.input_tokens = result.input_tokens

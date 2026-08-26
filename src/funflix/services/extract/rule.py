@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from typing import Any
 
@@ -20,16 +19,12 @@ from funflix.services.text.normalize import (
     extract_tags,
     extract_year,
     guess_media_type,
+    looks_like_catalog,
     norm_key,
 )
 from funflix.services.text.segment import segment_text
 
 VERSION = "v1"
-
-#: 目录帖/合集帖的标题特征。命中即认为这条文本不代表某一部具体作品。
-_CATALOG_TITLE_RE = re.compile(
-    r"目录|合集|打包|合辑|片单|清单|资源包|更新列表|\d{1,2}\s*月\s*\d{1,2}\s*日"
-)
 
 
 def _looks_like_catalog(title: str, segment_count: int, link_count: int) -> bool:
@@ -37,8 +32,14 @@ def _looks_like_catalog(title: str, segment_count: int, link_count: int) -> bool
 
     两个信号：标题本身像目录，或者「标题数远多于链接数」——
     后者对应"正文罗列几十部片名、底下只给一个总链接"的合集帖。
+
+    标题特征走 `normalize.looks_like_catalog`，这里不再自备一份正则。
+    曾经两份各自演化过：这边漏了「更新N部」、日期只认「N月N日」而不认
+    斜杠/连字符/「号」，也没做全角归一。结果是同一条文本 rule 判成作品、
+    sheet 判成目录 —— 走哪个抽取器决定了落出什么数据，而且不会有任何报错，
+    media 表里会慢慢堆满以日期为名的假作品。
     """
-    if _CATALOG_TITLE_RE.search(title):
+    if looks_like_catalog(title):
         return True
     return segment_count >= 5 and link_count <= 1
 
