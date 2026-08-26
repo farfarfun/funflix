@@ -70,6 +70,12 @@ Releases = "https://github.com/farfarfun/funflix/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/funflix"]
+# 迁移脚本与 alembic.ini 必须进包。它们在仓库根目录、不在 src/funflix 下，
+# 不显式收进来的话装完包只有代码没有迁移，`funflix db upgrade` 会直接报
+# "No 'script_location' key found"，使用方只能再 clone 一份源码建库。
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "funflix/migrations"
+"alembic.ini" = "funflix/alembic.ini"
 
 [tool.setuptools]
 

@@ -3,13 +3,15 @@
 与 `/media` 的区别是视角：这里按链接本身筛（哪个网盘、校验成不成功），
 用于运维排查「夸克最近是不是大面积失效了」这类问题。
 
-**列表接口要 `X-API-Key`**：它按 `provider` / `check_status` 成页吐出整库的
-链接与提取码，整库可在 `总数/200` 次请求内翻完 —— 那是把索引整个交出去，
-和「按作品查详情时附带它的链接」不是一个量级。面向使用者的产品接口是
-`/media` 与 `/media/{id}`，它们保持开放。
+**这个模块整体要 `X-API-Key`**：它按 `provider` / `check_status` 成页吐出
+整库的链接与提取码，是运维视角而非产品视角。面向使用者的接口是
+`/media` 与 `/media/{id}`，保持开放。
 
-单条 `/resources/{id}` 也保持开放：知道 id 才查得到，`/media/{id}` 本来
-就会返回这些 id。
+> ⚠️ 这道锁防的是**成批导出的便利**，不是保密。链接本身来自公开频道，
+> 而且 `/media/{id}` 无凭据就会返回同一份 url 与 passcode，media id 同样
+> 是自增整数 —— 顺序枚举 `/media/{id}` 依然能把全库链接抓走。
+> 真要挡住枚举得靠限流，目前没有（见 docs/TODO.md）。
+> 把这里当成机密边界会得到虚假的安全感。
 """
 
 from __future__ import annotations
@@ -64,7 +66,12 @@ async def list_resources(
 
 
 @router.get("/{resource_id}", response_model=ResourceOut)
-async def get_resource(resource_id: int, session: SessionDep) -> ResourceOut:
+async def get_resource(resource_id: int, session: SessionDep, _: AdminDep) -> ResourceOut:
+    """单条资源详情。与列表接口同样要 key。
+
+    这里曾经是开放的，理由写的是「知道 id 才查得到」—— 那个推理是错的：
+    id 是自增整数，`seq 1 100000` 就能把列表接口上的锁绕过去（issue #2）。
+    """
     return ResourceOut.model_validate(
         await get_or_404(session, Resource, resource_id, "资源不存在")
     )

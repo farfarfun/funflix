@@ -253,8 +253,12 @@ class TestListResources:
         body = (await admin_client.get("/api/v1/resources", params={"provider": "alipan"})).json()
         assert body["total"] == 0
 
-    async def test_404_for_missing(self, client, seeded) -> None:
-        assert (await client.get("/api/v1/resources/99999")).status_code == 404
+    async def test_404_for_missing(self, admin_client, seeded) -> None:
+        assert (await admin_client.get("/api/v1/resources/99999")).status_code == 404
+
+    async def test_single_lookup_requires_key(self, client, seeded) -> None:
+        """issue #2：id 是自增整数，单条不上锁等于列表那把锁白加。"""
+        assert (await client.get("/api/v1/resources/1")).status_code == 403
 
 
 @pytest.mark.asyncio

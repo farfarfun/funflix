@@ -126,6 +126,16 @@ class TestResourceEnumerationIsLocked:
         resp = await keyed.get("/api/v1/resources", headers={"X-API-Key": KEY})
         assert resp.status_code == 200
 
-    async def test_single_lookup_stays_open(self, keyless) -> None:
-        """按 id 查单条不上锁：id 本来就由 /media/{id} 给出。"""
-        assert (await keyless.get("/api/v1/resources/99999")).status_code == 404
+    async def test_single_lookup_also_requires_key(self, keyed) -> None:
+        """单条查询同样要 key（issue #2）。
+
+        原先这里是开放的，理由是「知道 id 才查得到」—— 但 id 是自增整数，
+        `seq 1 100000` 就把列表接口上的锁完全绕过去了。
+        同一份数据在同一模块内，鉴权要求必须一致。
+        """
+        assert (await keyed.get("/api/v1/resources/1")).status_code == 401
+
+    async def test_enumeration_no_longer_bypasses_the_list_lock(self, keyed) -> None:
+        """顺序枚举 id 不该比列表接口更宽松。"""
+        for rid in (1, 2, 3):
+            assert (await keyed.get(f"/api/v1/resources/{rid}")).status_code == 401

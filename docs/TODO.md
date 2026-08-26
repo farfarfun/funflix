@@ -113,7 +113,23 @@ PostgreSQL 上可能因为一次 VACUUM 或计划变化就翻转，和 SQLite �
 
 **怎么做**：`acquire` 的 sleep 时长和 `backoff` 的返回值各加 ±20% 随机。
 
-### 2.4 User-Agent 是写死的单个串
+### 2.4 顺序枚举 `/media/{id}` 依然能抓走全库链接
+
+issue #2 指出 `/resources/{id}` 没上锁、可以顺序枚举绕过列表接口的 AdminDep ——
+已修（`70dffcd` 之后）。但**只修那一处会给虚假的安全感**：
+
+`/media/{id}` 无凭据就返回同一份 `url` 与 `passcode`（`MediaDetail.resources`），
+而 media id 同样是自增整数。`seq 1 100000` 打 `/media/{id}` 照样能把全库链接抓走。
+
+这不是遗漏，是取舍：`/media/{id}` 就是产品接口本身，用户浏览一部剧拿到它的
+链接是这个系统存在的理由，锁掉等于没有产品。所以 `/resources` 上那把锁防的是
+**成批导出的便利**，不是保密 —— 这一点已经写进 `api/v1/resources.py` 的模块说明。
+
+**真要挡枚举只能靠限流**，按 IP / 按 key 限制 `/media/{id}` 的调用速率。
+目前没有任何限流。做之前先想清楚要防谁：链接本身来自公开频道，
+真实损失是聚合结果被整表爬走，不是机密泄露。
+
+### 2.5 User-Agent 是写死的单个串
 
 `base/http.py` 的 `DEFAULT_UA` 是固定的 Chrome/120。
 注释自己写着「太旧会被当成爬虫」，但没人跟版本。DESIGN §6.3 要求的是随机 UA 池。

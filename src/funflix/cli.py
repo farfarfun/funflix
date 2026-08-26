@@ -294,8 +294,41 @@ def serve(
 
 
 def _alembic_config():
+    """定位 alembic 配置与迁移脚本。
+
+    两种运行场景都要成立：
+
+    - **装出来的包**：配置和 migrations/ 都在 `funflix/` 包内（见 pyproject 的
+      force-include）。此时不能依赖当前工作目录 —— 用户在任何目录敲
+      `funflix db upgrade` 都该能建库。
+    - **源码仓库里开发**：包内没有这两个文件，回落到仓库根目录那份。
+
+    `script_location` 一律显式覆盖成绝对路径：alembic.ini 里写的是相对路径
+    `migrations`，它按 cwd 解析，装包场景下必然找不到。
+    """
+    import pathlib
+
     from alembic.config import Config
 
+    pkg = pathlib.Path(__file__).resolve().parent
+    packaged_ini = pkg / "alembic.ini"
+    packaged_migrations = pkg / "migrations"
+
+    if packaged_ini.is_file():
+        cfg = Config(str(packaged_ini))
+        if packaged_migrations.is_dir():
+            cfg.set_main_option("script_location", str(packaged_migrations))
+        return cfg
+
+    # 源码仓库：包目录是 src/funflix，仓库根在它的上两级
+    repo_root = pkg.parent.parent
+    repo_ini = repo_root / "alembic.ini"
+    if repo_ini.is_file():
+        cfg = Config(str(repo_ini))
+        cfg.set_main_option("script_location", str(repo_root / "migrations"))
+        return cfg
+
+    # 都找不到就按老行为走 cwd，让 alembic 自己报它的错
     return Config("alembic.ini")
 
 
