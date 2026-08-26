@@ -347,6 +347,29 @@ class TencentSheetCollector:
             for row_id, cells in rows.items()
         ]
 
+    @staticmethod
+    def _merge_offset(existing: int | None, consumed: int) -> int:
+        """行偏移只能往前，不能倒退。
+
+        backfill 每轮推进 `backfill_pages_per_fetch` 片，一个三万行的 sheet
+        要几百轮才能推到底。而文档一旦追加新行、`ver` 变化，fetch 就会重扫该
+        sheet —— 它只读得起最前面几片，直接覆盖就会把 backfill 的进度打回原点，
+        之后几百次请求全被 content_hash 去重、白跑，期间新追加的行一直取不到。
+        """
+        return max(existing or 0, consumed)
+
+    @staticmethod
+    def _has_pending_rows(offsets: dict[str, int], totals: dict[str, int]) -> bool:
+        """还有没扫到的行吗？用来决定要不要把补历史重新打开。
+
+        `backfill_done` 置 True 之后，全仓库只有 `db reset` 会改回 False。
+        文档追加 5000 行后偏移远小于总行数，但补历史因为 done=True 直接返回，
+        新行永远采不到 —— 而且每轮采集都显示成功。
+
+        总行数未知时返回 False：拿不到 total 就重开的话，补历史会每轮空跑。
+        """
+        return any(off < totals.get(sheet_id, 0) for sheet_id, off in offsets.items())
+
     async def fetch(self, source: Source) -> FetchResult:
         """枚举文档下所有 sheet，拉取版本号变化的那些。"""
         doc_id = source.identifier
@@ -389,14 +412,16 @@ class TencentSheetCollector:
                 if isinstance(total_row, int) and total_row > 0:
                     totals[sheet_id] = total_row
 
-                collected, sheet_pages, sheet_truncated = await self._collect_sheet(
+                collected, sheet_pages, sheet_truncated, consumed = await self._collect_sheet(
                     client, doc_id, sheet_id, payload, total_row, budget - pages
                 )
                 messages.extend(collected)
                 pages += sheet_pages
                 truncated = truncated or sheet_truncated
-                # 记下扫到哪一行，backfill 从这里接着往下扫
-                offsets[sheet_id] = _CHUNK_SIZE * (1 + sheet_pages)
+                # 记下扫到哪一行，backfill 从这里接着往下扫。
+                # 取较大值：backfill 可能已经推得比这一轮远得多，
+                # 直接覆盖会把它几百次请求的进度打回原点。
+                offsets[sheet_id] = self._merge_offset(offsets.get(sheet_id), consumed)
 
                 # 只有整个 sheet 都取完了才推进版本号，
                 # 否则下轮会误以为已同步、跳过剩下的行
@@ -420,6 +445,9 @@ class TencentSheetCollector:
             truncated=truncated,
             title=title,
             state=state,
+            # 还有没扫到的行就要求把补历史重新打开 —— 文档追加新行后，
+            # backfill_done 若还停在 True，那批新行永远采不到。
+            backfill_pending=self._has_pending_rows(offsets, totals),
         )
 
     async def _collect_sheet(
@@ -473,4 +501,6 @@ class TencentSheetCollector:
             )
             for row_id, cells in collected.items()
         ]
-        return messages, pages, truncated
+        # 返回**实际扫到的行偏移**而不是页数：空片会让 pages 加一但 start 不动，
+        # 拿页数反推偏移就会一次多跳一整片（60 行），那批行再也扫不到。
+        return messages, pages, truncated, start

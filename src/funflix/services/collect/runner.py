@@ -117,6 +117,11 @@ async def collect_source(
             # 途中会重新遇到已入库的消息，交给 content_hash 去重。
             source.backfill_cursor_id = source.cursor_message_id
 
+    if result.backfill_pending and source.backfill_done:
+        # 又有没采到的历史内容了，重新打开补历史
+        logger.info("source=%s 出现新的历史内容，重新打开补历史", source.identifier)
+        source.backfill_done = False
+
     source.total_collected += report.created
     source.consecutive_failures = 0
     source.last_error = None

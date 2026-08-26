@@ -45,6 +45,12 @@ class FetchResult:
     backfill_cursor: str | None = None
     #: 历史是否已补到头。置 True 后不再往前空跑。
     backfill_done: bool = False
+    #: 又出现了没采到的历史内容，要求把补历史**重新打开**。
+    #:
+    #: `backfill_done` 只有单向的 False→True，没有回头路。表格类源会追加新行、
+    #: 频道会有一段没翻完的区间 —— 这些都得让补历史重新启动，否则那批内容
+    #: 永远采不到，而每轮采集还都显示成功。
+    backfill_pending: bool = False
 
 
 @runtime_checkable
