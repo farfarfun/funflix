@@ -122,8 +122,11 @@ class Settings(BaseSettings):
     #: 任务租约时长。必须显著长于单条任务的正常耗时（LLM 调用可能几十秒），
     #: 否则任务还在跑租约就过期了，会被另一个 worker 重复领取，白烧一次 token。
     worker_lease_seconds: int = 300
+    #: 每轮采集**每批**领取多少个到点的源；一轮会循环分批领取直到清空，不是硬上限。
     worker_collect_batch: int = 5
+    #: 每轮解析**每批**领取多少条待抽取文本；一轮会循环分批领取直到清空，不是硬上限。
     worker_parse_batch: int = 20
+    #: 每轮校验**每批**领取多少条待复查资源；一轮会循环分批领取直到清空，不是硬上限。
     worker_verify_batch: int = 20
     #: 每个网盘每秒最多几次探测
     worker_verify_rate: float = 1.0

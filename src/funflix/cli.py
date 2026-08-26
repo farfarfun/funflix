@@ -9,7 +9,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import typer
 from sqlalchemy import select
@@ -32,7 +32,7 @@ def _run[T](factory: Callable[[], Awaitable[T]]) -> T:
     return asyncio.run(factory())
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     typer.secho(message, fg=typer.colors.RED, err=True)
     raise typer.Exit(1)
 
@@ -75,6 +75,21 @@ def _table(rows: list[list[Any]], headers: list[str]) -> None:
 def _progress(items: list[Any], desc: str, unit: str) -> Any:
     """统一的进度条。只有多于一项时才显示，避免单条任务被进度条刷屏。"""
     return tqdm(items, desc=desc, unit=unit, leave=False, disable=len(items) <= 1)
+
+
+def _progress_ticker(prefix: str) -> Callable[[str], None]:
+    """`progress_heartbeat` 的 on_tick：用 `tqdm.write` 而不是 print，
+    避免心跳行把正在刷新的 tqdm 进度条截断/错位。
+    """
+
+    def _on_tick(line: str) -> None:
+        tqdm.write(typer.style(f"{prefix} 进度：{line}", fg=typer.colors.BRIGHT_BLACK))
+
+    return _on_tick
+
+
+def _progress_interval(override: int | None) -> int:
+    return get_settings().worker_progress_seconds if override is None else override
 
 
 # --- status ------------------------------------------------------------------
@@ -181,7 +196,9 @@ def status(
 @app.command()
 def run(
     extractor: Annotated[str, typer.Option(help="抽取器：rule / sheet / llm")] = "rule",
-    limit: Annotated[int, typer.Option(help="本轮最多解析多少条")] = 200,
+    limit: Annotated[
+        int | None, typer.Option(help="最多解析多少条，默认不设上限、处理到清空为止")
+    ] = None,
     skip_collect: Annotated[bool, typer.Option("--skip-collect", help="只解析，不采集")] = False,
 ) -> None:
     """一条龙：采集全部启用的源，再解析待处理文本。"""
@@ -201,9 +218,15 @@ def worker(
     once: Annotated[bool, typer.Option("--once", help="只跑一轮就退出，不常驻")] = False,
     interval: Annotated[int | None, typer.Option(help="轮询间隔秒数，覆盖配置")] = None,
     lease: Annotated[int | None, typer.Option(help="任务租约秒数，覆盖配置")] = None,
-    parse_batch: Annotated[int | None, typer.Option(help="每轮解析多少条")] = None,
-    verify_batch: Annotated[int | None, typer.Option(help="每轮校验多少条")] = None,
-    collect_batch: Annotated[int | None, typer.Option(help="每轮采集多少个源")] = None,
+    parse_batch: Annotated[
+        int | None, typer.Option(help="解析阶段每批领取多少条（不是总量上限，跑到队列清空）")
+    ] = None,
+    verify_batch: Annotated[
+        int | None, typer.Option(help="校验阶段每批领取多少条（不是总量上限，跑到队列清空）")
+    ] = None,
+    collect_batch: Annotated[
+        int | None, typer.Option(help="采集阶段每批领取多少个源（不是总量上限，跑到队列清空）")
+    ] = None,
     extractor: Annotated[str | None, typer.Option(help="强制抽取器，留空按源类型自动选")] = None,
     progress_interval: Annotated[
         int | None, typer.Option(help="心跳进度日志间隔秒数，<=0 关闭，覆盖配置")
@@ -217,7 +240,7 @@ def worker(
     """
     import logging
 
-    from funflix.worker import Worker
+    from funflix.worker import Worker, progress_heartbeat
 
     settings = get_settings().model_copy(
         update={
@@ -245,7 +268,11 @@ def worker(
 
         async def _one() -> Any:
             await instance.startup_check()
-            return await instance.run_once()
+            async with progress_heartbeat(
+                settings.worker_progress_seconds,
+                on_tick=lambda line: _dim(f"进度：{line}"),
+            ):
+                return await instance.run_once()
 
         report = _run(_one)
         _table(
@@ -267,8 +294,9 @@ def worker(
 
     _dim(
         f"轮询 {settings.worker_poll_seconds}s，租约 {settings.worker_lease_seconds}s，"
-        f"批次 采集{settings.worker_collect_batch}/"
+        f"每批 采集{settings.worker_collect_batch}/"
         f"解析{settings.worker_parse_batch}/校验{settings.worker_verify_batch}"
+        "（各阶段循环拉取直到清空）"
     )
     _heading("worker 运行中，Ctrl-C 停止")
     try:
@@ -711,6 +739,9 @@ def source_collect(
 @app.command("collect")
 def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
+    progress_interval: Annotated[
+        int | None, typer.Option(help="进度心跳间隔秒数，<=0 关闭，默认取配置")
+    ] = None,
 ) -> None:
     """采集：把源里的新内容写成原始文本。"""
     from sqlalchemy import select
@@ -718,9 +749,14 @@ def collect(
     from funflix.base.db import session_scope
     from funflix.models import Source
     from funflix.services.collect.runner import collect_source
+    from funflix.worker import progress_heartbeat
 
     async def _do() -> list:
-        async with session_scope() as session:
+        interval = _progress_interval(progress_interval)
+        async with (
+            progress_heartbeat(interval, on_tick=_progress_ticker("采集")),
+            session_scope() as session,
+        ):
             if source_id is not None:
                 targets = [await _require_source(session, source_id)]
             else:
@@ -781,16 +817,25 @@ def parse(
         str | None,
         typer.Option(help="抽取器：rule / sheet / llm。留空则按来源类型自动选"),
     ] = None,
-    limit: Annotated[int, typer.Option(help="本次最多解析多少条")] = 50,
+    limit: Annotated[
+        int | None, typer.Option(help="最多解析多少条，默认不设上限、处理到清空为止")
+    ] = None,
+    batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
     doc_id: Annotated[int | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
+    progress_interval: Annotated[
+        int | None, typer.Option(help="进度心跳间隔秒数，<=0 关闭，默认取配置")
+    ] = None,
 ) -> None:
     """抽取：把原始文本解析成作品与资源。
 
     不指定抽取器时按来源类型自动选：表格源用 sheet，自由文本用 rule。
     用错抽取器不会报错，只会静默地大批归属失败，所以默认按源类型分开。
+
+    默认不设总量上限——待处理的文档会一直处理到清空为止，内部按 `--batch-size`
+    分批拉取（不会一次性把全部待处理行都读进内存）。
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import func, or_, select
 
     from funflix.base.db import session_scope
     from funflix.models import RawDocument, utcnow
@@ -800,6 +845,7 @@ def parse(
         supported_extractors,
     )
     from funflix.services.extract.runner import parse_document
+    from funflix.worker import progress_heartbeat
 
     _cache: dict[str, Any] = {}
 
@@ -816,39 +862,69 @@ def parse(
         return _cache[kind]
 
     async def _do() -> list:
-        async with session_scope() as session:
+        interval = _progress_interval(progress_interval)
+        async with (
+            progress_heartbeat(interval, on_tick=_progress_ticker("解析")),
+            session_scope() as session,
+        ):
             if doc_id is not None:
                 doc = await session.get(RawDocument, doc_id)
                 if doc is None:
                     _fail(f"文档 #{doc_id} 不存在")
-                docs = [doc]
-            else:
-                now = utcnow()
-                docs = list(
-                    await session.scalars(
-                        select(RawDocument)
-                        .where(
-                            RawDocument.parse_status == ParseStatus.PENDING,
-                            or_(
-                                RawDocument.next_parse_at.is_(None),
-                                RawDocument.next_parse_at <= now,
-                            ),
-                        )
-                        .order_by(RawDocument.id)
-                        .limit(limit)
-                    )
+                report = await parse_document(session, doc, _extractor_for(doc), force=force)
+                await session.commit()
+                return [report]
+
+            now = utcnow()
+            conditions = (
+                RawDocument.parse_status == ParseStatus.PENDING,
+                or_(
+                    RawDocument.next_parse_at.is_(None),
+                    RawDocument.next_parse_at <= now,
+                ),
+            )
+            total = int(
+                await session.scalar(
+                    select(func.count()).select_from(RawDocument).where(*conditions)
                 )
-            if not docs:
+                or 0
+            )
+            if limit is not None:
+                total = min(total, limit)
+            if not total:
                 return []
 
-            reports = []
-            bar = _progress(docs, "解析", "条")
-            for doc in bar:
-                impl = _extractor_for(doc)
-                if hasattr(bar, "set_postfix_str"):
-                    bar.set_postfix_str(impl.name)
-                reports.append(await parse_document(session, doc, impl, force=force))
-            await session.commit()
+            reports: list[Any] = []
+            remaining = total
+            last_id = 0
+            bar = tqdm(total=total, desc="解析", unit="条", leave=False, disable=total <= 1)
+            try:
+                while remaining > 0:
+                    fetch = min(batch_size, remaining)
+                    # 按 id 游标翻页，而不是复用同一个 WHERE 反复查——已处理的
+                    # 行状态变化未必总能把自己排除出条件（比如未来加了强制
+                    # 全量重跑之类的开关），游标才能保证不会在同一批里死循环。
+                    docs = list(
+                        await session.scalars(
+                            select(RawDocument)
+                            .where(*conditions, RawDocument.id > last_id)
+                            .order_by(RawDocument.id)
+                            .limit(fetch)
+                        )
+                    )
+                    if not docs:
+                        break
+                    for doc in docs:
+                        impl = _extractor_for(doc)
+                        if hasattr(bar, "set_postfix_str"):
+                            bar.set_postfix_str(impl.name)
+                        reports.append(await parse_document(session, doc, impl, force=force))
+                        bar.update(1)
+                    last_id = docs[-1].id
+                    await session.commit()
+                    remaining -= len(docs)
+            finally:
+                bar.close()
             return reports
 
     reports = _run(_do)
@@ -876,63 +952,103 @@ def parse(
 
 @app.command()
 def verify(
-    limit: Annotated[int, typer.Option(help="本次最多校验多少条")] = 50,
+    limit: Annotated[
+        int | None, typer.Option(help="最多校验多少条，默认不设上限、处理到清空为止")
+    ] = None,
+    batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
     resource_id: Annotated[int | None, typer.Option(help="只校验指定资源")] = None,
     rate: Annotated[float, typer.Option(help="每个网盘每秒最多几次请求")] = 1.0,
     recheck_all: Annotated[
         bool, typer.Option("--recheck-all", help="忽略复查时间，重校验全部可校验资源")
     ] = False,
+    progress_interval: Annotated[
+        int | None, typer.Option(help="进度心跳间隔秒数，<=0 关闭，默认取配置")
+    ] = None,
 ) -> None:
-    """校验：探测网盘链接现在还能不能用。"""
-    from sqlalchemy import or_, select
+    """校验：探测网盘链接现在还能不能用。
+
+    默认不设总量上限——待校验的资源会一直处理到清空为止，内部按 `--batch-size`
+    分批拉取（不会一次性把全部待校验行都读进内存）。
+    """
+    from sqlalchemy import func, or_, select
 
     from funflix.base.db import session_scope
     from funflix.base.enums import CHECKABLE_PROVIDERS
     from funflix.models import Resource, utcnow
     from funflix.services.verify.registry import assert_registry_matches_enum, get_probe
     from funflix.services.verify.runner import RateLimiter, check_resource
+    from funflix.worker import progress_heartbeat
 
     assert_registry_matches_enum()
     limiter = RateLimiter(rate_per_second=rate)
     probes: dict[Any, Any] = {}
 
     async def _do() -> list:
-        async with session_scope() as session:
+        interval = _progress_interval(progress_interval)
+        async with (
+            progress_heartbeat(interval, on_tick=_progress_ticker("校验")),
+            session_scope() as session,
+        ):
             if resource_id is not None:
                 target = await session.get(Resource, resource_id)
                 if target is None:
                     _fail(f"资源 #{resource_id} 不存在")
-                rows = [target]
-            else:
-                now = utcnow()
-                conditions = [Resource.provider.in_(CHECKABLE_PROVIDERS)]
-                if not recheck_all:
-                    conditions.append(
-                        or_(
-                            Resource.next_check_at.is_(None)
-                            & (Resource.check_status == CheckStatus.UNCHECKED),
-                            Resource.next_check_at <= now,
-                        )
-                    )
-                rows = list(
-                    await session.scalars(
-                        select(Resource)
-                        .where(*conditions)
-                        .order_by(Resource.next_check_at.nulls_first(), Resource.id)
-                        .limit(limit)
+                probe = probes.setdefault(target.provider, get_probe(target.provider))
+                report = await check_resource(session, target, probe, limiter)
+                await session.commit()
+                return [report]
+
+            now = utcnow()
+            conditions = [Resource.provider.in_(CHECKABLE_PROVIDERS)]
+            if not recheck_all:
+                conditions.append(
+                    or_(
+                        Resource.next_check_at.is_(None)
+                        & (Resource.check_status == CheckStatus.UNCHECKED),
+                        Resource.next_check_at <= now,
                     )
                 )
-            if not rows:
+
+            total = int(
+                await session.scalar(select(func.count()).select_from(Resource).where(*conditions))
+                or 0
+            )
+            if limit is not None:
+                total = min(total, limit)
+            if not total:
                 return []
 
-            reports = []
-            bar = _progress(rows, "校验", "条")
-            for row in bar:
-                probe = probes.setdefault(row.provider, get_probe(row.provider))
-                if hasattr(bar, "set_postfix_str"):
-                    bar.set_postfix_str(row.provider.value)
-                reports.append(await check_resource(session, row, probe, limiter))
-            await session.commit()
+            reports: list[Any] = []
+            remaining = total
+            last_id = 0
+            bar = tqdm(total=total, desc="校验", unit="条", leave=False, disable=total <= 1)
+            try:
+                while remaining > 0:
+                    fetch = min(batch_size, remaining)
+                    # 按 id 游标翻页：`--recheck-all` 下 WHERE 条件本身不会
+                    # 因为处理过就自动排除已处理的行（只看 provider，跟校验
+                    # 状态无关），不用游标会在同一批里死循环重复捞回同一批行。
+                    rows = list(
+                        await session.scalars(
+                            select(Resource)
+                            .where(*conditions, Resource.id > last_id)
+                            .order_by(Resource.id)
+                            .limit(fetch)
+                        )
+                    )
+                    if not rows:
+                        break
+                    for row in rows:
+                        probe = probes.setdefault(row.provider, get_probe(row.provider))
+                        if hasattr(bar, "set_postfix_str"):
+                            bar.set_postfix_str(row.provider.value)
+                        reports.append(await check_resource(session, row, probe, limiter))
+                        bar.update(1)
+                    last_id = rows[-1].id
+                    await session.commit()
+                    remaining -= len(rows)
+            finally:
+                bar.close()
             return reports
 
     reports = _run(_do)

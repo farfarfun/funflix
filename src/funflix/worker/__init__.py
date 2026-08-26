@@ -17,7 +17,14 @@ from funflix.worker.claim import (
     claim_resources,
     claim_sources,
 )
-from funflix.worker.scheduler import CycleReport, StaleSummary, Worker, spawn, stale_summary
+from funflix.worker.scheduler import (
+    CycleReport,
+    StaleSummary,
+    Worker,
+    progress_heartbeat,
+    spawn,
+    stale_summary,
+)
 from funflix.worker.tasks import (
     BatchReport,
     run_collect_batch,
@@ -35,6 +42,7 @@ __all__ = [
     "claim_documents",
     "claim_resources",
     "claim_sources",
+    "progress_heartbeat",
     "run_collect_batch",
     "run_parse_batch",
     "run_verify_batch",

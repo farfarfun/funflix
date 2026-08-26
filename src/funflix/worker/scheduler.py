@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -205,6 +205,69 @@ async def progress_snapshot(session: AsyncSession) -> ProgressSnapshot:
     )
 
 
+async def _run_progress_ticks(
+    stop: asyncio.Event,
+    interval: int,
+    session_factory: SessionFactory,
+    on_tick: Callable[[str], None],
+) -> None:
+    """每隔 `interval` 秒调一次 `on_tick(line)`，直到 `stop` 被置位。
+
+    只读快照，不消费任何任务；查询失败不该拖累调用方，兜在这里自己重试。
+    """
+    while not stop.is_set():
+        try:
+            async with session_factory() as session:
+                snapshot = await progress_snapshot(session)
+            on_tick(snapshot.line())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("进度查询失败，%ss 后重试", interval)
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            pass
+
+
+def _default_on_tick(line: str) -> None:
+    logger.info("进度：%s", line)
+
+
+@asynccontextmanager
+async def progress_heartbeat(
+    interval: int,
+    session_factory: SessionFactory = session_scope,
+    *,
+    on_tick: Callable[[str], None] | None = None,
+) -> AsyncIterator[None]:
+    """后台每隔 `interval` 秒汇报一次三条队列当前各态的数据量。
+
+    给一次性命令（`collect` / `parse` / `verify` / `worker --once`）用，
+    跟 `Worker.run_forever` 的心跳共享同一份快照逻辑。`interval <= 0` 时
+    直接是个空操作，调用方不用自己判断开关。
+    """
+    if interval <= 0:
+        yield
+        return
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        _run_progress_ticks(stop, interval, session_factory, on_tick or _default_on_tick),
+        name="funflix-progress-heartbeat",
+    )
+    try:
+        yield
+    finally:
+        # 只置位 stop、不 cancel()：心跳大多数时候都在 `stop.wait()` 里挂着，
+        # set() 就能让它立刻醒来退出。若这一刻正巧卡在一次查询中途，
+        # 也让它把这次查询走完再看 stop —— 强行 cancel 会打断 aiosqlite
+        # 连接的正常收尾，析构线程在事件循环关掉之后再回调会报一堆噪音。
+        stop.set()
+        await task
+
+
 class Worker:
     """把三条队列轮流推进的常驻循环。
 
@@ -240,10 +303,14 @@ class Worker:
         return stale
 
     async def run_once(self) -> CycleReport:
-        """跑一轮：采集 → 解析 → 校验，各推进一批。
+        """跑一轮：采集 → 解析 → 校验，各推进到队列清空。
 
         顺序是有意的 —— 先采集拿到新文本，本轮的解析就能直接吃到它，
         新文本产出的资源又能被本轮的校验捡走，一轮走完整条流水线。
+
+        每个阶段内部会循环分批领取直到队列清空，而不是只推进一批 ——
+        某一队列大量积压时会在这一轮里长时间独占，暂时不轮到另外两个阶段，
+        这是刻意的取舍：比起"公平但谁都清不完"，用户更想要"跑完就是真的清空了"。
         """
         report = CycleReport()
         cfg = self.settings
@@ -268,35 +335,6 @@ class Worker:
             )
         return report
 
-    async def _progress_loop(self, stop: asyncio.Event, interval: int) -> None:
-        """每隔 `interval` 秒打一行心跳：三条队列当前各态的数据量。
-
-        与 `run_once` 的批处理循环完全独立 —— 只读快照，不消费任何任务，
-        跑崩了也不该拖累主循环，异常兜在这里自己重试。
-        """
-        while not stop.is_set():
-            try:
-                async with self._session_factory() as session:
-                    snapshot = await progress_snapshot(session)
-                logger.info("worker 进度：%s", snapshot.line())
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("worker 进度查询失败，%ss 后重试", interval)
-
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=interval)
-            except TimeoutError:
-                pass
-
-    def _spawn_progress_loop(self, stop: asyncio.Event) -> asyncio.Task[None] | None:
-        interval = self.settings.worker_progress_seconds
-        if interval <= 0:
-            return None
-        return asyncio.create_task(
-            self._progress_loop(stop, interval), name="funflix-worker-progress"
-        )
-
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
         """一直跑，直到 `stop` 被置位或任务被取消。"""
         stop = stop or asyncio.Event()
@@ -304,31 +342,27 @@ class Worker:
         await self.startup_check()
         logger.info("worker 启动，轮询间隔 %ss，租约 %s", interval, self._lease)
 
-        progress_task = self._spawn_progress_loop(stop)
+        async with progress_heartbeat(
+            self.settings.worker_progress_seconds,
+            self._session_factory,
+            on_tick=lambda line: logger.info("worker 进度：%s", line),
+        ):
+            while not stop.is_set():
+                try:
+                    report = await self.run_once()
+                    if not report.idle:
+                        logger.info("worker 一轮完成：%s", report.summary())
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # 一轮失败不该让整个 worker 退出 —— 下一轮大概率就好了
+                    # （数据库重启、网络抖动）。真正的坏任务由重试上限兜住。
+                    logger.exception("worker 本轮异常，%ss 后重试", interval)
 
-        while not stop.is_set():
-            try:
-                report = await self.run_once()
-                if not report.idle:
-                    logger.info("worker 一轮完成：%s", report.summary())
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # 一轮失败不该让整个 worker 退出 —— 下一轮大概率就好了
-                # （数据库重启、网络抖动）。真正的坏任务由重试上限兜住。
-                logger.exception("worker 本轮异常，%ss 后重试", interval)
-
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=interval)
-            except TimeoutError:
-                pass  # 正常的轮询间隔到点
-
-        if progress_task is not None:
-            progress_task.cancel()
-            try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                except TimeoutError:
+                    pass  # 正常的轮询间隔到点
 
         logger.info("worker 已停止")
 

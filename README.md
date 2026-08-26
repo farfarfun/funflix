@@ -45,6 +45,27 @@ funflix serve --reload
 # 接口文档 http://127.0.0.1:8000/docs
 ```
 
+## 命令行
+
+| 命令 | 执行的环节 |
+| --- | --- |
+| `funflix collect` | 采集 |
+| `funflix parse` | 解析，默认处理到清空为止，可用 `--limit` 显式设上限 |
+| `funflix verify` | 校验，默认处理到清空为止，可用 `--limit` 显式设上限 |
+| `funflix run` | 采集 → 解析（`--skip-collect` 时只解析，均不含校验），解析默认处理到清空为止 |
+| `funflix worker --once` | 采集 → 解析 → 校验，各推进到队列清空后退出 |
+| `funflix worker` / `funflix serve`（`FUNFLIX_WORKER_ENABLED=true`） | 循环反复：采集 → 解析 → 校验，各推进到队列清空，直到停止（某一队列大量积压时会在这一轮里暂时独占，属预期行为） |
+
+`parse`/`verify` 内部按 `--batch-size`（默认 500）分批拉取执行，不会一次性把全部
+待处理行读进内存；进度条从一开始就按总量显示，过程中持续推进。
+
+以上命令都会每隔 `FUNFLIX_WORKER_PROGRESS_SECONDS`（默认 5，`<=0` 关闭）秒打一行
+`采集[待处理/处理中/已完成] 解析[...] 校验[...]` 心跳，内容是**数据库里全局的三阶段快照**，
+与当前命令具体在跑哪个环节无关；命令自身的处理进度仍看 tqdm 进度条
+（`采集 N/total 源`、`解析 N/total 条` 等）。
+
+`db reset` / `db retag` / `db requeue`、`ingest` 是一次性批量操作，没有逐条推进的过程，不在此列。
+
 ## 配置
 
 所有配置项走 `FUNFLIX_` 前缀的环境变量或 `.env`：
