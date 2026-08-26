@@ -314,9 +314,6 @@ def db_revision(message: Annotated[str, typer.Option("-m", "--message")]) -> Non
 
 #: 重建时清空的数据表。顺序按外键依赖从下游到上游排，
 #: 即便不用 CASCADE 也能安全删。
-_DATA_TABLES = ("media_resource", "link_check", "extraction", "resource", "media", "raw_document")
-
-
 @db_app.command("reset")
 def db_reset(
     keep_documents: Annotated[
@@ -332,62 +329,24 @@ def db_reset(
     默认会把采集水位一起归零 —— 原始文本被清空后若水位还留着，
     采集器会认为"都采过了"，重建后一条都拉不回来。
     """
-    from sqlalchemy import select, text
-
     from funflix.base.db import session_scope
-    from funflix.models import Source
+    from funflix.services.maintenance import data_tables, reset_pipeline_data
 
-    tables = [t for t in _DATA_TABLES if not (keep_documents and t == "raw_document")]
-
-    if keep_documents and not keep_cursors:
-        # 原始文本还在，水位归零只会导致重复采集后被 content_hash 挡掉，无意义
-        keep_cursors = True
-
+    tables = data_tables(keep_documents=keep_documents)
     _warn(f"将清空：{', '.join(tables)}")
-    _warn("采集源配置保留" + ("，水位保留" if keep_cursors else "，采集水位归零"))
+    _warn("采集源配置保留" + ("，水位保留" if keep_cursors or keep_documents else "，采集水位归零"))
     if not yes and not typer.confirm("确认执行？此操作不可撤销"):
         raise typer.Abort()
 
-    async def _do() -> tuple[dict[str, int], dict[str, int]]:
+    async def _do():
         async with session_scope() as session:
+            return await reset_pipeline_data(
+                session, keep_documents=keep_documents, keep_cursors=keep_cursors
+            )
 
-            async def counts() -> dict[str, int]:
-                out = {}
-                for table in [*_DATA_TABLES, "source"]:
-                    out[table] = (
-                        await session.execute(text(f"select count(*) from {table}"))
-                    ).scalar() or 0
-                return out
-
-            before = await counts()
-            if session.bind.dialect.name == "postgresql":
-                await session.execute(
-                    text(f"TRUNCATE {', '.join(tables)} RESTART IDENTITY CASCADE")
-                )
-            else:
-                # SQLite 没有 TRUNCATE，逐表 DELETE
-                for table in tables:
-                    await session.execute(text(f"DELETE FROM {table}"))
-
-            if not keep_cursors:
-                await session.execute(
-                    text(
-                        "UPDATE source SET cursor_message_id=NULL, cursor_published_at=NULL, "
-                        "backfill_cursor_id=NULL, backfill_done=false, total_collected=0, "
-                        "total_backfilled=0, last_error=NULL, consecutive_failures=0, "
-                        "next_fetch_at=NULL"
-                    )
-                )
-                # extra 是 JSON 列，各方言的写法不同，交给 ORM 处理
-                for source in await session.scalars(select(Source)):
-                    source.extra = {}
-
-            await session.commit()
-            return before, await counts()
-
-    before, after = _run(_do)
+    report = _run(_do)
     _table(
-        [[t, before[t], after[t]] for t in [*_DATA_TABLES, "source"]],
+        [[t, report.before[t], report.after[t]] for t in report.before],
         ["表", "重建前", "重建后"],
     )
     _ok("重建完成")
@@ -404,73 +363,23 @@ def db_retag(
 
     同一个标签名在新旧维度下各有一行时会合并：关联迁到新行，旧行删除。
     """
-    from sqlalchemy import delete, func, select, update
-
     from funflix.base.db import session_scope
-    from funflix.models import Tag, TagKind, media_tag
-    from funflix.services.text.normalize import classify_tag
+    from funflix.services.maintenance import retag_all
 
     if not yes and not typer.confirm("将重新归类全部标签并合并重复项，继续？"):
         raise typer.Abort()
 
-    async def _do() -> dict[str, int]:
-        stats = {"total": 0, "moved": 0, "merged": 0, "recounted": 0}
+    async def _do():
         async with session_scope() as session:
-            tags = list(await session.scalars(select(Tag)))
-            stats["total"] = len(tags)
-            # 先建索引，避免每次都查库
-            by_identity = {(t.kind.value, t.norm_key): t for t in tags}
+            return await retag_all(session)
 
-            for tag in tags:
-                new_kind = classify_tag(tag.name)
-                if new_kind == tag.kind.value:
-                    continue
-
-                target = by_identity.get((new_kind, tag.norm_key))
-                if target is None or target.id == tag.id:
-                    tag.kind = TagKind(new_kind)
-                    by_identity[(new_kind, tag.norm_key)] = tag
-                    stats["moved"] += 1
-                    continue
-
-                # 目标维度下已有同名标签：把关联迁过去再删旧行。
-                # 迁移前要剔掉两边都有的作品，否则会撞 (media_id, tag_id) 唯一键。
-                dupes = select(media_tag.c.media_id).where(media_tag.c.tag_id == target.id)
-                await session.execute(
-                    update(media_tag)
-                    .where(media_tag.c.tag_id == tag.id, media_tag.c.media_id.not_in(dupes))
-                    .values(tag_id=target.id)
-                )
-                await session.execute(delete(media_tag).where(media_tag.c.tag_id == tag.id))
-                await session.delete(tag)
-                stats["merged"] += 1
-
-            await session.flush()
-
-            # 关联迁移后计数必然对不上，统一重算而不是增量维护
-            counts = dict(
-                (
-                    await session.execute(
-                        select(media_tag.c.tag_id, func.count()).group_by(media_tag.c.tag_id)
-                    )
-                ).all()
-            )
-            for tag in await session.scalars(select(Tag)):
-                actual = counts.get(tag.id, 0)
-                if tag.media_count != actual:
-                    tag.media_count = actual
-                    stats["recounted"] += 1
-
-            await session.commit()
-        return stats
-
-    stats = _run(_do)
+    report = _run(_do)
     _table(
         [
-            ["标签总数", stats["total"]],
-            ["改了维度", stats["moved"]],
-            ["合并删除", stats["merged"]],
-            ["修正计数", stats["recounted"]],
+            ["标签总数", report.total],
+            ["改了维度", report.moved],
+            ["合并删除", report.merged],
+            ["修正计数", report.recounted],
         ],
         ["项", "数量"],
     )

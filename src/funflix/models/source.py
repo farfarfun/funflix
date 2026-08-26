@@ -72,6 +72,30 @@ class Source(TimestampMixin, Base):
 
     documents: Mapped[list[RawDocument]] = relationship(back_populates="source")
 
+    def reset_watermark(self) -> None:
+        """把水位与健康度归零，保留身份与调度配置。
+
+        清空原始文本后必须调一次：水位还留着的话，采集器会认为"都采过了"，
+        重建后一条也拉不回来。
+
+        方法放在模型上而不是维护脚本里，是因为它要枚举本表的一批列 ——
+        放在这里，加字段的人改的就是同一个文件，漏掉的概率小得多。
+        """
+        self.cursor_message_id = None
+        self.cursor_published_at = None
+        self.backfill_cursor_id = None
+        self.backfill_done = False
+        self.total_collected = 0
+        self.total_backfilled = 0
+        self.last_error = None
+        self.consecutive_failures = 0
+        self.next_fetch_at = None
+        self.last_fetched_at = None
+        self.last_success_at = None
+        self.lease_until = None
+        # 采集器自定义水位（如文档版本号）也在这里，不清就会跟主水位一起卡住
+        self.extra = {}
+
     __table_args__ = (
         sa.UniqueConstraint("source_type", "identifier", name="uq_source_type_identifier"),
         sa.Index("ix_source_fetch_queue", "enabled", "next_fetch_at"),
