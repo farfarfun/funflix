@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
-#: nltsecret 里都没有、环境变量也没给时的兜底。
+#: funsecret 里都没有、环境变量也没给时的兜底。
 #: 用本地 SQLite 而不是报错 —— 让"刚 clone 下来就能跑起来"成立。
 DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./funflix.db"
 
@@ -42,33 +42,33 @@ def to_async_url(url: str) -> str:
 
 
 def resolve_database_url() -> str:
-    """从 nltsecret 读数据库地址：`read_secret("funflix", "db", "url")`。
+    """从 funsecret 读数据库地址：`read_secret("funflix", "db", "url")`。
 
     只在环境变量 `FUNFLIX_DATABASE_URL` 缺失时才会被调用 ——
     pydantic-settings 的取值顺序是「环境变量 > default_factory」，
     这个顺序是刻意保留的：CI 和测试需要能用环境变量强制指向临时库，
     否则跑个测试就连到生产库上了。
 
-    nltsecret 缺失或未配置时回落到本地 SQLite，不抛异常。
+    funsecret 缺失或未配置时回落到本地 SQLite，不抛异常。
     """
     try:
-        from nltsecret import read_secret
+        from funsecret import read_secret
     except ImportError:
-        logger.debug("未安装 nltsecret，使用默认数据库地址")
+        logger.debug("未安装 funsecret，使用默认数据库地址")
         return DEFAULT_DATABASE_URL
 
     try:
         value = read_secret("funflix", "db", "url")
     except Exception as exc:  # 密钥库损坏 / 权限问题，不该让整个应用起不来
-        logger.warning("读取 nltsecret 数据库配置失败，回落到默认值：%s", exc)
+        logger.warning("读取 funsecret 数据库配置失败，回落到默认值：%s", exc)
         return DEFAULT_DATABASE_URL
 
     if not value:
-        logger.debug("nltsecret 中未配置 funflix/db/url，使用默认数据库地址")
+        logger.debug("funsecret 中未配置 funflix/db/url，使用默认数据库地址")
         return DEFAULT_DATABASE_URL
 
     # 只记方言，不记完整 URL —— 它可能带账号密码
-    logger.info("数据库地址来自 nltsecret（%s）", value.split("://", 1)[0])
+    logger.info("数据库地址来自 funsecret（%s）", value.split("://", 1)[0])
     return value
 
 
@@ -90,8 +90,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # --- 数据库 ---
-    #: 取值顺序：环境变量 FUNFLIX_DATABASE_URL > nltsecret(funflix/db/url) > 本地 SQLite。
-    #: 切 PG 只需把 nltsecret 里的值改成 postgresql+asyncpg://...，schema 无需变更。
+    #: 取值顺序：环境变量 FUNFLIX_DATABASE_URL > funsecret(funflix/db/url) > 本地 SQLite。
+    #: 切 PG 只需把 funsecret 里的值改成 postgresql+asyncpg://...，schema 无需变更。
     database_url: str = Field(default_factory=resolve_database_url)
     db_echo: bool = False
 

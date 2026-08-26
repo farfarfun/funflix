@@ -3,7 +3,7 @@
 实现之间可互换，落库与状态机（runner）完全复用：
 
 - `rule`：确定性规则，免费、离线、可作降级路径与对照基准
-- `llm`：调用大模型，质量更高，凭证走 nltsecret
+- `llm`：调用大模型，质量更高，凭证走 funsecret
 """
 
 from funflix.services.extract.base import ExtractedItem, ExtractionOutcome, Extractor

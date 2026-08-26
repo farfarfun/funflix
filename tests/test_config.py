@@ -63,10 +63,10 @@ class TestToAsyncUrl:
 
 @pytest.fixture
 def fake_nltsecret(monkeypatch):
-    """装一个假的 nltsecret 模块，避免测试读到真实密钥库。"""
+    """装一个假的 funsecret 模块，避免测试读到真实密钥库。"""
 
     def install(value, *, raises: Exception | None = None):
-        module = ModuleType("nltsecret")
+        module = ModuleType("funsecret")
 
         def read_secret(cate1, cate2, cate3="", *args, **kwargs):
             if raises:
@@ -75,7 +75,7 @@ def fake_nltsecret(monkeypatch):
             return value
 
         module.read_secret = read_secret  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, "nltsecret", module)
+        monkeypatch.setitem(sys.modules, "funsecret", module)
 
     return install
 
@@ -94,8 +94,8 @@ class TestResolveDatabaseUrl:
         assert resolve_database_url() == DEFAULT_DATABASE_URL
 
     def test_falls_back_when_nltsecret_missing(self, monkeypatch) -> None:
-        """没装 nltsecret 也要能跑起来 —— 否则"clone 下来直接跑"就不成立。"""
-        monkeypatch.setitem(sys.modules, "nltsecret", None)
+        """没装 funsecret 也要能跑起来 —— 否则"clone 下来直接跑"就不成立。"""
+        monkeypatch.setitem(sys.modules, "funsecret", None)
         assert resolve_database_url() == DEFAULT_DATABASE_URL
 
     def test_falls_back_when_read_secret_raises(self, fake_nltsecret) -> None:

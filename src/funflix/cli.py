@@ -896,7 +896,7 @@ def extractors() -> None:
     notes = {
         "rule": "规则抽取，免费离线，自由文本的降级路径",
         "sheet": "表格行抽取，按列直接映射，零猜测零 token",
-        "llm": "大模型抽取，质量最高，凭证走 nltsecret",
+        "llm": "大模型抽取，质量最高，凭证走 funsecret",
     }
     for name in supported_extractors():
         typer.echo(f"  {name:<8} {notes.get(name, '')}")

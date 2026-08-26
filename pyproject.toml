@@ -31,7 +31,7 @@ dependencies = [
     # 所以这两个都要在。
     "asyncpg>=0.29",
     # 数据库地址与 LLM 凭证都从这里读
-    "nltsecret",
+    "funsecret",
 ]
 
 [[project.maintainers]]

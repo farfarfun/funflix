@@ -1,6 +1,6 @@
 """测试用的 LLM 桩客户端。
 
-不读 nltsecret、不发网络请求 —— 抽取逻辑的正确性不该依赖有没有配凭证。
+不读 funsecret、不发网络请求 —— 抽取逻辑的正确性不该依赖有没有配凭证。
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@ from funflix.services.extract.rule import RuleExtractor
 from funflix.services.extract.sheet import SheetExtractor
 
 #: 抽取器工厂。LLM 抽取器延迟构造 —— 它在 __init__ 里就要读凭证，
-#: 提前构造会让"只用规则抽取"的场景也被迫依赖 nltsecret 配置。
+#: 提前构造会让"只用规则抽取"的场景也被迫依赖 funsecret 配置。
 _REGISTRY: dict[str, Callable[[], Extractor]] = {
     "rule": RuleExtractor,
     "sheet": SheetExtractor,

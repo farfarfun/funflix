@@ -19,7 +19,7 @@ class TestRegistry:
             get_extractor("不存在的抽取器")
 
     def test_rule_extractor_needs_no_credentials(self) -> None:
-        """规则抽取器不该碰 nltsecret —— 否则"离线降级"就不成立。"""
+        """规则抽取器不该碰 funsecret —— 否则"离线降级"就不成立。"""
         extractor = get_extractor("rule")
         assert extractor.name == "rule"
 

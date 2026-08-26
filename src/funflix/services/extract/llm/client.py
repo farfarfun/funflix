@@ -1,7 +1,7 @@
 """LLM 客户端。
 
 走 OpenAI 兼容协议（`base_url` 可配意味着可以指向任意网关），
-凭证由 `nltsecret` 提供，不进环境变量、不进代码、不入库。
+凭证由 `funsecret` 提供，不进环境变量、不进代码、不入库。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from funflix.services.extract.llm.prompts import TOOL_NAME, TOOL_SCHEMA
 
 logger = logging.getLogger(__name__)
 
-#: nltsecret 的分类路径：read_secret("funflix", "llm", <key>)
+#: funsecret 的分类路径：read_secret("funflix", "llm", <key>)
 SECRET_CATE1 = "funflix"
 SECRET_CATE2 = "llm"
 
@@ -49,16 +49,16 @@ class LLMClient(Protocol):
 
 
 def read_llm_secret(key: str) -> str:
-    """从 nltsecret 读一项 LLM 配置。
+    """从 funsecret 读一项 LLM 配置。
 
     `read_secret` 在未命中时返回 None（尽管它标注的是 `-> str`），
     这里显式转成带指引的报错 —— 否则 None 会一路传到客户端构造，
     抛出一个跟"没配凭证"毫无关系的异常。
     """
     try:
-        from nltsecret import read_secret
+        from funsecret import read_secret
     except ImportError as exc:  # pragma: no cover - 环境问题
-        raise LLMConfigError("未安装 nltsecret，无法读取 LLM 凭证") from exc
+        raise LLMConfigError("未安装 funsecret，无法读取 LLM 凭证") from exc
 
     value = read_secret(SECRET_CATE1, SECRET_CATE2, key)
     if not value:
@@ -167,5 +167,5 @@ def _extract_tool_arguments(response: Any) -> dict[str, Any]:
 
 
 def build_default_client() -> OpenAICompatClient:
-    """按 nltsecret 里的配置构造客户端。凭证缺失时抛 LLMConfigError。"""
+    """按 funsecret 里的配置构造客户端。凭证缺失时抛 LLMConfigError。"""
     return OpenAICompatClient()
