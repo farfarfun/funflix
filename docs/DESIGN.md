@@ -192,10 +192,10 @@
 
 ### 4.1 LLM 抽取
 
-**凭证来源（已定）**：走 `nltsecret`，不进环境变量也不进代码：
+**凭证来源（已定）**：走 `funsecret`，不进环境变量也不进代码：
 
 ```python
-from nltsecret import read_secret
+from funsecret import read_secret
 
 base_url = read_secret("funflix", "llm", "base_url")
 api_key = read_secret("funflix", "llm", "api_key")
