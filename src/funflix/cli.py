@@ -116,21 +116,6 @@ def _progress(items: list[Any], desc: str, unit: str) -> Any:
     return tqdm(items, desc=desc, unit=unit, leave=False, disable=len(items) <= 1)
 
 
-def _progress_ticker(prefix: str) -> Callable[[str], None]:
-    """`progress_heartbeat` 的 on_tick：用 `tqdm.write` 而不是 print，
-    避免心跳行把正在刷新的 tqdm 进度条截断/错位。
-    """
-
-    def _on_tick(line: str) -> None:
-        tqdm.write(typer.style(f"{prefix} 进度：{line}", fg=typer.colors.BRIGHT_BLACK))
-
-    return _on_tick
-
-
-def _progress_interval(override: int | None) -> int:
-    return get_settings().worker_progress_seconds if override is None else override
-
-
 # --- status ------------------------------------------------------------------
 
 
@@ -819,9 +804,6 @@ def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
     write_batch: Annotated[int, typer.Option(help="攒够多少个源处理完再提交一次")] = 100,
-    progress_interval: Annotated[
-        int | None, typer.Option(help="进度心跳间隔秒数，<=0 关闭，默认取配置")
-    ] = None,
 ) -> None:
     """采集：把源里的新内容写成原始文本。
 
@@ -834,14 +816,9 @@ def collect(
     from funflix.base.db import session_scope
     from funflix.models import Source
     from funflix.services.collect.runner import collect_source
-    from funflix.worker import progress_heartbeat
 
     async def _do() -> list:
-        interval = _progress_interval(progress_interval)
-        async with (
-            progress_heartbeat(interval, on_tick=_progress_ticker("采集")),
-            session_scope() as session,
-        ):
+        async with session_scope() as session:
             if source_id is not None:
                 total = 1
             else:
@@ -951,9 +928,6 @@ def parse(
     ] = 100,
     doc_id: Annotated[int | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
-    progress_interval: Annotated[
-        int | None, typer.Option(help="进度心跳间隔秒数，<=0 关闭，默认取配置")
-    ] = None,
 ) -> None:
     """抽取：把原始文本解析成作品与资源。
 
@@ -978,7 +952,6 @@ def parse(
         supported_extractors,
     )
     from funflix.services.extract.runner import parse_batch, parse_document
-    from funflix.worker import progress_heartbeat
 
     _cache: dict[str, Any] = {}
 
@@ -995,11 +968,7 @@ def parse(
         return _cache[kind]
 
     async def _do() -> list:
-        interval = _progress_interval(progress_interval)
-        async with (
-            progress_heartbeat(interval, on_tick=_progress_ticker("解析")),
-            session_scope() as session,
-        ):
+        async with session_scope() as session:
             if doc_id is not None:
                 doc = await session.get(RawDocument, doc_id)
                 if doc is None:
@@ -1103,9 +1072,6 @@ def verify(
     recheck_all: Annotated[
         bool, typer.Option("--recheck-all", help="忽略复查时间，重校验全部可校验资源")
     ] = False,
-    progress_interval: Annotated[
-        int | None, typer.Option(help="进度心跳间隔秒数，<=0 关闭，默认取配置")
-    ] = None,
 ) -> None:
     """校验：探测网盘链接现在还能不能用。
 
@@ -1121,18 +1087,13 @@ def verify(
     from funflix.models import Resource, utcnow
     from funflix.services.verify.registry import assert_registry_matches_enum, get_probe
     from funflix.services.verify.runner import RateLimiter, check_resource
-    from funflix.worker import progress_heartbeat
 
     assert_registry_matches_enum()
     limiter = RateLimiter(rate_per_second=rate)
     probes: dict[Any, Any] = {}
 
     async def _do() -> list:
-        interval = _progress_interval(progress_interval)
-        async with (
-            progress_heartbeat(interval, on_tick=_progress_ticker("校验")),
-            session_scope() as session,
-        ):
+        async with session_scope() as session:
             if resource_id is not None:
                 target = await session.get(Resource, resource_id)
                 if target is None:

@@ -42,15 +42,24 @@ async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[int]
     ).all()
 
     counted = {mid: (total, int(valid or 0)) for mid, total, valid in rows}
-    for media_id in ids:
-        # 一条关联都不剩的作品不会出现在分组结果里，必须显式归零，
-        # 否则删掉最后一条资源后计数会永远停在旧值。
-        total, valid = counted.get(media_id, (0, 0))
-        await session.execute(
-            update(Media)
-            .where(Media.id == media_id)
-            .values(resource_count=total, valid_resource_count=valid)
+    # 一条关联都不剩的作品不会出现在分组结果里，必须显式归零，
+    # 否则删掉最后一条资源后计数会永远停在旧值。
+    by_id = {media_id: counted.get(media_id, (0, 0)) for media_id in ids}
+
+    # 单条 CASE 表达式一次性把整批更新写完，而不是每个作品各发一次 UPDATE——
+    # 远程数据库上一次往返 ~100ms，作品多的批次逐条更新代价很高。
+    await session.execute(
+        update(Media)
+        .where(Media.id.in_(ids))
+        .values(
+            resource_count=case(
+                {mid: total for mid, (total, _valid) in by_id.items()}, value=Media.id
+            ),
+            valid_resource_count=case(
+                {mid: valid for mid, (_total, valid) in by_id.items()}, value=Media.id
+            ),
         )
+    )
     return len(ids)
 
 
