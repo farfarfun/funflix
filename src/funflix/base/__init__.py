@@ -3,6 +3,7 @@
 与业务无关，被所有环节共用。
 """
 
+from funflix.base.commit_batcher import CommitBatcher
 from funflix.base.config import Settings, get_settings
 from funflix.base.db import (
     dispose_engine,
@@ -25,6 +26,7 @@ from funflix.base.enums import (
 __all__ = [
     "CHECKABLE_PROVIDERS",
     "CheckStatus",
+    "CommitBatcher",
     "MediaType",
     "ParseStatus",
     "Provider",

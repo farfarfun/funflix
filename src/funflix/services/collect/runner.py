@@ -13,6 +13,7 @@ from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import MAX_BACKOFF, backoff
+from funflix.base.commit_batcher import CommitBatcher
 from funflix.models import Source, utcnow
 from funflix.schemas.raw import RawDocumentCreate
 from funflix.services.collect.base import (
@@ -26,6 +27,13 @@ from funflix.services.collect.registry import get_collector
 from funflix.services.ingest import ingest_document
 
 logger = logging.getLogger(__name__)
+
+#: 一个源可能要翻几千上万页才能补完历史，_run_backfill 按块循环调用
+#: collector.backfill()（每块页数由采集器自己定，如 telegram 是 100 页），
+#: 这里是「一次 collect_source 最多跑多少块」的兜底上限，防止一个卡在
+#: 「总也翻不到顶」状态的源占住一整轮 collect 不出来。跑到这个上限就地
+#: 收工，backfill_done 留 False，水位已经推进的部分不受影响，下次接着翻。
+_MAX_BACKFILL_CHUNKS_PER_RUN = 100
 
 
 @dataclass(slots=True)
@@ -63,6 +71,12 @@ async def collect_source(
         on_progress: 翻页进度回调。采集一个源可能翻上百页、跑好几分钟，
             而它对外只是「一个源」—— 没有这个回调就只能干等，
             分不清是在正常翻页还是卡死了。
+
+    一个源（尤其是补历史）可能要翻几千上万页，不能等它全部跑完再提交——
+    中途崩溃、超时会把这期间推进的水位全部赔进去。内部按 `CommitBatcher`
+    的节奏（攒够 100 条或过了 1 分钟，哪个先到）在追新和每一块补历史之后
+    落一次盘；无论正常返回还是提前失败退出，`finally` 里都会强制 flush 掉
+    尚未提交的尾巴，调用方不需要再对这个函数的写入自己 commit。
     """
     report = CollectReport(source_id=source.id, cursor_before=source.cursor_message_id)
     collector = collector or get_collector(source.source_type)
@@ -70,126 +84,148 @@ async def collect_source(
         collector.set_progress(on_progress)
     now = utcnow()
     source.last_fetched_at = now
-
-    if collector is None:
-        report.error = f"没有 {source.source_type.value} 类型的采集器"
-        source.last_error = report.error
-        source.next_fetch_at = now + MAX_BACKOFF
-        return report
+    committer = CommitBatcher(session)
 
     try:
-        result = await collector.fetch(source)
-    except Exception as exc:  # 网络抖动、页面改版、被限流都收敛到这里
-        source.consecutive_failures += 1
-        source.last_error = f"{type(exc).__name__}: {exc}"
-        source.next_fetch_at = now + backoff(source.consecutive_failures)
-        report.error = source.last_error
-        logger.warning("采集失败 source=%s: %s", source.identifier, source.last_error)
-        return report
+        if collector is None:
+            report.error = f"没有 {source.source_type.value} 类型的采集器"
+            source.last_error = report.error
+            source.next_fetch_at = now + MAX_BACKOFF
+            return report
 
-    report.fetched = len(result.messages)
-    report.pages_fetched = result.pages_fetched
-    report.truncated = result.truncated
+        try:
+            result = await collector.fetch(source)
+        except Exception as exc:  # 网络抖动、页面改版、被限流都收敛到这里
+            source.consecutive_failures += 1
+            source.last_error = f"{type(exc).__name__}: {exc}"
+            source.next_fetch_at = now + backoff(source.consecutive_failures)
+            report.error = source.last_error
+            logger.warning("采集失败 source=%s: %s", source.identifier, source.last_error)
+            return report
 
-    if result.title and not source.title:
-        source.title = result.title
+        report.fetched = len(result.messages)
+        report.pages_fetched = result.pages_fetched
+        report.truncated = result.truncated
 
-    if result.state:
-        # 采集器自定义水位（如文档版本号）。合并而非覆盖，
-        # 让采集器只上报本轮变化的部分即可。
-        # 值为 None 表示「清掉这个键」—— 否则采集器没法把一个用完的续翻位置抹掉，
-        # 下一轮会从一个陈旧的位置接着翻。
-        merged = {**source.extra, **result.state}
-        source.extra = {k: v for k, v in merged.items() if v is not None}
+        if result.title and not source.title:
+            source.title = result.title
 
-    created, duplicated, skipped = await _ingest_messages(session, source, result.messages)
-    report.created += created
-    report.duplicated += duplicated
-    report.skipped_empty += skipped
+        if result.state:
+            # 采集器自定义水位（如文档版本号）。合并而非覆盖，
+            # 让采集器只上报本轮变化的部分即可。
+            # 值为 None 表示「清掉这个键」—— 否则采集器没法把一个用完的续翻位置抹掉，
+            # 下一轮会从一个陈旧的位置接着翻。
+            merged = {**source.extra, **result.state}
+            source.extra = {k: v for k, v in merged.items() if v is not None}
 
-    # 水位按「见到的最大消息 ID」推进，而不是「成功落库的最大 ID」——
-    # 空消息和重复消息也算已处理，否则水位会被它们永久卡住。
-    newest = max(
-        (m.numeric_id for m in result.messages if m.numeric_id is not None),
-        default=None,
-    )
-    _advance_cursor(source, result, newest)
+        created, duplicated, skipped = await _ingest_messages(session, source, result.messages)
+        report.created += created
+        report.duplicated += duplicated
+        report.skipped_empty += skipped
+        await committer.mark(created + duplicated + skipped)
 
-    # 低水位的起点。没有它就无从往前回溯。
-    #
-    # 优先用本轮见到的最早一条；本轮没有新消息时**必须回落到高水位** ——
-    # 否则已经追平的源永远等不到"有新消息"的那一轮，低水位立不起来，
-    # 回溯从头到尾不会启动。（这正是加回溯功能前就已追平的源的处境。）
-    if source.backfill_cursor_id is None:
-        oldest = min(
+        # 水位按「见到的最大消息 ID」推进，而不是「成功落库的最大 ID」——
+        # 空消息和重复消息也算已处理，否则水位会被它们永久卡住。
+        newest = max(
             (m.numeric_id for m in result.messages if m.numeric_id is not None),
             default=None,
         )
-        if oldest is not None:
-            source.backfill_cursor_id = str(oldest)
-        elif source.cursor_message_id:
-            # 高水位那条是确定见过的，从它往前翻即可。
-            # 途中会重新遇到已入库的消息，交给 content_hash 去重。
-            source.backfill_cursor_id = source.cursor_message_id
+        _advance_cursor(source, result, newest)
 
-    if result.backfill_pending and source.backfill_done:
-        # 又有没采到的历史内容了，重新打开补历史
-        logger.info("source=%s 出现新的历史内容，重新打开补历史", source.identifier)
-        source.backfill_done = False
+        # 低水位的起点。没有它就无从往前回溯。
+        #
+        # 优先用本轮见到的最早一条；本轮没有新消息时**必须回落到高水位** ——
+        # 否则已经追平的源永远等不到"有新消息"的那一轮，低水位立不起来，
+        # 回溯从头到尾不会启动。（这正是加回溯功能前就已追平的源的处境。）
+        if source.backfill_cursor_id is None:
+            oldest = min(
+                (m.numeric_id for m in result.messages if m.numeric_id is not None),
+                default=None,
+            )
+            if oldest is not None:
+                source.backfill_cursor_id = str(oldest)
+            elif source.cursor_message_id:
+                # 高水位那条是确定见过的，从它往前翻即可。
+                # 途中会重新遇到已入库的消息，交给 content_hash 去重。
+                source.backfill_cursor_id = source.cursor_message_id
 
-    source.total_collected += report.created
-    source.consecutive_failures = 0
-    source.last_error = None
-    source.last_success_at = now
+        if result.backfill_pending and source.backfill_done:
+            # 又有没采到的历史内容了，重新打开补历史
+            logger.info("source=%s 出现新的历史内容，重新打开补历史", source.identifier)
+            source.backfill_done = False
 
-    await _run_backfill(session, source, collector, report)
+        source.total_collected += report.created
+        source.consecutive_failures = 0
+        source.last_error = None
+        source.last_success_at = now
 
-    # 还有未取完的内容就立刻排下一轮，别等一个完整周期
-    pending_more = result.truncated or not source.backfill_done
-    source.next_fetch_at = now + (
-        timedelta(seconds=5) if pending_more else timedelta(seconds=source.fetch_interval_seconds)
-    )
-    report.cursor_after = source.cursor_message_id
-    return report
+        await _run_backfill(session, source, collector, report, committer)
+
+        # 还有未取完的内容就立刻排下一轮，别等一个完整周期
+        pending_more = result.truncated or not source.backfill_done
+        source.next_fetch_at = now + (
+            timedelta(seconds=5)
+            if pending_more
+            else timedelta(seconds=source.fetch_interval_seconds)
+        )
+        report.cursor_after = source.cursor_message_id
+        return report
+    finally:
+        await committer.flush()
 
 
 async def _run_backfill(
-    session: AsyncSession, source: Source, collector: Collector, report: CollectReport
+    session: AsyncSession,
+    source: Source,
+    collector: Collector,
+    report: CollectReport,
+    committer: CommitBatcher,
 ) -> None:
     """往前补历史。
 
     与追新分开跑：追新每轮都做，补历史跑到拉不动为止就收工。
-    补历史失败不影响本轮追新的成果 —— 所以异常在这里就地吞掉并记日志，
-    不让它把已经成功的追新一起回滚。
+    一个源可能要翻几千上万页才能补完，不能等它全部跑完再回传水位——
+    所以按块循环调用 `collector.backfill()`（每块多少页由采集器自己定），
+    每块落库之后都用 `committer.mark()` 报一次量，攒够阈值就提交，
+    不用等这个源彻底补完。`_MAX_BACKFILL_CHUNKS_PER_RUN` 是防止一个
+    「总也翻不到顶」的源占住一整轮 collect 的兜底上限。
+    补历史失败不影响已经成功的追新和前面已提交的块 —— 所以异常在这里
+    就地吞掉并记日志，不让它把已经落盘的进度回滚掉。
     """
-    if source.backfill_done:
-        return
+    chunks = 0
+    while not source.backfill_done and chunks < _MAX_BACKFILL_CHUNKS_PER_RUN:
+        try:
+            result = await collector.backfill(source)
+        except Exception as exc:
+            logger.warning("补历史失败 source=%s: %s", source.identifier, exc)
+            return
+        chunks += 1
 
-    try:
-        result = await collector.backfill(source)
-    except Exception as exc:
-        logger.warning("补历史失败 source=%s: %s", source.identifier, exc)
-        return
+        report.backfilled += len(result.messages)
+        report.pages_fetched += result.pages_fetched
 
-    report.backfilled = len(result.messages)
-    report.pages_fetched += result.pages_fetched
+        created, duplicated, skipped = await _ingest_messages(session, source, result.messages)
+        report.backfill_created += created
+        report.duplicated += duplicated
+        report.skipped_empty += skipped
 
-    created, duplicated, skipped = await _ingest_messages(session, source, result.messages)
-    report.backfill_created = created
-    report.duplicated += duplicated
-    report.skipped_empty += skipped
+        if result.state:
+            source.extra = {**source.extra, **result.state}
+        if result.backfill_cursor is not None:
+            source.backfill_cursor_id = result.backfill_cursor
+        if result.backfill_done:
+            source.backfill_done = True
+            logger.info("source=%s 历史已补完", source.identifier)
 
-    if result.state:
-        source.extra = {**source.extra, **result.state}
-    if result.backfill_cursor is not None:
-        source.backfill_cursor_id = result.backfill_cursor
-    if result.backfill_done:
-        source.backfill_done = True
-        logger.info("source=%s 历史已补完", source.identifier)
+        source.total_backfilled += created
+        report.backfill_cursor = source.backfill_cursor_id
+        report.backfill_done = source.backfill_done
 
-    source.total_backfilled += created
-    report.backfill_cursor = source.backfill_cursor_id
-    report.backfill_done = source.backfill_done
+        await committer.mark(created + duplicated + skipped)
+
+        if result.pages_fetched == 0:
+            # 这一块没翻动（如低水位为空/非法），再翻也是原地踏步，避免死循环
+            return
 
 
 async def _ingest_messages(

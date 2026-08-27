@@ -819,13 +819,16 @@ def source_collect(
 def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
-    write_batch: Annotated[int, typer.Option(help="攒够多少个源处理完再提交一次")] = 100,
 ) -> None:
     """采集：把源里的新内容写成原始文本。
 
-    按 `--batch-size` 分批拉取启用的源（不会一次性把全部源读进内存），每处理完
-    `--write-batch` 个源提交一次，而不是全部跑完才提交一次 —— 源很多时中途
-    失败不会把已经采完的全部丢掉；也不需要等全部源跑完才落库。
+    按 `--batch-size` 分批拉取启用的源（不会一次性把全部源读进内存）。一个源
+    可能翻上百页、跑好几分钟，`collect_source` 内部已经按 `CommitBatcher`
+    的节奏（攒够 100 条或过了 1 分钟，哪个先到）自行提交，不用等它整个跑完
+    才落盘——中途撞上超时被杀也只丢最近未攒够阈值的那一小截，不会像"整个
+    源处理完才提交"那样把已经采到的水位推进全部回滚、下次从旧水位重新
+    翻起。这里只需在它抛异常时回滚掉这个源自己未提交的尾巴，不牵连
+    其它源已经提交的水位。
     """
     from sqlalchemy import func, select
 
@@ -849,7 +852,6 @@ def collect(
 
             reports: list[Any] = []
             bar = tqdm(total=total, desc="采集", unit="源", leave=False, disable=total <= 1)
-            pending = 0
             last_id = 0
             total_created = 0
             try:
@@ -889,22 +891,23 @@ def collect(
                             _bar.refresh()
 
                         bar.set_postfix_str(f"{label} 已采集{total_created}条")
+                        report = None
                         try:
                             report = await collect_source(session, target, on_progress=_tick)
+                        except Exception as exc:
+                            # collect_source 内部已经按阈值提交过若干次，这里只回滚
+                            # 它这次未攒够阈值就崩溃的尾巴，不牵连其它源。
+                            await session.rollback()
+                            logger.warning("采集异常 source=%s: %s", target.identifier, exc)
                         finally:
                             inner.close()
-                        reports.append((target.identifier, report))
-                        if report.ok:
-                            total_created += report.created + report.backfill_created
+                        if report is not None:
+                            reports.append((target.identifier, report))
+                            if report.ok:
+                                total_created += report.created + report.backfill_created
                         bar.set_postfix_str(f"{label} 已采集{total_created}条")
                         bar.update(1)
-                        pending += 1
-                        if pending >= write_batch:
-                            await session.commit()
-                            pending = 0
                     last_id = chunk[-1].id
-                if pending:
-                    await session.commit()
             finally:
                 bar.close()
             return reports

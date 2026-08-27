@@ -34,10 +34,12 @@ _UA = DEFAULT_UA
 #: 追赶模式下，下一轮从哪一页接着往回翻（存在 Source.extra 里）
 CATCHUP_BEFORE_KEY = "catchup_before"
 
-#: 补历史单次最多翻这么多页就收工，避免频道历史特别长时一次 collect
-#: 长时间卡在 backfill 里不出结果。没翻完就地收工、backfill_done 留 False，
-#: 下次 collect 从新低水位接着翻，跟翻页途中请求失败的收工方式一致。
-_MAX_BACKFILL_PAGES_PER_RUN = 200
+#: 单次 backfill() 调用最多翻这么多页就收工——它是 runner 里补历史循环的
+#: 一个「块」，块越小水位回传越勤（见 CommitBatcher）。频道历史很长时
+#: runner 会反复调用本方法接着翻，不靠单次调用把整段历史吃完。
+#: 没翻完就地收工、backfill_done 留 False，下次调用从新低水位接着翻，
+#: 跟翻页途中请求失败的收工方式一致。
+_MAX_BACKFILL_PAGES_PER_RUN = 100
 
 #: 从 t.me 的各种 URL 写法里取频道名：t.me/x、t.me/s/x、@x、裸频道名
 _CHANNEL_PATTERNS = (

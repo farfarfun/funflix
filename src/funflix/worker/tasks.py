@@ -91,13 +91,19 @@ async def run_collect_batch(
     *,
     limit: int = 5,
     lease: timedelta = DEFAULT_LEASE,
-    write_batch: int = 100,
 ) -> BatchReport:
     """循环领取、采集，直到到点的源被清空。
 
     `limit` 是每批领取多少条，不是这次总共处理多少条 —— 队列有多少到点的源
-    就处理多少，不设总量上限。`write_batch` 是攒够多少条处理完的源再提交
-    一次，见模块 docstring。
+    就处理多少，不设总量上限。
+
+    不套用模块 docstring 里"攒够 write_batch 条再提交"的批量提交：一个源
+    可能翻上百页、跑好几分钟，批量提交会让这么长一段时间的水位推进都压在
+    同一个未提交事务里 —— 中途一个源抛异常，连累同批里刚处理完、还没提交
+    的其它源一起回滚，表现为水位卡在原地不动。`collect_source` 内部已经
+    按 `CommitBatcher` 的节奏（攒够 100 条或过了 1 分钟）自行提交，这里
+    只需在它返回后落一次 `_mark_done`；一个源出错只丢它自己这次未提交的
+    尾巴，不牵连其它源。
     """
     report = BatchReport()
 
@@ -107,25 +113,17 @@ async def run_collect_batch(
         report.reclaimed += claimed.reclaimed
         report.abandoned += claimed.abandoned
 
-        pending = 0
         for source in claimed.rows:
             try:
                 collector = get_collector(source.source_type)
                 result = await collect_source(session, source, collector)
+                await _mark_done(source)
+                await session.commit()
                 report.succeeded += int(result.ok)
                 report.failed += int(not result.ok)
-                await _mark_done(source)
-                pending += 1
             except Exception as exc:
                 report.failed += 1
                 await _abort(session, "采集", source.id, exc)
-                pending = 0
-                continue
-            if pending >= write_batch:
-                await session.commit()
-                pending = 0
-        if pending:
-            await session.commit()
 
         if not claimed.rows:
             break

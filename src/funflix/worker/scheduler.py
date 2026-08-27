@@ -320,7 +320,6 @@ class Worker:
                 session,
                 limit=cfg.worker_collect_batch,
                 lease=self._lease,
-                write_batch=cfg.worker_write_batch,
             )
         async with self._session_factory() as session:
             report.parse = await run_parse_batch(
