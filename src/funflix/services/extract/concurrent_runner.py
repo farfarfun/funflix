@@ -21,11 +21,17 @@ funworker 是纯线程 + `queue.Queue` 模型，完全不感知 asyncio，而 fu
 不能让它变成 `WorkerPool` 默认的重试/丢弃语义，那样就没机会把失败写回
 `doc.parse_attempts`/`next_parse_at`。消费者复用 `persist_extracted` 的退避
 逻辑统一处理"处理单元报告的失败"和"落库时自己抛出的失败"两种来源。
+
+进度用 `on_progress(total_enqueued, total_done)` 按生产者/消费者的累计计数
+轮询喂给调用方（做法照抄 `services/collect/concurrent_runner.py`）：分子是
+"处理过的总数"，分母是"入队列的总数"——入队快照会随生产者继续翻页动态
+增长，不会像"启动前查一次待处理数就固定住"那样跟实际进度对不上。
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -222,13 +228,11 @@ class _ParseConsumer(BaseConsumer):
         *,
         settings: Settings,
         write_batch: int,
-        on_progress: Callable[[int], None] | None = None,
         name: str | None = None,
     ) -> None:
         super().__init__(input_queue, name=name)
         self.settings = settings
         self.write_batch = write_batch
-        self.on_progress = on_progress
         self.reports: list[ParseReport] = []
 
     def on_start(self) -> None:
@@ -253,11 +257,6 @@ class _ParseConsumer(BaseConsumer):
 
     def consume(self, item: dict[str, Any]) -> None:
         self._buffer.append(item)
-        # 进度反馈粒度跟落库批大小解耦：每收到一条就立刻回调一次，不等攒够
-        # write_batch 条才一次性跳一大截——否则总量不到 write_batch 时进度条
-        # 全程不动，跑到最后才瞬间跳到底，观感上等于没有进度条。
-        if self.on_progress is not None:
-            self.on_progress(1)
         if len(self._buffer) >= self.write_batch:
             self._aio_loop.run_until_complete(self._flush())
 
@@ -313,6 +312,26 @@ class _ParseConsumer(BaseConsumer):
         self.reports.extend(reports)
 
 
+def _pipeline_counts(pipeline: Pipeline) -> tuple[int, int]:
+    """(总入队数, 总处理数) —— 处理数按消费者读完队列、处理完（成功或失败）算，
+
+    只算成功会在有失败时永远追不上入队数。
+    """
+    total = pipeline.producer.stats()["produced"]
+    consumer = pipeline.consumer
+    assert consumer is not None
+    consumer_stats = consumer.stats()
+    done = consumer_stats["consumed"] + consumer_stats["failed"]
+    return total, done
+
+
+def _pipeline_pending(pipeline: Pipeline) -> int:
+    """两条队列里当前还没被取走的积压条数，用来判断"是否已经彻底跑空"。"""
+    consumer = pipeline.consumer
+    assert consumer is not None
+    return pipeline.producer.stats()["output_qsize"] + consumer.stats()["input_qsize"]
+
+
 def run_parse_pipeline(
     *,
     extractor_name: str | None = None,
@@ -322,13 +341,17 @@ def run_parse_pipeline(
     concurrency: int = 4,
     force: bool = False,
     settings: Settings | None = None,
-    on_progress: Callable[[int], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[ParseReport]:
     """跑一次完整的生产者/处理单元/消费者流水线，返回消费者攒的全部报告。
 
     同步阻塞函数——funworker 本身是阻塞式设计，不需要外层 `asyncio.run` 包装。
     生产/消费两端各自持有专属的 `AsyncEngine` + 事件循环（见模块 docstring），
     处理单元线程池并发数由 `concurrency` 控制。
+
+    `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者
+    已经翻完页（规划通常比 `extract()` 快得多），只要队列里还有积压就继续
+    轮询——不然进度条会在处理单元/消费者还在忙的时候看起来像卡死了。
     """
     settings = settings or get_settings()
 
@@ -350,10 +373,23 @@ def run_parse_pipeline(
         consumer_kwargs={
             "settings": settings,
             "write_batch": write_batch,
-            "on_progress": on_progress,
         },
     )
-    pipeline.run(install_signal_handlers=False)
+    pipeline.start()
+    try:
+        while True:
+            if pipeline.producer.is_alive():
+                pipeline.producer.join(timeout=0.5)
+            else:
+                time.sleep(0.5)
+            if on_progress is not None:
+                on_progress(*_pipeline_counts(pipeline))
+            if not pipeline.producer.is_alive() and _pipeline_pending(pipeline) == 0:
+                break
+    finally:
+        pipeline.stop()
+    if on_progress is not None:
+        on_progress(*_pipeline_counts(pipeline))
 
     consumer = pipeline.consumer
     assert isinstance(consumer, _ParseConsumer)

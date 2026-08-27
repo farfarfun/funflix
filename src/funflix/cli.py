@@ -920,16 +920,17 @@ def parse(
             typer.echo("没有待解析的文档")
             return
 
-        # total 不用查出来的待处理数固定住——批量模式跑起来可能持续好一阵，
-        # 期间会有新文档变成待处理（比如 collect 还在并发写入），用查询时的
-        # 快照当分母，进度条要么卡在 99% 要么冒进到 100%+。改成跟 done 一起长，
-        # 分母就是"已处理的总数"本身，永远准确，代价是不再显示百分比。
+        # 分母不用启动前查出来的待处理数固定住——批量模式跑起来可能持续好一阵，
+        # 期间会有新文档变成待处理（比如 collect 还在并发写入）。改成跟着
+        # 生产者实际入队的条数动态长，分子是消费者已处理（成功或失败）的条数，
+        # 两者都是流水线的真实累计计数，不是启动前的一次性快照。
         bar = tqdm(total=0, desc="解析", unit="条", leave=False, disable=total <= 1)
         bar.set_postfix_str(f"{concurrency} 线程")
 
-        def _on_progress(n: int) -> None:
-            bar.total += n
-            bar.update(n)
+        def _on_progress(total: int, done: int) -> None:
+            bar.total = total
+            bar.n = min(done, total)
+            bar.refresh()
 
         try:
             reports = run_parse_pipeline(
@@ -1027,15 +1028,16 @@ def verify(
             typer.echo("没有待校验的资源")
             return
 
-        # 分母不用查出来的待校验数固定住，理由同 parse：不设 --limit 时批量模式
-        # 会跑到清空为止，期间水位会变化，查询时的快照跟实际处理数对不上。
-        # 改成跟 done 一起长，分母就是"已处理的总数"本身，永远准确。
+        # 分母不用启动前查出来的待校验数固定住，理由同 parse：不设 --limit 时
+        # 批量模式会跑到清空为止，期间水位会变化。改成跟着生产者实际入队的
+        # 条数动态长，分子是消费者已处理（成功或失败）的条数。
         bar = tqdm(total=0, desc="校验", unit="条", leave=False, disable=total <= 1)
         bar.set_postfix_str(f"{concurrency} 线程")
 
-        def _on_progress(n: int) -> None:
-            bar.total += n
-            bar.update(n)
+        def _on_progress(total: int, done: int) -> None:
+            bar.total = total
+            bar.n = min(done, total)
+            bar.refresh()
 
         try:
             reports = run_verify_pipeline(

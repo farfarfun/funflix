@@ -136,27 +136,28 @@ class TestRunVerifyPipeline:
             assert resource.next_check_at is not None, "ERROR 要退避重试，不是永久停手"
 
     @pytest.mark.asyncio
-    async def test_progress_fires_per_resource_not_per_write_batch(
+    async def test_progress_callback_reports_enqueued_and_done_counts(
         self, db_url, monkeypatch
     ) -> None:
+        """`on_progress(total_enqueued, total_done)` 轮询驱动，不绑死在落库批大小上。"""
         monkeypatch.setattr(cr, "get_probe", fake_get_probe)
         async with open_session(db_url) as session:
             session.add_all([make_resource(n) for n in range(1, 6)])
             await session.commit()
 
-        calls: list[int] = []
+        calls: list[tuple[int, int]] = []
         reports = cr.run_verify_pipeline(
             settings=Settings(database_url=db_url),
             concurrency=1,
             write_batch=100,
             rate=0.0,
-            on_progress=calls.append,
+            on_progress=lambda total, done: calls.append((total, done)),
         )
 
         assert len(reports) == 5
-        assert calls == [1, 1, 1, 1, 1], (
-            "5 条资源应该各自触发一次回调，而不是攒够 write_batch 才一次性跳 5"
-        )
+        assert calls, "轮询进度回调至少要触发一次"
+        total, done = calls[-1]
+        assert total == done == 5
 
     @pytest.mark.asyncio
     async def test_limit_caps_how_many_resources_are_processed(

@@ -186,25 +186,26 @@ class TestRunParsePipeline:
         assert reports == []
 
     @pytest.mark.asyncio
-    async def test_progress_fires_per_document_not_per_write_batch(self, db_url) -> None:
-        """进度回调不能绑死在落库批大小上——否则总量不到 write_batch 时全程不动。"""
+    async def test_progress_callback_reports_enqueued_and_done_counts(self, db_url) -> None:
+        """`on_progress(total_enqueued, total_done)` 轮询驱动，不绑死在落库批大小上。"""
         async with open_session(db_url) as session:
             session.add_all([make_doc(n) for n in range(1, 6)])
             await session.commit()
 
-        calls: list[int] = []
+        calls: list[tuple[int, int]] = []
         reports = run_parse_pipeline(
             extractor_name="rule",
             settings=Settings(database_url=db_url),
             concurrency=1,
             write_batch=100,
-            on_progress=calls.append,
+            on_progress=lambda total, done: calls.append((total, done)),
         )
 
         assert len(reports) == 5
-        assert calls == [1, 1, 1, 1, 1], (
-            "5 条文档应该各自触发一次回调，而不是攒够 write_batch 才一次性跳 5"
-        )
+        assert calls, "轮询进度回调至少要触发一次"
+        # 最后一次回调时，入队/处理总数要对得上——流水线已经彻底跑空。
+        total, done = calls[-1]
+        assert total == done == 5
 
 
 class TestCountPending:
