@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import and_, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -81,6 +82,23 @@ class BatchCache:
     tag_by_key: dict[tuple[str, str], Tag] = field(default_factory=dict)
     media_resource_pairs: set[tuple[int, int]] = field(default_factory=set)
     media_tag_pairs: set[tuple[int, int]] = field(default_factory=set)
+
+
+def keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: int) -> Any:
+    """`ORDER BY ts_col.nulls_first(), id_col` 场景下的翻页游标条件。
+
+    不能直接拿 `id_col > last_id` 当游标——排序主键换成了 ts_col 之后，
+    id 不再单调对应排序位置，会跳过或重复行。这里按 (ts_col, id_col)
+    复合键翻页，NULL 视为最小值，跟 NULLS FIRST 的排序语义对齐。
+
+    `cli.py` 的 `parse`/`verify` 命令与 `concurrent_runner.py` 的生产者
+    共用同一份翻页逻辑。
+    """
+    if last_ts is None:
+        # 上一页最后一行还在"从未处理过"（ts IS NULL）这一段里：后续行
+        # 要么还在这段里但 id 更大，要么已经进入非 NULL 段（任意值都排后面）。
+        return or_(and_(ts_col.is_(None), id_col > last_id), ts_col.is_not(None))
+    return or_(ts_col > last_ts, and_(ts_col == last_ts, id_col > last_id))
 
 
 async def _load_cached(
@@ -556,55 +574,63 @@ async def parse_document(
     return report
 
 
-async def parse_batch(
+async def persist_extracted(
     session: AsyncSession,
     docs: list[RawDocument],
+    outcomes: dict[int, ExtractionOutcome],
+    cached_doc_ids: set[int],
     extractor: Extractor,
     *,
-    force: bool = False,
+    extraction_errors: dict[int, str] | None = None,
 ) -> list[ParseReport]:
-    """一批文档共用一次批量预读，逐条落库。要求 `docs` 已按同一个 extractor 分组。
+    """把一批**已经产出**的抽取结果批量落库。要求 `docs` 已按同一个 extractor 分组。
 
-    与循环调用 `parse_document` 的行为差异只有两处：
+    从 `parse_batch` 拆出来的"落库"半段——`parse_batch` 自己做抽取再调用这里；
+    `services/extract/concurrent_runner.py` 的消费者线程复用同一份逻辑，
+    抽取已经在处理单元线程池里做完，这里只管批量预读去重键、逐文档落库、
+    状态机推进、计数重算。
 
-    1. 缓存查询、media/resource/tag 去重查询批量预读（见 `BatchCache`），
-       单条文档落库时只剩 SAVEPOINT + 真正需要的 INSERT，不再逐条查库。
-    2. `refresh_media_counters` 在整批结束后对本批触碰到的所有作品统一调用
-       一次，而不是每条文档各调用一次。
+    Args:
+        cached_doc_ids: 命中缓存（走 `rehydrate` 而非 `extract`）的文档 id。
+            这些文档不新建 `Extraction` 留档行。
+        extraction_errors: 文档 id → 错误描述，供上游（如并发处理单元）报告
+            "这条文档在抽取阶段就失败了、根本没有 outcome"——这类文档直接按
+            现有的失败退避逻辑推进状态机，不进入落库流程。
 
     单条文档的失败隔离不变：每条仍在自己的 SAVEPOINT 里，一条撞唯一约束或
-    抽取异常只回滚它自己，不牵连同批其它文档。
+    落库异常只回滚它自己，不牵连同批其它文档。
     """
     reports = {doc.id: ParseReport(document_id=doc.id, status=doc.parse_status) for doc in docs}
     now = utcnow()
-
-    cached_by_doc = (
-        {}
-        if force
-        else await _load_cached_batch(
-            session, [doc.id for doc in docs], extractor.name, extractor.version
-        )
-    )
-
-    outcomes: dict[int, ExtractionOutcome] = {}
-    for doc in docs:
-        cached = cached_by_doc.get(doc.id)
-        outcomes[doc.id] = (
-            extractor.rehydrate(cached.output, doc.content)
-            if cached is not None
-            else await extractor.extract(doc.content)
-        )
 
     cache = await _preload_batch_cache(session, list(outcomes.values()))
     all_touched: set[int] = set()
 
     for doc in docs:
         report = reports[doc.id]
+
+        extraction_error = extraction_errors.get(doc.id) if extraction_errors else None
+        if extraction_error is not None:
+            doc.parse_attempts += 1
+            doc.parse_error = extraction_error
+            doc.lease_until = None
+            doc.last_parsed_at = now
+            if doc.parse_attempts >= MAX_PARSE_ATTEMPTS:
+                doc.parse_status = ParseStatus.FAILED
+                doc.next_parse_at = None
+            else:
+                doc.parse_status = ParseStatus.PENDING
+                doc.next_parse_at = now + backoff(doc.parse_attempts)
+            report.status = doc.parse_status
+            report.error = doc.parse_error
+            logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)
+            continue
+
         outcome = outcomes[doc.id]
-        cached = cached_by_doc.get(doc.id)
+        is_cached = doc.id in cached_doc_ids
         try:
             async with session.begin_nested():
-                if cached is not None:
+                if is_cached:
                     report.from_cache = True
                 else:
                     session.add(
@@ -657,3 +683,42 @@ async def parse_batch(
         await refresh_media_counters(session, all_touched)
 
     return [reports[doc.id] for doc in docs]
+
+
+async def parse_batch(
+    session: AsyncSession,
+    docs: list[RawDocument],
+    extractor: Extractor,
+    *,
+    force: bool = False,
+) -> list[ParseReport]:
+    """一批文档共用一次批量预读，逐条落库。要求 `docs` 已按同一个 extractor 分组。
+
+    与循环调用 `parse_document` 的行为差异只有两处：
+
+    1. 缓存查询、media/resource/tag 去重查询批量预读（见 `BatchCache`），
+       单条文档落库时只剩 SAVEPOINT + 真正需要的 INSERT，不再逐条查库。
+    2. `refresh_media_counters` 在整批结束后对本批触碰到的所有作品统一调用
+       一次，而不是每条文档各调用一次。
+
+    落库部分见 `persist_extracted`；这里只负责抽取（命中缓存走 `rehydrate`，
+    否则调用 `extractor.extract`）。
+    """
+    cached_by_doc = (
+        {}
+        if force
+        else await _load_cached_batch(
+            session, [doc.id for doc in docs], extractor.name, extractor.version
+        )
+    )
+
+    outcomes: dict[int, ExtractionOutcome] = {}
+    for doc in docs:
+        cached = cached_by_doc.get(doc.id)
+        outcomes[doc.id] = (
+            extractor.rehydrate(cached.output, doc.content)
+            if cached is not None
+            else await extractor.extract(doc.content)
+        )
+
+    return await persist_extracted(session, docs, outcomes, set(cached_by_doc), extractor)

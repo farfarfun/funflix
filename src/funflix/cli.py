@@ -116,22 +116,6 @@ def _progress(items: list[Any], desc: str, unit: str) -> Any:
     return tqdm(items, desc=desc, unit=unit, leave=False, disable=len(items) <= 1)
 
 
-def _keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: int) -> Any:
-    """`ORDER BY ts_col.nulls_first(), id_col` 场景下的翻页游标条件。
-
-    不能直接拿 `id_col > last_id` 当游标——排序主键换成了 ts_col 之后，
-    id 不再单调对应排序位置，会跳过或重复行。这里按 (ts_col, id_col)
-    复合键翻页，NULL 视为最小值，跟 NULLS FIRST 的排序语义对齐。
-    """
-    from sqlalchemy import and_, or_
-
-    if last_ts is None:
-        # 上一页最后一行还在"从未处理过"（ts IS NULL）这一段里：后续行
-        # 要么还在这段里但 id 更大，要么已经进入非 NULL 段（任意值都排后面）。
-        return or_(and_(ts_col.is_(None), id_col > last_id), ts_col.is_not(None))
-    return or_(ts_col > last_ts, and_(ts_col == last_ts, id_col > last_id))
-
-
 # --- status ------------------------------------------------------------------
 
 
@@ -945,6 +929,9 @@ def parse(
     write_batch: Annotated[
         int, typer.Option(help="每批内部按此粒度批量预读去重键、处理完再提交一次")
     ] = 100,
+    concurrency: Annotated[
+        int, typer.Option(help="处理单元并发线程数（并发跑 extract()，不碰数据库）")
+    ] = 4,
     doc_id: Annotated[int | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
 ) -> None:
@@ -953,130 +940,79 @@ def parse(
     不指定抽取器时按来源类型自动选：表格源用 sheet，自由文本用 rule。
     用错抽取器不会报错，只会静默地大批归属失败，所以默认按源类型分开。
 
-    默认不设总量上限——待处理的文档会一直处理到清空为止，内部按 `--batch-size`
-    分批拉取（不会一次性把全部待处理行都读进内存）。单条文档落库要查好几次
-    数据库（缓存命中、media/resource/tag 去重……），在远程数据库上每次往返
-    ~100~150ms，逐条查代价很高；每 `--write-batch` 条文档共用一次批量预读
-    （见 `services/extract/runner.py::parse_batch`），把这些查询从"每条文档
-    一次往返"折叠成"每批几次往返"，再统一提交一次。两条文档若抽出同一部
+    默认不设总量上限——待处理的文档会一直处理到清空为止。批量模式用
+    `services/extract/concurrent_runner.py` 的 funworker 流水线执行：一个生产者
+    线程按 `--batch-size` 翻页读文档，`--concurrency` 个处理单元线程并发跑
+    `extract()`（通常是耗时的网络/LLM 调用），一个消费者线程每攒够
+    `--write-batch` 条就批量预读去重键、落库、提交一次。两条文档若抽出同一部
     作品会撞库唯一约束，静默回滚重试、不计入失败次数，属预期行为。
     """
-    from sqlalchemy import func, or_, select
-
     from funflix.base.db import session_scope
-    from funflix.models import RawDocument, utcnow
+    from funflix.models import RawDocument
+    from funflix.services.extract.concurrent_runner import count_pending, run_parse_pipeline
     from funflix.services.extract.registry import (
         default_extractor_for,
         get_extractor,
         supported_extractors,
     )
-    from funflix.services.extract.runner import parse_batch, parse_document
+    from funflix.services.extract.runner import parse_document
 
-    _cache: dict[str, Any] = {}
+    if extractor is not None:
+        try:
+            get_extractor(extractor)
+        except ValueError as exc:
+            _fail(str(exc))
+        except Exception as exc:
+            # LLM 抽取器在构造时就要读凭证，缺配置在这里先报错，
+            # 不然要等流水线的生产者线程里才炸、且会被误当成"没有数据"重试到天荒地老。
+            _fail(f"抽取器 {extractor!r} 初始化失败：{exc}\n可选抽取器：{supported_extractors()}")
 
-    def _extractor_for(doc: Any) -> Any:
-        kind = extractor or default_extractor_for(doc.source_type)
-        if kind not in _cache:
-            try:
-                _cache[kind] = get_extractor(kind)
-            except ValueError as exc:
-                _fail(str(exc))
-            except Exception as exc:
-                # LLM 抽取器在构造时就要读凭证，缺配置会在这里失败
-                _fail(f"抽取器 {kind!r} 初始化失败：{exc}\n可选抽取器：{supported_extractors()}")
-        return _cache[kind]
+    if doc_id is not None:
 
-    async def _do() -> list:
-        async with session_scope() as session:
-            if doc_id is not None:
+        async def _do_single() -> list[Any]:
+            async with session_scope() as session:
                 doc = await session.get(RawDocument, doc_id)
                 if doc is None:
                     _fail(f"文档 #{doc_id} 不存在")
-                report = await parse_document(session, doc, _extractor_for(doc), force=force)
+                kind = extractor or default_extractor_for(doc.source_type)
+                impl = get_extractor(kind)
+                report = await parse_document(session, doc, impl, force=force)
                 await session.commit()
                 return [report]
 
-            now = utcnow()
-            conditions = (
-                RawDocument.parse_status == ParseStatus.PENDING,
-                or_(
-                    RawDocument.next_parse_at.is_(None),
-                    RawDocument.next_parse_at <= now,
-                ),
+        reports = _run(_do_single)
+    else:
+
+        async def _count() -> int:
+            async with session_scope() as session:
+                return await count_pending(session, limit=limit)
+
+        total = _run(_count)
+        if not total:
+            typer.echo("没有待解析的文档")
+            return
+
+        bar = tqdm(total=total, desc="解析", unit="条", leave=False, disable=total <= 1)
+        try:
+            reports = run_parse_pipeline(
+                extractor_name=extractor,
+                limit=limit,
+                batch_size=batch_size,
+                write_batch=write_batch,
+                concurrency=concurrency,
+                force=force,
+                on_progress=bar.update,
             )
-            total = int(
-                await session.scalar(
-                    select(func.count()).select_from(RawDocument).where(*conditions)
-                )
-                or 0
-            )
-            if limit is not None:
-                total = min(total, limit)
-            if not total:
-                return []
+        finally:
+            bar.close()
 
-            reports: list[Any] = []
-            remaining = total
-            last_id = 0
-            last_ts: Any = None
-            bar = tqdm(total=total, desc="解析", unit="条", leave=False, disable=total <= 1)
-            try:
-                while remaining > 0:
-                    fetch = min(batch_size, remaining)
-                    # 按 (last_parsed_at, id) 复合游标翻页，而不是复用同一个
-                    # WHERE 反复查——已处理的行状态变化未必总能把自己排除出
-                    # 条件（比如未来加了强制全量重跑之类的开关），游标才能
-                    # 保证不会在同一批里死循环。排序优先级是"从没解析过的"
-                    # （last_parsed_at IS NULL）在前，纯按 id 当游标已经不
-                    # 对应排序位置了，必须带上 last_parsed_at 一起翻页。
-                    docs = list(
-                        await session.scalars(
-                            select(RawDocument)
-                            .where(
-                                *conditions,
-                                _keyset_after(
-                                    RawDocument.last_parsed_at, RawDocument.id, last_ts, last_id
-                                ),
-                            )
-                            .order_by(RawDocument.last_parsed_at.nulls_first(), RawDocument.id)
-                            .limit(fetch)
-                        )
-                    )
-                    if not docs:
-                        break
-
-                    # 游标取自查询结果本身，必须在 parse_batch 改写
-                    # last_parsed_at 之前记录，否则下一页的翻页起点就错了。
-                    last_ts = docs[-1].last_parsed_at
-                    last_id = docs[-1].id
-
-                    groups: dict[str, list[Any]] = {}
-                    for doc in docs:
-                        kind = extractor or default_extractor_for(doc.source_type)
-                        groups.setdefault(kind, []).append(doc)
-
-                    for kind_docs in groups.values():
-                        impl = _extractor_for(kind_docs[0])
-                        for i in range(0, len(kind_docs), write_batch):
-                            chunk = kind_docs[i : i + write_batch]
-                            results = await parse_batch(session, chunk, impl, force=force)
-                            await session.commit()
-                            reports.extend(results)
-                            bar.update(len(chunk))
-
-                    remaining -= len(docs)
-            finally:
-                bar.close()
-            return reports
-
-    reports = _run(_do)
     if not reports:
         typer.echo("没有待解析的文档")
         return
 
     good = [r for r in reports if r.ok]
     failed = [r for r in reports if not r.ok]
-    _dim("抽取器 " + ", ".join(f"{e.name}/{e.version}" for e in _cache.values()))
+    _dim(f"抽取器 {extractor or '自动（按来源类型选择）'}")
     typer.secho(
         f"解析 {len(reports)} 条：成功 {len(good)}  失败 {len(failed)}  "
         f"目录帖 {sum(1 for r in good if r.is_catalog)}  "
@@ -1117,6 +1053,7 @@ def verify(
     from funflix.base.db import session_scope
     from funflix.base.enums import CHECKABLE_PROVIDERS
     from funflix.models import Resource, utcnow
+    from funflix.services.extract.runner import keyset_after
     from funflix.services.verify.registry import assert_registry_matches_enum, get_probe
     from funflix.services.verify.runner import RateLimiter, check_resource
 
@@ -1174,7 +1111,7 @@ def verify(
                             select(Resource)
                             .where(
                                 *conditions,
-                                _keyset_after(
+                                keyset_after(
                                     Resource.last_checked_at, Resource.id, last_ts, last_id
                                 ),
                             )
