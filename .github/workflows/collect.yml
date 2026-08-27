@@ -1,9 +1,13 @@
-name: Daily Collect
+name: Collect Pipeline
 
 on:
   schedule:
     # 20:13 UTC ≈ 次日 04:13 北京时间，错开整点避免和别的 workflow 抢跑。
     - cron: "13 20 * * *"
+  # 每次提交都跑一遍，代码改动引入的问题当天就能在真实数据上暴露，
+  # 不用等到第二天定时任务才发现。
+  push:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -40,7 +44,9 @@ jobs:
       # 每周一（北京时间）先把采集水位归零，核查是否有"水位漂移但没真正
       # 采到"的情况：重新翻旧内容会被 content_hash 唯一约束挡掉，不会
       # 重复入库，只有真正漏采的部分才会补进来。原始文本不受影响。
+      # 只在定时触发时判断——push 触发的运行不需要跟着凑一次周一重置。
       - name: Reset cursors (Monday only)
+        if: github.event_name == 'schedule'
         run: |
           if [ "$(TZ=Asia/Shanghai date +%u)" = "1" ]; then
             echo "今天是周一（北京时间），先重置采集水位"
@@ -51,3 +57,9 @@ jobs:
 
       - name: Collect
         run: funflix collect
+
+      - name: Parse
+        run: funflix parse
+
+      - name: Verify
+        run: funflix verify
