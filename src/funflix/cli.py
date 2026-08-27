@@ -116,6 +116,22 @@ def _progress(items: list[Any], desc: str, unit: str) -> Any:
     return tqdm(items, desc=desc, unit=unit, leave=False, disable=len(items) <= 1)
 
 
+def _keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: int) -> Any:
+    """`ORDER BY ts_col.nulls_first(), id_col` 场景下的翻页游标条件。
+
+    不能直接拿 `id_col > last_id` 当游标——排序主键换成了 ts_col 之后，
+    id 不再单调对应排序位置，会跳过或重复行。这里按 (ts_col, id_col)
+    复合键翻页，NULL 视为最小值，跟 NULLS FIRST 的排序语义对齐。
+    """
+    from sqlalchemy import and_, or_
+
+    if last_ts is None:
+        # 上一页最后一行还在"从未处理过"（ts IS NULL）这一段里：后续行
+        # 要么还在这段里但 id 更大，要么已经进入非 NULL 段（任意值都排后面）。
+        return or_(and_(ts_col.is_(None), id_col > last_id), ts_col.is_not(None))
+    return or_(ts_col > last_ts, and_(ts_col == last_ts, id_col > last_id))
+
+
 # --- status ------------------------------------------------------------------
 
 
@@ -999,23 +1015,37 @@ def parse(
             reports: list[Any] = []
             remaining = total
             last_id = 0
+            last_ts: Any = None
             bar = tqdm(total=total, desc="解析", unit="条", leave=False, disable=total <= 1)
             try:
                 while remaining > 0:
                     fetch = min(batch_size, remaining)
-                    # 按 id 游标翻页，而不是复用同一个 WHERE 反复查——已处理的
-                    # 行状态变化未必总能把自己排除出条件（比如未来加了强制
-                    # 全量重跑之类的开关），游标才能保证不会在同一批里死循环。
+                    # 按 (last_parsed_at, id) 复合游标翻页，而不是复用同一个
+                    # WHERE 反复查——已处理的行状态变化未必总能把自己排除出
+                    # 条件（比如未来加了强制全量重跑之类的开关），游标才能
+                    # 保证不会在同一批里死循环。排序优先级是"从没解析过的"
+                    # （last_parsed_at IS NULL）在前，纯按 id 当游标已经不
+                    # 对应排序位置了，必须带上 last_parsed_at 一起翻页。
                     docs = list(
                         await session.scalars(
                             select(RawDocument)
-                            .where(*conditions, RawDocument.id > last_id)
-                            .order_by(RawDocument.id)
+                            .where(
+                                *conditions,
+                                _keyset_after(
+                                    RawDocument.last_parsed_at, RawDocument.id, last_ts, last_id
+                                ),
+                            )
+                            .order_by(RawDocument.last_parsed_at.nulls_first(), RawDocument.id)
                             .limit(fetch)
                         )
                     )
                     if not docs:
                         break
+
+                    # 游标取自查询结果本身，必须在 parse_batch 改写
+                    # last_parsed_at 之前记录，否则下一页的翻页起点就错了。
+                    last_ts = docs[-1].last_parsed_at
+                    last_id = docs[-1].id
 
                     groups: dict[str, list[Any]] = {}
                     for doc in docs:
@@ -1031,7 +1061,6 @@ def parse(
                             reports.extend(results)
                             bar.update(len(chunk))
 
-                    last_id = docs[-1].id
                     remaining -= len(docs)
             finally:
                 bar.close()
@@ -1126,24 +1155,39 @@ def verify(
             reports: list[Any] = []
             remaining = total
             last_id = 0
+            last_ts: Any = None
             bar = tqdm(total=total, desc="校验", unit="条", leave=False, disable=total <= 1)
             try:
                 while remaining > 0:
                     fetch = min(batch_size, remaining)
-                    # 按 id 游标翻页：`--recheck-all` 下 WHERE 条件本身不会
-                    # 因为处理过就自动排除已处理的行（只看 provider，跟校验
-                    # 状态无关），不用游标会在同一批里死循环重复捞回同一批行。
+                    # 按 (last_checked_at, id) 复合游标翻页：`--recheck-all`
+                    # 下 WHERE 条件本身不会因为处理过就自动排除已处理的行
+                    # （只看 provider，跟校验状态无关），不用游标会在同一批里
+                    # 死循环重复捞回同一批行。排序优先级是"从没校验过的"
+                    # （last_checked_at IS NULL）在前，纯按 id 当游标已经不
+                    # 对应排序位置了，必须带上 last_checked_at 一起翻页。
                     rows = list(
                         await session.scalars(
                             select(Resource)
-                            .where(*conditions, Resource.id > last_id)
-                            .order_by(Resource.id)
+                            .where(
+                                *conditions,
+                                _keyset_after(
+                                    Resource.last_checked_at, Resource.id, last_ts, last_id
+                                ),
+                            )
+                            .order_by(Resource.last_checked_at.nulls_first(), Resource.id)
                             .limit(fetch)
                         )
                     )
                     if not rows:
                         break
                     resource_ids = [row.id for row in rows]
+
+                    # 游标取自查询结果本身，跟 check_resource 是否已经改了
+                    # last_checked_at 无关（check_resource 在独立 sub_session
+                    # 里操作，不会动到这批 ORM 对象），但仍在处理前记录更清楚。
+                    last_ts = rows[-1].last_checked_at
+                    last_id = rows[-1].id
 
                     async def _handle(sub_session: Any, res_id: int) -> Any:
                         sub_row = await sub_session.get(Resource, res_id)
@@ -1160,7 +1204,6 @@ def verify(
                             logger.exception("校验任务异常", exc_info=r)
                             continue
                         reports.append(r)
-                    last_id = rows[-1].id
                     remaining -= len(rows)
             finally:
                 bar.close()

@@ -34,6 +34,11 @@ _UA = DEFAULT_UA
 #: 追赶模式下，下一轮从哪一页接着往回翻（存在 Source.extra 里）
 CATCHUP_BEFORE_KEY = "catchup_before"
 
+#: 补历史单次最多翻这么多页就收工，避免频道历史特别长时一次 collect
+#: 长时间卡在 backfill 里不出结果。没翻完就地收工、backfill_done 留 False，
+#: 下次 collect 从新低水位接着翻，跟翻页途中请求失败的收工方式一致。
+_MAX_BACKFILL_PAGES_PER_RUN = 200
+
 #: 从 t.me 的各种 URL 写法里取频道名：t.me/x、t.me/s/x、@x、裸频道名
 _CHANNEL_PATTERNS = (
     re.compile(r"^https?://t\.me/s/(?P<name>[A-Za-z0-9_]{3,})", re.I),
@@ -263,13 +268,15 @@ class TelegramChannelCollector(SupportsProgress):
     async def backfill(self, source: Source) -> FetchResult:
         """往更早的消息回溯。
 
-        从低水位开始用 `?before=` 一路向前翻，一次性翻到顶 —— 不再分轮限速。
-        返回空页或翻到 ID 1 即到顶，此时置 `backfill_done`，此后每轮只追新，
-        不再往前空跑。
+        从低水位开始用 `?before=` 一路向前翻，单次最多翻
+        `_MAX_BACKFILL_PAGES_PER_RUN` 页——频道历史很长时不设上限会让一次
+        collect 长时间卡在这里不出结果。返回空页或翻到 ID 1 即到顶，此时置
+        `backfill_done`，此后每轮只追新，不再往前空跑。
 
-        翻页途中请求失败（网络抖动、被限流）就地收工，把已经翻到的内容和
-        新低水位一起返回、`backfill_done` 留 False —— 下次 collect 从这里接着
-        翻，而不是让一次抖动扔掉这一整轮已经翻到的内容。
+        翻页途中请求失败（网络抖动、被限流）或翻页数到顶就地收工，把已经
+        翻到的内容和新低水位一起返回、`backfill_done` 留 False —— 下次
+        collect 从这里接着翻，而不是让一次抖动/页数上限扔掉这一整轮已经
+        翻到的内容。
 
         低水位为空时说明还没做过首次采集，本轮不动，等 fetch 立好水位再说。
         """
@@ -287,7 +294,7 @@ class TelegramChannelCollector(SupportsProgress):
         done = False
 
         try:
-            while True:
+            while pages < _MAX_BACKFILL_PAGES_PER_RUN:
                 try:
                     html = await self._get_page(client, channel, oldest)
                 except httpx.HTTPError as exc:

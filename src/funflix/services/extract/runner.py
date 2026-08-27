@@ -491,12 +491,14 @@ async def parse_document(
         doc.parse_error = None
         doc.lease_until = None
         doc.next_parse_at = None
+        doc.last_parsed_at = now
         report.status = doc.parse_status
 
     except IntegrityError:
         # 并发时另一个协程/进程抢先建了同一个 (norm_key, media_type, year) /
         # (provider, share_id) / (kind, norm_key)——不是这条文档本身有问题，
         # SAVEPOINT 已自动回滚，不计入 parse_attempts，留到下次自然重试。
+        # 同样不算一次"处理过"：last_parsed_at 不动，下次仍按原优先级排队。
         report.status = doc.parse_status
         report.error = "并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
         logger.info("解析撞车 doc=%s: 并发写入冲突，留待下次重试", doc.id)
@@ -505,6 +507,7 @@ async def parse_document(
         doc.parse_attempts += 1
         doc.parse_error = f"{type(exc).__name__}: {exc}"
         doc.lease_until = None
+        doc.last_parsed_at = now
         if doc.parse_attempts >= MAX_PARSE_ATTEMPTS:
             doc.parse_status = ParseStatus.FAILED
             doc.next_parse_at = None
@@ -591,9 +594,11 @@ async def parse_batch(
             doc.parse_error = None
             doc.lease_until = None
             doc.next_parse_at = None
+            doc.last_parsed_at = now
             report.status = doc.parse_status
 
         except IntegrityError:
+            # 并发撞车不算"处理过"，last_parsed_at 不动，留到下次自然重试。
             report.status = doc.parse_status
             report.error = "并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
             logger.info("解析撞车 doc=%s: 并发写入冲突，留待下次重试", doc.id)
@@ -602,6 +607,7 @@ async def parse_batch(
             doc.parse_attempts += 1
             doc.parse_error = f"{type(exc).__name__}: {exc}"
             doc.lease_until = None
+            doc.last_parsed_at = now
             if doc.parse_attempts >= MAX_PARSE_ATTEMPTS:
                 doc.parse_status = ParseStatus.FAILED
                 doc.next_parse_at = None

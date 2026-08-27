@@ -6,6 +6,7 @@ from factories import build_message, build_page, simple_page
 
 from funflix.base.enums import SourceType
 from funflix.models import Source
+from funflix.services.collect import telegram
 from funflix.services.collect.registry import detect_source
 from funflix.services.collect.telegram import TelegramChannelCollector, parse_channel_page
 
@@ -143,7 +144,9 @@ def _mock_collector(pages: dict[int | None, str]) -> TelegramChannelCollector:
     return collector
 
 
-def _source(cursor: str | None = None, max_pages: int = 5) -> Source:
+def _source(
+    cursor: str | None = None, max_pages: int = 5, backfill_cursor: str | None = None
+) -> Source:
     return Source(
         id=1,
         source_type=SourceType.TELEGRAM,
@@ -151,6 +154,7 @@ def _source(cursor: str | None = None, max_pages: int = 5) -> Source:
         identifier=CHANNEL,
         max_pages_per_fetch=max_pages,
         cursor_message_id=cursor,
+        backfill_cursor_id=backfill_cursor,
     )
 
 
@@ -211,3 +215,38 @@ class TestFetch:
 
         assert result.messages == []
         assert result.pages_fetched == 1
+
+
+@pytest.mark.asyncio
+class TestBackfill:
+    async def test_stops_at_top_and_marks_done(self) -> None:
+        collector = _mock_collector(
+            {
+                200: simple_page(CHANNEL, [107, 108, 109]),
+                107: simple_page(CHANNEL, [1, 2, 3]),
+            }
+        )
+        result = await collector.backfill(_source(backfill_cursor="200"))
+
+        assert result.backfill_done is True
+        assert result.backfill_cursor == "1"
+
+    async def test_stops_after_page_cap_leaves_backfill_open(self, monkeypatch) -> None:
+        """频道历史很长时不能无限翻——单次撞到页数上限就地收工，下次接着翻。"""
+        monkeypatch.setattr(telegram, "_MAX_BACKFILL_PAGES_PER_RUN", 3)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raw = request.url.params.get("before")
+            before = int(raw)
+            ids = [before - 3, before - 2, before - 1]
+            return httpx.Response(200, text=simple_page(CHANNEL, ids))
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        collector = TelegramChannelCollector(client=client, page_delay=0)
+
+        result = await collector.backfill(_source(backfill_cursor="1000"))
+
+        assert result.backfill_done is False
+        assert result.pages_fetched == 3
+        # 每页往前挪 3 个 id：1000 -> 997 -> 994 -> 991
+        assert result.backfill_cursor == "991"

@@ -182,7 +182,8 @@ async def claim_documents(
         RawDocument,
         columns=[RawDocument.id, RawDocument.parse_status, RawDocument.parse_attempts],
         conditions=conditions,
-        order_by=[RawDocument.id],
+        # 没解析过的排在最前：新文档的第一次抽取比失败重试更有价值。
+        order_by=[RawDocument.last_parsed_at.nulls_first(), RawDocument.id],
         limit=limit,
         decide=decide,
     )

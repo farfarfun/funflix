@@ -57,6 +57,9 @@ class RawDocument(TimestampMixin, Base):
     lease_until: Mapped[datetime | None] = mapped_column(UTCDateTime)
     #: 下次可尝试解析的时间，用于失败退避
     next_parse_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    #: 最近一次尝试解析的时间（成功或失败都算）。为空即"从没解析过"，
+    #: 领取/排队时用它把这类文档排到已处理过但待重试的文档前面。
+    last_parsed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     source: Mapped[Source | None] = relationship(back_populates="documents")
     extractions: Mapped[list[Extraction]] = relationship(
