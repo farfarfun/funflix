@@ -33,15 +33,17 @@
 保留的方法名）。处理单元线程池完全不碰数据库，只负责 HTTP 抓取 + 解析。
 
 进度不再按"处理了百分之几"算——一个源可能被拆成几十个并发页任务，
-"整体百分比"这个概念本身就不成立了。改用 funworker 自带的
-`Pipeline.format_progress()`：入队/出队/已处理的队列计数，跟用户的直觉
-（看队列涨跌）一致。
+"整体百分比"这个概念本身就不成立了。改用生产者/消费者的累计计数喂给
+`on_progress(total_enqueued, total_done)`：总数随生产者规划出更多任务动态
+增长，已处理数随消费者收尾（成功或失败）逐步逼近，交给调用方（CLI）驱动
+一个真正会跑动的 `tqdm` 进度条，而不是只有文字后缀的空转指示器。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -547,13 +549,47 @@ class _CollectConsumer(BaseConsumer):
         self.reports.append((source.identifier, report))
 
 
+def _pipeline_counts(pipeline: Pipeline) -> tuple[int, int]:
+    """(累计入队总数, 累计出队总数)。
+
+    入队总数取生产者写入第一条队列的历史累计（`BaseProducer.stats()['produced']`），
+    随生产者规划出更多任务（尤其是 Telegram 补历史拆出来的翻页任务）动态增长。
+    出队总数取消费者读完最后一条队列、处理完（成功或失败）的历史累计——两者
+    加起来才是"这条任务已经走完流水线"，只算成功会在有失败时永远追不上总数。
+    """
+    total = pipeline.producer.stats()["produced"]
+    consumer_stats = pipeline.consumer.stats() if pipeline.consumer is not None else None
+    if consumer_stats is not None:
+        done = consumer_stats["consumed"] + consumer_stats["failed"]
+    else:
+        last_stage = pipeline.stages[-1].stats()
+        done = last_stage["processed"] + last_stage["failed"]
+    return total, done
+
+
+def _pipeline_pending(pipeline: Pipeline) -> int:
+    """两条队列里当前还没被取走的积压条数，用来判断"是否已经彻底跑空"。
+
+    只数各队列自己的 `qsize()`，不代表"正在某个线程里处理中"的条目——那部分
+    交给 `pipeline.stop()` 自带的 `Queue.join()` 兜底等待，这里只是决定什么
+    时候可以放心地从"轮询进度"切到"调用 stop() 收尾"。
+    """
+    pending = pipeline.producer.stats()["output_qsize"]
+    if pipeline.consumer is not None:
+        pending += pipeline.consumer.stats()["input_qsize"]
+    else:
+        output_qsize = pipeline.stages[-1].stats()["output_qsize"]
+        pending += output_qsize or 0
+    return pending
+
+
 def run_collect_pipeline(
     *,
     source_id: int | None = None,
     batch_size: int = 500,
     concurrency: int = 4,
     settings: Settings | None = None,
-    on_progress: Callable[[str], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> CollectPipelineResult:
     """跑一次完整的生产者/处理单元/消费者流水线，返回按源汇总的报告。
 
@@ -561,6 +597,10 @@ def run_collect_pipeline(
     包装。生产/消费两端各自持有专属的 `AsyncEngine` + 事件循环（见模块
     docstring），处理单元线程池并发数由 `concurrency` 控制，多个源（含
     Telegram 拆出来的并发翻页任务）共享同一条队列。
+
+    `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者
+    已经跑完（规划本身通常比 HTTP 抓取快得多），只要队列里还有积压就继续
+    轮询——不然进度条会在处理单元/消费者还在忙的时候看起来像卡死了。
     """
     settings = settings or get_settings()
 
@@ -574,14 +614,19 @@ def run_collect_pipeline(
     )
     pipeline.start()
     try:
-        while pipeline.producer.is_alive():
-            pipeline.producer.join(timeout=0.5)
+        while True:
+            if pipeline.producer.is_alive():
+                pipeline.producer.join(timeout=0.5)
+            else:
+                time.sleep(0.5)
             if on_progress is not None:
-                on_progress(pipeline.format_progress())
+                on_progress(*_pipeline_counts(pipeline))
+            if not pipeline.producer.is_alive() and _pipeline_pending(pipeline) == 0:
+                break
     finally:
         pipeline.stop()
     if on_progress is not None:
-        on_progress(pipeline.format_progress())
+        on_progress(*_pipeline_counts(pipeline))
 
     consumer = pipeline.consumer
     assert isinstance(consumer, _CollectConsumer)

@@ -826,13 +826,21 @@ def collect(
     """
     from funflix.services.collect.concurrent_runner import run_collect_pipeline
 
-    bar = tqdm(total=None, desc="采集", unit="任务", leave=False)
+    bar = tqdm(total=0, desc="采集", unit="任务", leave=False)
+
+    def _on_progress(total: int, done: int) -> None:
+        # total 随生产者规划出更多任务动态增长，done 不会超过它——min() 只是
+        # 防个万一（比如两次回调之间 total 还没来得及反映最新一次入队）。
+        bar.total = total
+        bar.n = min(done, total)
+        bar.refresh()
+
     try:
         result = run_collect_pipeline(
             source_id=source_id,
             batch_size=batch_size,
             concurrency=concurrency,
-            on_progress=bar.set_postfix_str,
+            on_progress=_on_progress,
         )
     finally:
         bar.close()

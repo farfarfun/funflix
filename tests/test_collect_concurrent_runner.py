@@ -229,12 +229,17 @@ class TestOpaqueSources:
             session.add(_source("s1"))
             await session.commit()
 
-        calls: list[str] = []
+        calls: list[tuple[int, int]] = []
         run_collect_pipeline(
-            settings=Settings(database_url=db_url), concurrency=1, on_progress=calls.append
+            settings=Settings(database_url=db_url),
+            concurrency=1,
+            on_progress=lambda total, done: calls.append((total, done)),
         )
 
         assert calls, "队列计数进度回调至少要触发一次"
+        # 最后一次回调时，入队/出队总数要对得上——流水线已经彻底跑空。
+        total, done = calls[-1]
+        assert total == done == 1
 
 
 # --- Telegram 补历史：翻页解耦 + 乐观水位推进 ---
