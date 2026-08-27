@@ -803,105 +803,45 @@ def source_collect(
 def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
+    concurrency: Annotated[
+        int, typer.Option(help="处理单元并发线程数（并发抓 HTTP，不碰数据库）")
+    ] = 4,
 ) -> None:
     """采集：把源里的新内容写成原始文本。
 
-    按 `--batch-size` 分批拉取启用的源（不会一次性把全部源读进内存）。一个源
-    可能翻上百页、跑好几分钟，`collect_source` 内部已经按 `CommitBatcher`
-    的节奏（攒够 100 条或过了 1 分钟，哪个先到）自行提交，不用等它整个跑完
-    才落盘——中途撞上超时被杀也只丢最近未攒够阈值的那一小截，不会像"整个
-    源处理完才提交"那样把已经采到的水位推进全部回滚、下次从旧水位重新
-    翻起。这里只需在它抛异常时回滚掉这个源自己未提交的尾巴，不牵连
-    其它源已经提交的水位。
+    批量模式用 `services/collect/concurrent_runner.py` 的 funworker 流水线
+    执行：一个生产者线程按 `--batch-size` 翻页读启用的源。Telegram 源的补
+    历史因为消息 ID 单调递增、每页条数固定，不必等真的抓到内容就能靠整数
+    运算把后续每一页的游标提前算出来，拆成多个可并发抓取的翻页任务；其余
+    情况（Telegram 追新、腾讯文档）当一个不透明的整源任务，内部翻页原样在
+    处理单元线程里跑完。所有任务不分源、不分类型，全部丢进同一条队列，由
+    `--concurrency` 个处理单元线程并发抓取，一个消费者线程批量落库、回写
+    水位。水位在规划阶段就乐观提交，不等对应任务真的被消费——中途异常顶多
+    丢掉几个还没来得及抓的页面，content_hash 唯一约束保证不会重复入库，
+    每周的水位重置也会把整个源重新刷一遍，可接受。
+
+    进度条不再按"处理了百分之几"算——一个源可能被拆成几十个并发任务，
+    "整体百分比"这个概念本身就不成立了，改成展示队列的入队/出队/已处理
+    条数，跟着任务被拆分、并发消化的真实节奏走。
     """
-    from sqlalchemy import func, select
+    from funflix.services.collect.concurrent_runner import run_collect_pipeline
 
-    from funflix.base.db import session_scope
-    from funflix.models import Source
-    from funflix.services.collect.runner import collect_source
+    bar = tqdm(total=None, desc="采集", unit="任务", leave=False)
+    try:
+        result = run_collect_pipeline(
+            source_id=source_id,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            on_progress=bar.set_postfix_str,
+        )
+    finally:
+        bar.close()
 
-    async def _do() -> list:
-        async with session_scope() as session:
-            if source_id is not None:
-                total = 1
-            else:
-                total = int(
-                    await session.scalar(
-                        select(func.count()).select_from(Source).where(Source.enabled)
-                    )
-                    or 0
-                )
-            if not total:
-                return []
-
-            reports: list[Any] = []
-            bar = tqdm(total=total, desc="采集", unit="源", leave=False, disable=total <= 1)
-            last_id = 0
-            total_created = 0
-            try:
-                while True:
-                    if source_id is not None:
-                        # 单源模式没有分页可言，只在第一轮取一次。
-                        chunk = [await _require_source(session, source_id)] if last_id == 0 else []
-                    else:
-                        # 按 id 游标翻页，理由同 `parse` 命令：已处理的源状态
-                        # 未必总能把自己排除出 WHERE，游标才保证不会死循环。
-                        chunk = list(
-                            await session.scalars(
-                                select(Source)
-                                .where(Source.enabled, Source.id > last_id)
-                                .order_by(Source.id)
-                                .limit(batch_size)
-                            )
-                        )
-                    if not chunk:
-                        break
-
-                    for target in chunk:
-                        # 一个源可能翻上百页、跑几分钟。源级进度条只会停在那里不动，
-                        # 分不清是在正常翻页还是卡死了 —— 所以把页级进度实时打出来。
-                        label = target.identifier[:18]
-                        inner = tqdm(
-                            total=None, desc=f"  ↳ {label}", unit="页", leave=False, position=1
-                        )
-
-                        def _tick(p, _bar=inner) -> None:
-                            _bar.total = p.budget or None
-                            _bar.n = p.pages
-                            stage = "追新" if p.stage == "fetch" else "补历史"
-                            where = f" @{p.position}" if p.position else ""
-                            extra = f" {p.detail}" if p.detail else ""
-                            _bar.set_postfix_str(f"{stage} {p.messages}条{where}{extra}")
-                            _bar.refresh()
-
-                        bar.set_postfix_str(f"{label} 已采集{total_created}条")
-                        report = None
-                        try:
-                            report = await collect_source(session, target, on_progress=_tick)
-                        except Exception as exc:
-                            # collect_source 内部已经按阈值提交过若干次，这里只回滚
-                            # 它这次未攒够阈值就崩溃的尾巴，不牵连其它源。
-                            await session.rollback()
-                            logger.warning("采集异常 source=%s: %s", target.identifier, exc)
-                        finally:
-                            inner.close()
-                        if report is not None:
-                            reports.append((target.identifier, report))
-                            if report.ok:
-                                total_created += report.created + report.backfill_created
-                        bar.set_postfix_str(f"{label} 已采集{total_created}条")
-                        bar.update(1)
-                    last_id = chunk[-1].id
-            finally:
-                bar.close()
-            return reports
-
-    reports = _run(_do)
-    if not reports:
+    if not result.reports and not result.backfill_pages.pages:
         typer.echo("没有启用的采集源")
         return
 
-    for identifier, report in reports:
+    for identifier, report in result.reports:
         if not report.ok:
             typer.secho(f"[{identifier}] 采集失败: {report.error}", fg=typer.colors.RED)
             continue
@@ -910,6 +850,16 @@ def collect(
             f"重复 {report.duplicated} / 空 {report.skipped_empty}"
             f"，水位 {report.cursor_before or '-'} → {report.cursor_after or '-'}"
             + ("（未取完）" if report.truncated else "")
+        )
+
+    pages = result.backfill_pages
+    if pages.pages:
+        # 并发翻页任务分散在多个源里，没有一个自然的时间点能拼出"某个源
+        # 的补历史完整报告"，只按全局汇总展示，跟按源展示的整源任务报告
+        # 分开。
+        _ok(
+            f"补历史（并发翻页 {pages.pages} 页）→ 新增 {pages.created} / "
+            f"重复 {pages.duplicated} / 空 {pages.skipped}"
         )
 
 

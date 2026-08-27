@@ -41,6 +41,13 @@ CATCHUP_BEFORE_KEY = "catchup_before"
 #: 跟翻页途中请求失败的收工方式一致。
 _MAX_BACKFILL_PAGES_PER_RUN = 100
 
+#: 频道预览页固定每页最多 20 条消息（Telegram Web 预览的实测值）。消息 ID
+#: 在频道内单调递增，这让我们能在真正抓页面之前就用整数运算规划出后续每一
+#: 页的 `before` 游标（见 `plan_backfill_pages`），不必等解析完当前页才知道
+#: 下一页翻哪——代价是遇到大段被删消息时个别页可能凑不满 20 条，这属于正常
+#: 稀疏，不是错误。
+TELEGRAM_PAGE_STRIDE = 20
+
 #: 从 t.me 的各种 URL 写法里取频道名：t.me/x、t.me/s/x、@x、裸频道名
 _CHANNEL_PATTERNS = (
     re.compile(r"^https?://t\.me/s/(?P<name>[A-Za-z0-9_]{3,})", re.I),
@@ -237,6 +244,50 @@ def parse_channel_page(html: str, channel: str) -> tuple[list[CollectedMessage],
     return messages, parser.title
 
 
+async def fetch_page_html(client: httpx.AsyncClient, channel: str, before: int | None) -> str:
+    """抓一页频道预览的原始 HTML，不做解析。
+
+    模块级自由函数（而不是 `TelegramChannelCollector` 的方法）：并发补历史
+    流水线（`collect/concurrent_runner.py`）按页派发任务，处理单元线程没有
+    也不需要一个完整的采集器实例，只需要这一个纯函数。
+    """
+    url = f"https://t.me/s/{channel}"
+    params = {"before": str(before)} if before is not None else None
+    resp = await client.get(url, params=params, headers={"User-Agent": _UA})
+    resp.raise_for_status()
+    return resp.text
+
+
+def plan_backfill_pages(
+    backfill_cursor_id: str | None, *, max_pages: int
+) -> tuple[list[int], str | None, bool]:
+    """不发请求，纯靠整数运算规划一批可并发抓取的历史页 `before` 游标。
+
+    消息 ID 单调递增、每页固定 `TELEGRAM_PAGE_STRIDE` 条，所以不必像
+    `backfill()` 那样翻完一页才知道下一页翻哪——直接从低水位开始按步长
+    往回减，一次性把这批要翻的页面都算出来，交给并发流水线的生产者在
+    入队前就把新低水位提交进库（乐观推进，见 `concurrent_runner.py` 模块
+    docstring）。
+
+    返回 `(待抓取的 before 值列表（从新到旧）, 规划完这批后的新低水位,
+    是否已到顶)`。低水位无效（未开始过首次采集）或已到 1（历史已到头）时
+    返回空列表——跟 `backfill()` 原有的收工条件一致。
+    """
+    if not (backfill_cursor_id and backfill_cursor_id.isdigit()):
+        return [], backfill_cursor_id, False
+    cursor = int(backfill_cursor_id)
+    if cursor <= 1:
+        return [], backfill_cursor_id, True
+
+    pages: list[int] = []
+    for _ in range(max(0, max_pages)):
+        if cursor <= 1:
+            break
+        pages.append(cursor)
+        cursor = max(1, cursor - TELEGRAM_PAGE_STRIDE)
+    return pages, str(cursor), cursor <= 1
+
+
 class TelegramChannelCollector(SupportsProgress):
     name = "telegram-web-preview-v1"
     #: 最后问。它的模式能匹配任意裸标识串（"某频道名" 也算命中），
@@ -261,11 +312,7 @@ class TelegramChannelCollector(SupportsProgress):
         return None
 
     async def _get_page(self, client: httpx.AsyncClient, channel: str, before: int | None) -> str:
-        url = f"https://t.me/s/{channel}"
-        params = {"before": str(before)} if before is not None else None
-        resp = await client.get(url, params=params, headers={"User-Agent": _UA})
-        resp.raise_for_status()
-        return resp.text
+        return await fetch_page_html(client, channel, before)
 
     async def backfill(self, source: Source) -> FetchResult:
         """往更早的消息回溯。
