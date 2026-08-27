@@ -128,8 +128,10 @@ class Settings(BaseSettings):
     worker_parse_batch: int = 20
     #: 每轮校验**每批**领取多少条待复查资源；一轮会循环分批领取直到清空，不是硬上限。
     worker_verify_batch: int = 20
-    #: 每个网盘每秒最多几次探测
-    worker_verify_rate: float = 1.0
+    #: 每个网盘每秒最多几次探测。默认值从 1.0 提到 5.0——打太快可能触发网盘
+    #: 风控、被限流的响应误判成链接失效，是用户在看到这条风险后明确接受、
+    #: 换取校验吞吐的选择，不是随手调大的数字。
+    worker_verify_rate: float = 5.0
     #: 强制使用某个抽取器；留空则按来源类型自动选
     worker_extractor: str | None = None
     #: 心跳进度日志的打印间隔；<= 0 关闭

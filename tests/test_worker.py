@@ -18,7 +18,7 @@ from funflix.base.backoff import BASE_BACKOFF, MAX_BACKOFF, backoff
 from funflix.base.config import Settings
 from funflix.base.enums import CheckStatus, ParseStatus, Provider, Quality, SourceType
 from funflix.models import Base, LinkCheck, RawDocument, Resource, Source, utcnow
-from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS
+from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS, parse_document
 from funflix.services.verify.base import CheckOutcome
 from funflix.worker.claim import claim_documents, claim_resources, claim_sources
 from funflix.worker.scheduler import Worker, progress_snapshot, stale_summary
@@ -365,6 +365,46 @@ class TestParseBatch:
     async def test_idle_when_queue_empty(self, session) -> None:
         report = await run_parse_batch(session, limit=10, extractor="rule")
         assert report.idle
+
+
+class TestParseDocumentIntegrityRace:
+    """并发下两个协程各用独立 session 撞上唯一约束，是良性重试，不是解析失败。
+
+    真实的撞车需要两条独立连接在 SELECT 与 INSERT 之间交错，SQLite 单写者
+    语义下很难可靠复现；直接让 `_persist` 抛 `IntegrityError` 更能稳定地
+    单测 `parse_document` 的 except 分支本身。
+    """
+
+    @pytest.mark.asyncio
+    async def test_integrity_error_is_a_benign_retry_not_a_failure(
+        self, session, monkeypatch
+    ) -> None:
+        from sqlalchemy.exc import IntegrityError
+
+        from funflix.services.extract import runner as runner_module
+        from funflix.services.extract.rule import RuleExtractor
+
+        doc = make_doc(1)
+        session.add(doc)
+        await session.commit()
+
+        async def _boom(*_args, **_kwargs) -> None:
+            raise IntegrityError("INSERT", {}, Exception("uq_media_identity"))
+
+        monkeypatch.setattr(runner_module, "_persist", _boom)
+
+        report = await parse_document(session, doc, RuleExtractor())
+
+        assert report.ok is False
+        assert report.error is not None
+        assert "并发写入冲突" in report.error
+        assert doc.parse_attempts == 0, "撞车不该计入失败重试次数"
+        assert doc.parse_status == ParseStatus.PENDING
+        assert doc.parse_error is None, "撞车不是这条文档自身的错，不该写进 parse_error"
+
+        # SAVEPOINT 已经自动回滚，外层 session 没有被拖成不可用状态——照常能继续用
+        doc.parse_attempts = 0
+        await session.commit()
 
 
 class TestVerifyBatch:

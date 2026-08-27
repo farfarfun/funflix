@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import backoff
@@ -275,40 +276,55 @@ async def parse_document(
     now = utcnow()
 
     try:
-        cached = (
-            None
-            if force
-            else await _load_cached(session, doc.id, extractor.name, extractor.version)
-        )
-        if cached is not None:
-            # 命中缓存：同一抽取器 + 同一版本不重复调用外部服务
-            outcome = extractor.rehydrate(cached.output, doc.content)
-            report.from_cache = True
-        else:
-            outcome = await extractor.extract(doc.content)
-            session.add(
-                Extraction(
-                    raw_document_id=doc.id,
-                    model=outcome.extractor_name or extractor.name,
-                    prompt_version=outcome.extractor_version or extractor.version,
-                    output=outcome.raw_payload,
-                    input_tokens=outcome.input_tokens,
-                    output_tokens=outcome.output_tokens,
-                    latency_ms=outcome.latency_ms,
-                    stats=outcome.stats,
-                )
+        # 用 SAVEPOINT 把"产出并落库这一条文档的抽取结果"框起来：调用方
+        # （cli.py 的分批提交、worker 的整批共享 session）可能在同一个外层
+        # 事务里连续处理很多条文档。这条文档写到一半炸掉（死锁、并发撞
+        # 唯一约束）时，只回滚这个 SAVEPOINT，不会把外层事务标脏、级联
+        # 拖垮同一事务里其余文档（此前没有嵌套事务时，一条死锁会让整个
+        # chunk 后续文档全部报 InFailedSQLTransactionError，直至整批崩溃）。
+        async with session.begin_nested():
+            cached = (
+                None
+                if force
+                else await _load_cached(session, doc.id, extractor.name, extractor.version)
             )
-            await session.flush()
+            if cached is not None:
+                # 命中缓存：同一抽取器 + 同一版本不重复调用外部服务
+                outcome = extractor.rehydrate(cached.output, doc.content)
+                report.from_cache = True
+            else:
+                outcome = await extractor.extract(doc.content)
+                session.add(
+                    Extraction(
+                        raw_document_id=doc.id,
+                        model=outcome.extractor_name or extractor.name,
+                        prompt_version=outcome.extractor_version or extractor.version,
+                        output=outcome.raw_payload,
+                        input_tokens=outcome.input_tokens,
+                        output_tokens=outcome.output_tokens,
+                        latency_ms=outcome.latency_ms,
+                        stats=outcome.stats,
+                    )
+                )
+                await session.flush()
 
-        report.is_catalog = outcome.is_catalog
-        await _persist(session, doc, outcome, report)
+            report.is_catalog = outcome.is_catalog
+            await _persist(session, doc, outcome, report)
 
         # 目录帖不代表一部作品，标为 skipped 而非 done —— 让它在统计里可区分
-        doc.parse_status = ParseStatus.SKIPPED if outcome.is_catalog else ParseStatus.DONE
+        doc.parse_status = ParseStatus.SKIPPED if report.is_catalog else ParseStatus.DONE
         doc.parse_error = None
         doc.lease_until = None
         doc.next_parse_at = None
         report.status = doc.parse_status
+
+    except IntegrityError:
+        # 并发时另一个协程/进程抢先建了同一个 (norm_key, media_type, year) /
+        # (provider, share_id) / (kind, norm_key)——不是这条文档本身有问题，
+        # SAVEPOINT 已自动回滚，不计入 parse_attempts，留到下次自然重试。
+        report.status = doc.parse_status
+        report.error = "并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
+        logger.info("解析撞车 doc=%s: 并发写入冲突，留待下次重试", doc.id)
 
     except Exception as exc:
         doc.parse_attempts += 1

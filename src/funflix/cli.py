@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -17,6 +18,8 @@ from tqdm import tqdm
 
 from funflix.base.config import get_settings
 from funflix.base.enums import CheckStatus, MediaType, ParseStatus, SourceType
+
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(help="funflix 命令行工具", no_args_is_help=True)
 db_app = typer.Typer(help="数据库迁移与检查", no_args_is_help=True)
@@ -30,6 +33,42 @@ app.add_typer(source_app, name="source")
 def _run[T](factory: Callable[[], Awaitable[T]]) -> T:
     """跑一个协程。每条命令都是一次性进程，不需要复用事件循环。"""
     return asyncio.run(factory())
+
+
+async def _process_concurrently[T](
+    items: list[T],
+    handle: Callable[[Any, T], Awaitable[Any]],
+    *,
+    concurrency: int,
+) -> list[Any]:
+    """有界并发处理一批条目，`parse`/`verify` 复用。
+
+    每个任务用**独立 session**（同一个 AsyncSession 不能被多个协程同时用），
+    独立提交自己的事务——用独立 session 本身就决定了提交粒度只能是
+    "每条一提交"，而不是整批共用一次提交，这是并发换来的代价。
+
+    `handle` 拿到的 session 是这个任务自己的，不能用外层查出来的 ORM 对象
+    （跨 session 用会出问题），要在 `handle` 内部按 id 重新加载——所以
+    `items` 传的是 id，不是 ORM 对象。
+
+    某个任务异常不会让其余任务陪葬：`asyncio.gather(..., return_exceptions=True)`
+    保证一个任务的异常只体现为返回列表里的一个 `Exception` 实例。
+    """
+    from funflix.base.db import session_scope
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(item: T) -> Any:
+        async with sem, session_scope() as session:
+            try:
+                result = await handle(session, item)
+                await session.commit()
+                return result
+            except Exception:
+                await session.rollback()
+                raise
+
+    return await asyncio.gather(*(_one(item) for item in items), return_exceptions=True)
 
 
 def _fail(message: str) -> NoReturn:
@@ -199,6 +238,9 @@ def run(
     limit: Annotated[
         int | None, typer.Option(help="最多解析多少条，默认不设上限、处理到清空为止")
     ] = None,
+    concurrency: Annotated[
+        int, typer.Option(help="解析阶段并发处理数，每个并发任务用独立数据库连接")
+    ] = 20,
     skip_collect: Annotated[bool, typer.Option("--skip-collect", help="只解析，不采集")] = False,
 ) -> None:
     """一条龙：采集全部启用的源，再解析待处理文本。"""
@@ -207,7 +249,7 @@ def run(
         collect(None)
         typer.echo()
     _heading("[2/2] 解析" if not skip_collect else "解析")
-    parse(extractor=extractor, limit=limit, doc_id=None, force=False)
+    parse(extractor=extractor, limit=limit, concurrency=concurrency, doc_id=None, force=False)
 
 
 # --- worker ------------------------------------------------------------------
@@ -821,6 +863,7 @@ def parse(
         int | None, typer.Option(help="最多解析多少条，默认不设上限、处理到清空为止")
     ] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
+    concurrency: Annotated[int, typer.Option(help="并发处理数，每个并发任务用独立数据库连接")] = 20,
     doc_id: Annotated[int | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
     progress_interval: Annotated[
@@ -833,7 +876,14 @@ def parse(
     用错抽取器不会报错，只会静默地大批归属失败，所以默认按源类型分开。
 
     默认不设总量上限——待处理的文档会一直处理到清空为止，内部按 `--batch-size`
-    分批拉取（不会一次性把全部待处理行都读进内存）。
+    分批拉取（不会一次性把全部待处理行都读进内存），每批内部用 `--concurrency`
+    个并发任务处理（每个任务独立数据库连接与事务）。并发下两条文档若抽出
+    同一部作品会撞库唯一约束，静默回滚重试、不计入失败次数，属预期行为。
+
+    `--concurrency` 默认比 `verify` 高（20 而非 8）——parse 没有 `verify` 那种
+    "打太快触发风控"的顾虑，瓶颈纯粹是远程数据库的往返延迟，多开并发只会重叠
+    延迟、不会有副作用，上限只需留在数据库连接池容量（`pool_size=10` +
+    `max_overflow=20`＝30）以内。
     """
     from sqlalchemy import func, or_, select
 
@@ -914,14 +964,32 @@ def parse(
                     )
                     if not docs:
                         break
-                    for doc in docs:
-                        impl = _extractor_for(doc)
-                        if hasattr(bar, "set_postfix_str"):
-                            bar.set_postfix_str(impl.name)
-                        reports.append(await parse_document(session, doc, impl, force=force))
+                    doc_ids = [doc.id for doc in docs]
+                    # 抽取器解析在主协程里做（不在并发任务内）——`_extractor_for`
+                    # 缺配置时会调用 `_fail()` 直接退出整个命令，必须在第一条
+                    # 命中缺失抽取器时就同步炸出来，不能被并发任务的
+                    # try/except 吞成"这一条失败"。
+                    impls = {doc.id: _extractor_for(doc) for doc in docs}
+
+                    async def _handle(
+                        sub_session: Any, doc_id: int, *, impls: dict[int, Any] = impls
+                    ) -> Any:
+                        sub_doc = await sub_session.get(RawDocument, doc_id)
+                        report = await parse_document(
+                            sub_session, sub_doc, impls[doc_id], force=force
+                        )
                         bar.update(1)
+                        return report
+
+                    results = await _process_concurrently(doc_ids, _handle, concurrency=concurrency)
+                    for r in results:
+                        if isinstance(r, Exception):
+                            # 不应该发生——parse_document 自己兜底所有异常；
+                            # 能漏到这里的只有 commit/rollback 本身的意外失败。
+                            logger.exception("解析任务异常", exc_info=r)
+                            continue
+                        reports.append(r)
                     last_id = docs[-1].id
-                    await session.commit()
                     remaining -= len(docs)
             finally:
                 bar.close()
@@ -956,8 +1024,9 @@ def verify(
         int | None, typer.Option(help="最多校验多少条，默认不设上限、处理到清空为止")
     ] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
+    concurrency: Annotated[int, typer.Option(help="并发处理数，每个并发任务用独立数据库连接")] = 8,
     resource_id: Annotated[int | None, typer.Option(help="只校验指定资源")] = None,
-    rate: Annotated[float, typer.Option(help="每个网盘每秒最多几次请求")] = 1.0,
+    rate: Annotated[float, typer.Option(help="每个网盘每秒最多几次请求")] = 5.0,
     recheck_all: Annotated[
         bool, typer.Option("--recheck-all", help="忽略复查时间，重校验全部可校验资源")
     ] = False,
@@ -968,7 +1037,9 @@ def verify(
     """校验：探测网盘链接现在还能不能用。
 
     默认不设总量上限——待校验的资源会一直处理到清空为止，内部按 `--batch-size`
-    分批拉取（不会一次性把全部待校验行都读进内存）。
+    分批拉取（不会一次性把全部待校验行都读进内存），每批内部用 `--concurrency`
+    个并发任务处理。默认限速已提到 5/秒——打太快可能触发网盘风控，被限流的
+    响应会误判成链接失效；这是接受该风险换取速度的选择，见 README。
     """
     from sqlalchemy import func, or_, select
 
@@ -1038,14 +1109,24 @@ def verify(
                     )
                     if not rows:
                         break
-                    for row in rows:
-                        probe = probes.setdefault(row.provider, get_probe(row.provider))
-                        if hasattr(bar, "set_postfix_str"):
-                            bar.set_postfix_str(row.provider.value)
-                        reports.append(await check_resource(session, row, probe, limiter))
+                    resource_ids = [row.id for row in rows]
+
+                    async def _handle(sub_session: Any, res_id: int) -> Any:
+                        sub_row = await sub_session.get(Resource, res_id)
+                        probe = probes.setdefault(sub_row.provider, get_probe(sub_row.provider))
+                        report = await check_resource(sub_session, sub_row, probe, limiter)
                         bar.update(1)
+                        return report
+
+                    results = await _process_concurrently(
+                        resource_ids, _handle, concurrency=concurrency
+                    )
+                    for r in results:
+                        if isinstance(r, Exception):
+                            logger.exception("校验任务异常", exc_info=r)
+                            continue
+                        reports.append(r)
                     last_id = rows[-1].id
-                    await session.commit()
                     remaining -= len(rows)
             finally:
                 bar.close()
