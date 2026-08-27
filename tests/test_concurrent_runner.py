@@ -187,6 +187,27 @@ class TestRunParsePipeline:
         )
         assert reports == []
 
+    @pytest.mark.asyncio
+    async def test_progress_fires_per_document_not_per_write_batch(self, db_url) -> None:
+        """进度回调不能绑死在落库批大小上——否则总量不到 write_batch 时全程不动。"""
+        async with open_session(db_url) as session:
+            session.add_all([make_doc(n) for n in range(1, 6)])
+            await session.commit()
+
+        calls: list[int] = []
+        reports = run_parse_pipeline(
+            extractor_name="rule",
+            settings=Settings(database_url=db_url),
+            concurrency=1,
+            write_batch=100,
+            on_progress=calls.append,
+        )
+
+        assert len(reports) == 5
+        assert calls == [1, 1, 1, 1, 1], (
+            "5 条文档应该各自触发一次回调，而不是攒够 write_batch 才一次性跳 5"
+        )
+
 
 class TestCountPending:
     @pytest.mark.asyncio

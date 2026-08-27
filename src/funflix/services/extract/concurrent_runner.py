@@ -253,6 +253,11 @@ class _ParseConsumer(BaseConsumer):
 
     def consume(self, item: dict[str, Any]) -> None:
         self._buffer.append(item)
+        # 进度反馈粒度跟落库批大小解耦：每收到一条就立刻回调一次，不等攒够
+        # write_batch 条才一次性跳一大截——否则总量不到 write_batch 时进度条
+        # 全程不动，跑到最后才瞬间跳到底，观感上等于没有进度条。
+        if self.on_progress is not None:
+            self.on_progress(1)
         if len(self._buffer) >= self.write_batch:
             self._aio_loop.run_until_complete(self._flush())
 
@@ -306,8 +311,6 @@ class _ParseConsumer(BaseConsumer):
                 raise
 
         self.reports.extend(reports)
-        if self.on_progress is not None:
-            self.on_progress(len(items))
 
 
 def run_parse_pipeline(
