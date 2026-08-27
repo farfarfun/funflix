@@ -325,11 +325,14 @@ def _pipeline_counts(pipeline: Pipeline) -> tuple[int, int]:
     return total, done
 
 
-def _pipeline_pending(pipeline: Pipeline) -> int:
-    """两条队列里当前还没被取走的积压条数，用来判断"是否已经彻底跑空"。"""
-    consumer = pipeline.consumer
-    assert consumer is not None
-    return pipeline.producer.stats()["output_qsize"] + consumer.stats()["input_qsize"]
+def _pipeline_finished(*, producer_alive: bool, total: int, done: int) -> bool:
+    """生产者已经不在跑，且累计处理数追上了累计入队数，才算真的跑完。
+
+    不能用"两条队列的 qsize 都是 0"判断——处理单元线程可能正把条目从输入
+    队列取走、还没处理完就没写回输出队列，那一刻两条队列恰好都是空的，但
+    实际还有条目在处理单元线程里"飞行中"，谁的 stats() 快照都看不见。
+    """
+    return not producer_alive and done >= total
 
 
 def run_parse_pipeline(
@@ -382,9 +385,12 @@ def run_parse_pipeline(
                 pipeline.producer.join(timeout=0.5)
             else:
                 time.sleep(0.5)
+            total, done = _pipeline_counts(pipeline)
             if on_progress is not None:
-                on_progress(*_pipeline_counts(pipeline))
-            if not pipeline.producer.is_alive() and _pipeline_pending(pipeline) == 0:
+                on_progress(total, done)
+            if _pipeline_finished(
+                producer_alive=pipeline.producer.is_alive(), total=total, done=done
+            ):
                 break
     finally:
         pipeline.stop()

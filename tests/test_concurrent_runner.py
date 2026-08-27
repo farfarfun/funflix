@@ -16,7 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from funflix.base.config import Settings
 from funflix.base.enums import ParseStatus, SourceType
 from funflix.models import Base, Media, RawDocument, Resource, utcnow
-from funflix.services.extract.concurrent_runner import count_pending, run_parse_pipeline
+from funflix.services.extract.concurrent_runner import (
+    _pipeline_finished,
+    count_pending,
+    run_parse_pipeline,
+)
 from funflix.services.extract.rule import RuleExtractor
 
 
@@ -206,6 +210,20 @@ class TestRunParsePipeline:
         # 最后一次回调时，入队/处理总数要对得上——流水线已经彻底跑空。
         total, done = calls[-1]
         assert total == done == 5
+
+
+class TestPipelineFinished:
+    def test_not_finished_while_producer_alive_even_if_counts_match(self) -> None:
+        assert _pipeline_finished(producer_alive=True, total=5, done=5) is False
+
+    def test_not_finished_while_in_flight_items_havent_been_counted_as_done(self) -> None:
+        """生产者已经翻完页，但处理单元线程还在处理最后几条——两条队列的
+        qsize 可能都已经归零，可累计处理数还没追上累计入队数，这时不能提前
+        收尾，否则进度回调会在流水线真正跑完前就停止轮询。"""
+        assert _pipeline_finished(producer_alive=False, total=99, done=83) is False
+
+    def test_finished_once_done_catches_up_to_total(self) -> None:
+        assert _pipeline_finished(producer_alive=False, total=99, done=99) is True
 
 
 class TestCountPending:

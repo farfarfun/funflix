@@ -18,6 +18,7 @@ from funflix.base.enums import CheckStatus, Provider
 from funflix.models import Base, Resource, utcnow
 from funflix.services.verify import concurrent_runner as cr
 from funflix.services.verify.base import CheckOutcome, LinkRef
+from funflix.services.verify.concurrent_runner import _pipeline_finished
 
 
 class FakeProbe:
@@ -160,9 +161,7 @@ class TestRunVerifyPipeline:
         assert total == done == 5
 
     @pytest.mark.asyncio
-    async def test_limit_caps_how_many_resources_are_processed(
-        self, db_url, monkeypatch
-    ) -> None:
+    async def test_limit_caps_how_many_resources_are_processed(self, db_url, monkeypatch) -> None:
         monkeypatch.setattr(cr, "get_probe", fake_get_probe)
         async with open_session(db_url) as session:
             session.add_all([make_resource(n) for n in range(1, 6)])
@@ -206,6 +205,18 @@ class TestRunVerifyPipeline:
 
         assert len(reports) == 1
         assert reports[0].resource_id == 2
+
+
+class TestPipelineFinished:
+    def test_not_finished_while_producer_alive_even_if_counts_match(self) -> None:
+        assert _pipeline_finished(producer_alive=True, total=5, done=5) is False
+
+    def test_not_finished_while_in_flight_items_havent_been_counted_as_done(self) -> None:
+        """理由同 `tests/test_concurrent_runner.py::TestPipelineFinished`。"""
+        assert _pipeline_finished(producer_alive=False, total=99, done=83) is False
+
+    def test_finished_once_done_catches_up_to_total(self) -> None:
+        assert _pipeline_finished(producer_alive=False, total=99, done=99) is True
 
 
 class TestCountDue:
