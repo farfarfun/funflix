@@ -317,7 +317,10 @@ class Worker:
 
         async with self._session_factory() as session:
             report.collect = await run_collect_batch(
-                session, limit=cfg.worker_collect_batch, lease=self._lease
+                session,
+                limit=cfg.worker_collect_batch,
+                lease=self._lease,
+                write_batch=cfg.worker_write_batch,
             )
         async with self._session_factory() as session:
             report.parse = await run_parse_batch(
@@ -325,6 +328,7 @@ class Worker:
                 limit=cfg.worker_parse_batch,
                 lease=self._lease,
                 extractor=cfg.worker_extractor,
+                write_batch=cfg.worker_write_batch,
             )
         async with self._session_factory() as session:
             report.verify = await run_verify_batch(
@@ -332,6 +336,7 @@ class Worker:
                 limit=cfg.worker_verify_batch,
                 lease=self._lease,
                 limiter=self._limiter,
+                write_batch=cfg.worker_write_batch,
             )
         return report
 

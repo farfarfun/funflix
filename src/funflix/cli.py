@@ -269,6 +269,9 @@ def worker(
     collect_batch: Annotated[
         int | None, typer.Option(help="采集阶段每批领取多少个源（不是总量上限，跑到队列清空）")
     ] = None,
+    write_batch: Annotated[
+        int | None, typer.Option(help="攒够多少条处理完的任务再提交一次，覆盖配置")
+    ] = None,
     extractor: Annotated[str | None, typer.Option(help="强制抽取器，留空按源类型自动选")] = None,
     progress_interval: Annotated[
         int | None, typer.Option(help="心跳进度日志间隔秒数，<=0 关闭，覆盖配置")
@@ -293,6 +296,7 @@ def worker(
                 "worker_parse_batch": parse_batch,
                 "worker_verify_batch": verify_batch,
                 "worker_collect_batch": collect_batch,
+                "worker_write_batch": write_batch,
                 "worker_extractor": extractor,
                 "worker_progress_seconds": progress_interval,
             }.items()
@@ -338,7 +342,8 @@ def worker(
         f"轮询 {settings.worker_poll_seconds}s，租约 {settings.worker_lease_seconds}s，"
         f"每批 采集{settings.worker_collect_batch}/"
         f"解析{settings.worker_parse_batch}/校验{settings.worker_verify_batch}"
-        "（各阶段循环拉取直到清空）"
+        "（各阶段循环拉取直到清空），"
+        f"每 {settings.worker_write_batch} 条提交一次"
     )
     _heading("worker 运行中，Ctrl-C 停止")
     try:
@@ -781,12 +786,19 @@ def source_collect(
 @app.command("collect")
 def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
+    batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
+    write_batch: Annotated[int, typer.Option(help="攒够多少个源处理完再提交一次")] = 100,
     progress_interval: Annotated[
         int | None, typer.Option(help="进度心跳间隔秒数，<=0 关闭，默认取配置")
     ] = None,
 ) -> None:
-    """采集：把源里的新内容写成原始文本。"""
-    from sqlalchemy import select
+    """采集：把源里的新内容写成原始文本。
+
+    按 `--batch-size` 分批拉取启用的源（不会一次性把全部源读进内存），每处理完
+    `--write-batch` 个源提交一次，而不是全部跑完才提交一次 —— 源很多时中途
+    失败不会把已经采完的全部丢掉；也不需要等全部源跑完才落库。
+    """
+    from sqlalchemy import func, select
 
     from funflix.base.db import session_scope
     from funflix.models import Source
@@ -800,37 +812,73 @@ def collect(
             session_scope() as session,
         ):
             if source_id is not None:
-                targets = [await _require_source(session, source_id)]
+                total = 1
             else:
-                targets = list(await session.scalars(select(Source).where(Source.enabled)))
-            if not targets:
+                total = int(
+                    await session.scalar(
+                        select(func.count()).select_from(Source).where(Source.enabled)
+                    )
+                    or 0
+                )
+            if not total:
                 return []
 
-            reports = []
-            bar = _progress(targets, "采集", "源")
-            for target in bar:
-                # 一个源可能翻上百页、跑几分钟。源级进度条只会停在那里不动，
-                # 分不清是在正常翻页还是卡死了 —— 所以把页级进度实时打出来。
-                label = target.identifier[:18]
-                inner = tqdm(total=None, desc=f"  ↳ {label}", unit="页", leave=False, position=1)
+            reports: list[Any] = []
+            bar = tqdm(total=total, desc="采集", unit="源", leave=False, disable=total <= 1)
+            pending = 0
+            last_id = 0
+            try:
+                while True:
+                    if source_id is not None:
+                        # 单源模式没有分页可言，只在第一轮取一次。
+                        chunk = [await _require_source(session, source_id)] if last_id == 0 else []
+                    else:
+                        # 按 id 游标翻页，理由同 `parse` 命令：已处理的源状态
+                        # 未必总能把自己排除出 WHERE，游标才保证不会死循环。
+                        chunk = list(
+                            await session.scalars(
+                                select(Source)
+                                .where(Source.enabled, Source.id > last_id)
+                                .order_by(Source.id)
+                                .limit(batch_size)
+                            )
+                        )
+                    if not chunk:
+                        break
 
-                def _tick(p, _bar=inner) -> None:
-                    _bar.total = p.budget or None
-                    _bar.n = p.pages
-                    stage = "追新" if p.stage == "fetch" else "补历史"
-                    where = f" @{p.position}" if p.position else ""
-                    extra = f" {p.detail}" if p.detail else ""
-                    _bar.set_postfix_str(f"{stage} {p.messages}条{where}{extra}")
-                    _bar.refresh()
+                    for target in chunk:
+                        # 一个源可能翻上百页、跑几分钟。源级进度条只会停在那里不动，
+                        # 分不清是在正常翻页还是卡死了 —— 所以把页级进度实时打出来。
+                        label = target.identifier[:18]
+                        inner = tqdm(
+                            total=None, desc=f"  ↳ {label}", unit="页", leave=False, position=1
+                        )
 
-                if hasattr(bar, "set_postfix_str"):
-                    bar.set_postfix_str(label)
-                try:
-                    report = await collect_source(session, target, on_progress=_tick)
-                finally:
-                    inner.close()
-                reports.append((target.identifier, report))
-            await session.commit()
+                        def _tick(p, _bar=inner) -> None:
+                            _bar.total = p.budget or None
+                            _bar.n = p.pages
+                            stage = "追新" if p.stage == "fetch" else "补历史"
+                            where = f" @{p.position}" if p.position else ""
+                            extra = f" {p.detail}" if p.detail else ""
+                            _bar.set_postfix_str(f"{stage} {p.messages}条{where}{extra}")
+                            _bar.refresh()
+
+                        bar.set_postfix_str(label)
+                        try:
+                            report = await collect_source(session, target, on_progress=_tick)
+                        finally:
+                            inner.close()
+                        reports.append((target.identifier, report))
+                        bar.update(1)
+                        pending += 1
+                        if pending >= write_batch:
+                            await session.commit()
+                            pending = 0
+                    last_id = chunk[-1].id
+                if pending:
+                    await session.commit()
+            finally:
+                bar.close()
             return reports
 
     reports = _run(_do)
