@@ -71,9 +71,7 @@ class TestRunParsePipeline:
             assert len(media_rows) == 3
 
     @pytest.mark.asyncio
-    async def test_concurrency_and_multiple_flushes_still_dedupe_shared_media(
-        self, db_url
-    ) -> None:
+    async def test_concurrency_and_multiple_flushes_still_dedupe_shared_media(self, db_url) -> None:
         """3 线程处理单元 + 每 2 条落库一次：跨多次 flush 的作品去重要靠查库命中，
         不能只靠单次批内的内存 `BatchCache`。"""
         async with open_session(db_url) as session:

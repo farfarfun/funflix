@@ -213,9 +213,7 @@ def _apply_fetch_result(source: Source, result: FetchResult) -> None:
         merged = {**source.extra, **result.state}
         source.extra = {k: v for k, v in merged.items() if v is not None}
 
-    newest = max(
-        (m.numeric_id for m in result.messages if m.numeric_id is not None), default=None
-    )
+    newest = max((m.numeric_id for m in result.messages if m.numeric_id is not None), default=None)
     _advance_cursor(source, result, newest)
 
     if source.backfill_cursor_id is None:

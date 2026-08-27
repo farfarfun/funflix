@@ -2,7 +2,8 @@
 
 影视资源分享文本的结构化采集、解析与网盘链接校验。
 
-完整设计见 [docs/DESIGN.md](docs/DESIGN.md)，已知待优化项见 [docs/TODO.md](docs/TODO.md)。
+完整设计见 [docs/DESIGN.md](docs/DESIGN.md)，已知待优化项见 [docs/TODO.md](docs/TODO.md)，
+给本项目贡献代码见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
 ## 流水线
 
@@ -30,7 +31,7 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 ## 快速开始
 
 ```bash
-pip install -e ".[dev]"
+pip install -e .
 
 # 建库
 alembic upgrade head
@@ -76,6 +77,53 @@ funflix serve --reload
 （`采集 N/total 源`、`解析 N/total 条` 等）。
 
 `db reset` / `db retag` / `db requeue`、`ingest` 是一次性批量操作，没有逐条推进的过程，不在此列。
+
+### 全部命令
+
+顶层命令：
+
+| 命令 | 说明 |
+| --- | --- |
+| `funflix status` | 查看流水线各环节的记录数（`--verbose` 展开采集源明细） |
+| `funflix collect [source_id]` | 采集：把源里的新内容写成原始文本；不传 `source_id` 则采集全部启用的源 |
+| `funflix parse` | 抽取：把原始文本解析成作品与资源 |
+| `funflix verify` | 校验：探测网盘链接现在还能不能用 |
+| `funflix run` | 一条龙：采集全部启用的源，再解析待处理文本 |
+| `funflix worker` | 常驻后台 worker：周期性地采集、解析、校验（`--once` 只跑一轮就退出） |
+| `funflix serve` | 启动 API 服务 |
+| `funflix probes` | 列出可用的网盘校验探针 |
+| `funflix extractors` | 列出可用的抽取器 |
+| `funflix search <keyword>` | 按剧名搜索作品及其资源 |
+| `funflix doc <doc_id>` | 查看一条原始文本及其解析状态 |
+| `funflix ingest <path>` | 从文件导入原始文本（`.txt` / `.jsonl`） |
+
+`funflix db` 子命令：
+
+| 命令 | 说明 |
+| --- | --- |
+| `funflix db upgrade` | 执行数据库迁移 |
+| `funflix db downgrade <revision>` | 回滚迁移 |
+| `funflix db current` | 显示当前数据库版本 |
+| `funflix db revision -m "..."` | 按模型变更自动生成迁移脚本 |
+| `funflix db reset` | 清空数据表并重建（采集源配置保留，可用 `--keep-documents`/`--keep-cursors` 调整范围） |
+| `funflix db retag` | 按当前规则重新归类已有标签，合并重复项 |
+| `funflix db requeue` | 把"新支持的网盘"的历史资源放回校验队列 |
+| `funflix db info` | 显示当前连接的数据库方言 |
+
+`funflix source` 子命令：
+
+| 命令 | 说明 |
+| --- | --- |
+| `funflix source add <url>` | 登记一个采集源，类型与标识按 URL 自动识别 |
+| `funflix source list` | 列出全部采集源及其水位 |
+| `funflix source show <source_id>` | 查看采集源详情 |
+| `funflix source set <source_id>` | 修改采集源配置（间隔、翻页上限、水位、标题） |
+| `funflix source reset-cursor [source_id]` | 只归零采集水位，已采集的原始文本原样保留；不传则重置全部源 |
+| `funflix source enable <source_id>` | 启用采集源 |
+| `funflix source disable <source_id>` | 停用采集源 |
+| `funflix source remove <source_id>` | 删除采集源（已采集的原始文本会保留） |
+| `funflix source types` | 列出当前支持的采集源类型 |
+| `funflix source collect [source_id]` | 立即采集一次，等价于顶层 `funflix collect` |
 
 ## 配置
 
@@ -190,26 +238,4 @@ UC 与夸克是同一套接口（连业务码都一样），所以 UC 探针直�
 
 ## 开发
 
-```bash
-pytest              # 测试
-ruff check .        # lint
-ruff format .       # 格式化
-
-# 改了模型后生成迁移
-alembic revision --autogenerate -m "描述"
-```
-
-### 跑 PostgreSQL 那部分测试
-
-默认测试全在 SQLite 上，走的是 `LikeSearchBackend`；而**生产上真正跑的是
-`PgTrgmSearchBackend`**，两者的关键词子句一行代码都不共用。所以 SQLite 全绿
-并不能说明 PG 上是对的。`tests/test_search_pg.py` 补这一块，默认跳过：
-
-```bash
-export FUNFLIX_TEST_PG_URL='postgresql+asyncpg://用户@/库名'
-pytest tests/test_search_pg.py
-```
-
-其中 `test_keyword_query_uses_the_trgm_index` 断言的是**查询计划**而不是结果。
-`similarity(a,b) > 阈值` 和 `a % b` 结果完全一样，只有后者走索引 —— 写错了
-结果依旧正确、测试依旧全绿，只是慢几百倍。这种退化只有查执行计划才拦得住。
+开发环境搭建、测试、lint、生成迁移等见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
