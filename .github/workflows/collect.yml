@@ -62,7 +62,7 @@ jobs:
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
       # 影响范围有限，不会一次把所有待处理/待校验的都搭进去。
       - name: Parse
-        run: funflix parse --limit 2000
+        run: funflix parse --limit 20000
 
       - name: Verify
-        run: funflix verify --limit 2000
+        run: funflix verify --limit 20000
