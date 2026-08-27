@@ -36,42 +36,6 @@ def _run[T](factory: Callable[[], Awaitable[T]]) -> T:
     return asyncio.run(factory())
 
 
-async def _process_concurrently[T](
-    items: list[T],
-    handle: Callable[[Any, T], Awaitable[Any]],
-    *,
-    concurrency: int,
-) -> list[Any]:
-    """有界并发处理一批条目，`parse`/`verify` 复用。
-
-    每个任务用**独立 session**（同一个 AsyncSession 不能被多个协程同时用），
-    独立提交自己的事务——用独立 session 本身就决定了提交粒度只能是
-    "每条一提交"，而不是整批共用一次提交，这是并发换来的代价。
-
-    `handle` 拿到的 session 是这个任务自己的，不能用外层查出来的 ORM 对象
-    （跨 session 用会出问题），要在 `handle` 内部按 id 重新加载——所以
-    `items` 传的是 id，不是 ORM 对象。
-
-    某个任务异常不会让其余任务陪葬：`asyncio.gather(..., return_exceptions=True)`
-    保证一个任务的异常只体现为返回列表里的一个 `Exception` 实例。
-    """
-    from funflix.base.db import session_scope
-
-    sem = asyncio.Semaphore(max(1, concurrency))
-
-    async def _one(item: T) -> Any:
-        async with sem, session_scope() as session:
-            try:
-                result = await handle(session, item)
-                await session.commit()
-                return result
-            except Exception:
-                await session.rollback()
-                raise
-
-    return await asyncio.gather(*(_one(item) for item in items), return_exceptions=True)
-
-
 def _fail(message: str) -> NoReturn:
     typer.secho(message, fg=typer.colors.RED, err=True)
     raise typer.Exit(1)
@@ -891,8 +855,11 @@ def parse(
         int, typer.Option(help="每批内部按此粒度批量预读去重键、处理完再提交一次")
     ] = 100,
     concurrency: Annotated[
-        int, typer.Option(help="处理单元并发线程数（并发跑 extract()，不碰数据库）")
-    ] = 4,
+        int,
+        typer.Option(
+            help="处理单元并发线程数（并发跑 extract()，不碰数据库），默认取 max(8, CPU 核数)"
+        ),
+    ] = max(8, os.cpu_count() or 1),
     doc_id: Annotated[int | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
 ) -> None:
@@ -953,7 +920,17 @@ def parse(
             typer.echo("没有待解析的文档")
             return
 
-        bar = tqdm(total=total, desc="解析", unit="条", leave=False, disable=total <= 1)
+        # total 不用查出来的待处理数固定住——批量模式跑起来可能持续好一阵，
+        # 期间会有新文档变成待处理（比如 collect 还在并发写入），用查询时的
+        # 快照当分母，进度条要么卡在 99% 要么冒进到 100%+。改成跟 done 一起长，
+        # 分母就是"已处理的总数"本身，永远准确，代价是不再显示百分比。
+        bar = tqdm(total=0, desc="解析", unit="条", leave=False, disable=total <= 1)
+        bar.set_postfix_str(f"{concurrency} 线程")
+
+        def _on_progress(n: int) -> None:
+            bar.total += n
+            bar.update(n)
+
         try:
             reports = run_parse_pipeline(
                 extractor_name=extractor,
@@ -962,7 +939,7 @@ def parse(
                 write_batch=write_batch,
                 concurrency=concurrency,
                 force=force,
-                on_progress=bar.update,
+                on_progress=_on_progress,
             )
         finally:
             bar.close()
@@ -995,7 +972,13 @@ def verify(
         int | None, typer.Option(help="最多校验多少条，默认不设上限、处理到清空为止")
     ] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
-    concurrency: Annotated[int, typer.Option(help="并发处理数，每个并发任务用独立数据库连接")] = 8,
+    write_batch: Annotated[
+        int, typer.Option(help="消费者每攒够几条批量落库、提交一次")
+    ] = 100,
+    concurrency: Annotated[
+        int,
+        typer.Option(help="处理单元并发线程数（并发探测，不碰数据库），默认取 max(8, CPU 核数)"),
+    ] = max(8, os.cpu_count() or 1),
     resource_id: Annotated[int | None, typer.Option(help="只校验指定资源")] = None,
     rate: Annotated[float, typer.Option(help="每个网盘每秒最多几次请求")] = 5.0,
     recheck_all: Annotated[
@@ -1004,113 +987,69 @@ def verify(
 ) -> None:
     """校验：探测网盘链接现在还能不能用。
 
-    默认不设总量上限——待校验的资源会一直处理到清空为止，内部按 `--batch-size`
-    分批拉取（不会一次性把全部待校验行都读进内存），每批内部用 `--concurrency`
-    个并发任务处理。默认限速已提到 5/秒——打太快可能触发网盘风控，被限流的
-    响应会误判成链接失效；这是接受该风险换取速度的选择，见 README。
+    默认不设总量上限——待校验的资源会一直处理到清空为止。批量模式用
+    `services/verify/concurrent_runner.py` 的 funworker 流水线执行：一个生产者
+    线程按 `--batch-size` 翻页读资源，`--concurrency` 个处理单元线程并发跑
+    `probe.check()`，一个消费者线程每攒够 `--write-batch` 条就批量落库、
+    提交一次。默认限速已提到 5/秒——打太快可能触发网盘风控，被限流的响应会
+    误判成链接失效；这是接受该风险换取速度的选择，见 README。
     """
-    from sqlalchemy import func, or_, select
-
     from funflix.base.db import session_scope
-    from funflix.base.enums import CHECKABLE_PROVIDERS
-    from funflix.models import Resource, utcnow
-    from funflix.services.extract.runner import keyset_after
+    from funflix.models import Resource
+    from funflix.services.verify.concurrent_runner import count_due, run_verify_pipeline
     from funflix.services.verify.registry import assert_registry_matches_enum, get_probe
     from funflix.services.verify.runner import RateLimiter, check_resource
 
     assert_registry_matches_enum()
-    limiter = RateLimiter(rate_per_second=rate)
-    probes: dict[Any, Any] = {}
 
-    async def _do() -> list:
-        async with session_scope() as session:
-            if resource_id is not None:
+    if resource_id is not None:
+
+        async def _do_single() -> list[Any]:
+            async with session_scope() as session:
                 target = await session.get(Resource, resource_id)
                 if target is None:
                     _fail(f"资源 #{resource_id} 不存在")
-                probe = probes.setdefault(target.provider, get_probe(target.provider))
+                probe = get_probe(target.provider)
+                limiter = RateLimiter(rate_per_second=rate)
                 report = await check_resource(session, target, probe, limiter)
                 await session.commit()
                 return [report]
 
-            now = utcnow()
-            conditions = [Resource.provider.in_(CHECKABLE_PROVIDERS)]
-            if not recheck_all:
-                conditions.append(
-                    or_(
-                        Resource.next_check_at.is_(None)
-                        & (Resource.check_status == CheckStatus.UNCHECKED),
-                        Resource.next_check_at <= now,
-                    )
-                )
+        reports = _run(_do_single)
+    else:
 
-            total = int(
-                await session.scalar(select(func.count()).select_from(Resource).where(*conditions))
-                or 0
+        async def _count() -> int:
+            async with session_scope() as session:
+                return await count_due(session, recheck_all=recheck_all, limit=limit)
+
+        total = _run(_count)
+        if not total:
+            typer.echo("没有待校验的资源")
+            return
+
+        # 分母不用查出来的待校验数固定住，理由同 parse：不设 --limit 时批量模式
+        # 会跑到清空为止，期间水位会变化，查询时的快照跟实际处理数对不上。
+        # 改成跟 done 一起长，分母就是"已处理的总数"本身，永远准确。
+        bar = tqdm(total=0, desc="校验", unit="条", leave=False, disable=total <= 1)
+        bar.set_postfix_str(f"{concurrency} 线程")
+
+        def _on_progress(n: int) -> None:
+            bar.total += n
+            bar.update(n)
+
+        try:
+            reports = run_verify_pipeline(
+                limit=limit,
+                batch_size=batch_size,
+                write_batch=write_batch,
+                concurrency=concurrency,
+                rate=rate,
+                recheck_all=recheck_all,
+                on_progress=_on_progress,
             )
-            if limit is not None:
-                total = min(total, limit)
-            if not total:
-                return []
+        finally:
+            bar.close()
 
-            reports: list[Any] = []
-            remaining = total
-            last_id = 0
-            last_ts: Any = None
-            bar = tqdm(total=total, desc="校验", unit="条", leave=False, disable=total <= 1)
-            try:
-                while remaining > 0:
-                    fetch = min(batch_size, remaining)
-                    # 按 (last_checked_at, id) 复合游标翻页：`--recheck-all`
-                    # 下 WHERE 条件本身不会因为处理过就自动排除已处理的行
-                    # （只看 provider，跟校验状态无关），不用游标会在同一批里
-                    # 死循环重复捞回同一批行。排序优先级是"从没校验过的"
-                    # （last_checked_at IS NULL）在前，纯按 id 当游标已经不
-                    # 对应排序位置了，必须带上 last_checked_at 一起翻页。
-                    rows = list(
-                        await session.scalars(
-                            select(Resource)
-                            .where(
-                                *conditions,
-                                keyset_after(
-                                    Resource.last_checked_at, Resource.id, last_ts, last_id
-                                ),
-                            )
-                            .order_by(Resource.last_checked_at.nulls_first(), Resource.id)
-                            .limit(fetch)
-                        )
-                    )
-                    if not rows:
-                        break
-                    resource_ids = [row.id for row in rows]
-
-                    # 游标取自查询结果本身，跟 check_resource 是否已经改了
-                    # last_checked_at 无关（check_resource 在独立 sub_session
-                    # 里操作，不会动到这批 ORM 对象），但仍在处理前记录更清楚。
-                    last_ts = rows[-1].last_checked_at
-                    last_id = rows[-1].id
-
-                    async def _handle(sub_session: Any, res_id: int) -> Any:
-                        sub_row = await sub_session.get(Resource, res_id)
-                        probe = probes.setdefault(sub_row.provider, get_probe(sub_row.provider))
-                        report = await check_resource(sub_session, sub_row, probe, limiter)
-                        bar.update(1)
-                        return report
-
-                    results = await _process_concurrently(
-                        resource_ids, _handle, concurrency=concurrency
-                    )
-                    for r in results:
-                        if isinstance(r, Exception):
-                            logger.exception("校验任务异常", exc_info=r)
-                            continue
-                        reports.append(r)
-                    remaining -= len(rows)
-            finally:
-                bar.close()
-            return reports
-
-    reports = _run(_do)
     if not reports:
         typer.echo("没有待校验的资源")
         return
