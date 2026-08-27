@@ -946,7 +946,9 @@ def parse(
         int | None, typer.Option(help="最多解析多少条，默认不设上限、处理到清空为止")
     ] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
-    concurrency: Annotated[int, typer.Option(help="并发处理数，每个并发任务用独立数据库连接")] = 20,
+    write_batch: Annotated[
+        int, typer.Option(help="每批内部按此粒度批量预读去重键、处理完再提交一次")
+    ] = 100,
     doc_id: Annotated[int | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
     progress_interval: Annotated[
@@ -959,14 +961,12 @@ def parse(
     用错抽取器不会报错，只会静默地大批归属失败，所以默认按源类型分开。
 
     默认不设总量上限——待处理的文档会一直处理到清空为止，内部按 `--batch-size`
-    分批拉取（不会一次性把全部待处理行都读进内存），每批内部用 `--concurrency`
-    个并发任务处理（每个任务独立数据库连接与事务）。并发下两条文档若抽出
-    同一部作品会撞库唯一约束，静默回滚重试、不计入失败次数，属预期行为。
-
-    `--concurrency` 默认比 `verify` 高（20 而非 8）——parse 没有 `verify` 那种
-    "打太快触发风控"的顾虑，瓶颈纯粹是远程数据库的往返延迟，多开并发只会重叠
-    延迟、不会有副作用，上限只需留在数据库连接池容量（`pool_size=10` +
-    `max_overflow=20`＝30）以内。
+    分批拉取（不会一次性把全部待处理行都读进内存）。单条文档落库要查好几次
+    数据库（缓存命中、media/resource/tag 去重……），在远程数据库上每次往返
+    ~100~150ms，逐条查代价很高；每 `--write-batch` 条文档共用一次批量预读
+    （见 `services/extract/runner.py::parse_batch`），把这些查询从"每条文档
+    一次往返"折叠成"每批几次往返"，再统一提交一次。两条文档若抽出同一部
+    作品会撞库唯一约束，静默回滚重试、不计入失败次数，属预期行为。
     """
     from sqlalchemy import func, or_, select
 
@@ -977,7 +977,7 @@ def parse(
         get_extractor,
         supported_extractors,
     )
-    from funflix.services.extract.runner import parse_document
+    from funflix.services.extract.runner import parse_batch, parse_document
     from funflix.worker import progress_heartbeat
 
     _cache: dict[str, Any] = {}
@@ -1047,31 +1047,21 @@ def parse(
                     )
                     if not docs:
                         break
-                    doc_ids = [doc.id for doc in docs]
-                    # 抽取器解析在主协程里做（不在并发任务内）——`_extractor_for`
-                    # 缺配置时会调用 `_fail()` 直接退出整个命令，必须在第一条
-                    # 命中缺失抽取器时就同步炸出来，不能被并发任务的
-                    # try/except 吞成"这一条失败"。
-                    impls = {doc.id: _extractor_for(doc) for doc in docs}
 
-                    async def _handle(
-                        sub_session: Any, doc_id: int, *, impls: dict[int, Any] = impls
-                    ) -> Any:
-                        sub_doc = await sub_session.get(RawDocument, doc_id)
-                        report = await parse_document(
-                            sub_session, sub_doc, impls[doc_id], force=force
-                        )
-                        bar.update(1)
-                        return report
+                    groups: dict[str, list[Any]] = {}
+                    for doc in docs:
+                        kind = extractor or default_extractor_for(doc.source_type)
+                        groups.setdefault(kind, []).append(doc)
 
-                    results = await _process_concurrently(doc_ids, _handle, concurrency=concurrency)
-                    for r in results:
-                        if isinstance(r, Exception):
-                            # 不应该发生——parse_document 自己兜底所有异常；
-                            # 能漏到这里的只有 commit/rollback 本身的意外失败。
-                            logger.exception("解析任务异常", exc_info=r)
-                            continue
-                        reports.append(r)
+                    for kind_docs in groups.values():
+                        impl = _extractor_for(kind_docs[0])
+                        for i in range(0, len(kind_docs), write_batch):
+                            chunk = kind_docs[i : i + write_batch]
+                            results = await parse_batch(session, chunk, impl, force=force)
+                            await session.commit()
+                            reports.extend(results)
+                            bar.update(len(chunk))
+
                     last_id = docs[-1].id
                     remaining -= len(docs)
             finally:

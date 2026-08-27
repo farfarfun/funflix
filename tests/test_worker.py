@@ -12,13 +12,14 @@ from datetime import timedelta
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from funflix.base.backoff import BASE_BACKOFF, MAX_BACKOFF, backoff
 from funflix.base.config import Settings
 from funflix.base.enums import CheckStatus, ParseStatus, Provider, Quality, SourceType
-from funflix.models import Base, LinkCheck, RawDocument, Resource, Source, utcnow
-from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS, parse_document
+from funflix.models import Base, LinkCheck, Media, RawDocument, Resource, Source, utcnow
+from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS, parse_batch, parse_document
 from funflix.services.verify.base import CheckOutcome
 from funflix.worker.claim import claim_documents, claim_resources, claim_sources
 from funflix.worker.scheduler import Worker, progress_snapshot, stale_summary
@@ -405,6 +406,120 @@ class TestParseDocumentIntegrityRace:
         # SAVEPOINT 已经自动回滚，外层 session 没有被拖成不可用状态——照常能继续用
         doc.parse_attempts = 0
         await session.commit()
+
+
+class TestRunnerParseBatch:
+    """`runner.parse_batch` 的批量预读不该改变结果，只该改变往返次数。"""
+
+    @pytest.mark.asyncio
+    async def test_two_docs_sharing_a_title_dedupe_within_the_batch(self, session) -> None:
+        """同批内两条文档抽出同一部作品——第二条该复用第一条批内新建的 media，
+        而不是各自建一份（batch 内没有单独提交，跨 doc 的复用必须走内存 cache）。
+        """
+        from funflix.services.extract.rule import RuleExtractor
+
+        doc_a = make_doc(1, content="名称：热门剧\n链接：https://pan.quark.cn/s/fakeaaa")
+        doc_b = make_doc(2, content="名称：热门剧\n链接：https://pan.quark.cn/s/fakebbb")
+        session.add_all([doc_a, doc_b])
+        await session.commit()
+
+        reports = await parse_batch(session, [doc_a, doc_b], RuleExtractor())
+        await session.commit()
+
+        assert [r.ok for r in reports] == [True, True]
+        report_a, report_b = reports
+        assert report_a.media_created == 1
+        assert report_b.media_created == 0
+        assert report_b.media_reused == 1
+
+        media_rows = list(await session.scalars(select(Media)))
+        assert len(media_rows) == 1, "同一部作品在批内被建了不止一次"
+        resource_rows = list(await session.scalars(select(Resource)))
+        assert len(resource_rows) == 2
+        assert doc_a.parse_status == ParseStatus.DONE
+        assert doc_b.parse_status == ParseStatus.DONE
+
+    @pytest.mark.asyncio
+    async def test_matches_parse_document_for_independent_titles(self, session) -> None:
+        """不同作品的一批文档，`parse_batch` 与逐条 `parse_document` 落库结果一致。"""
+        from funflix.services.extract.rule import RuleExtractor
+
+        docs_batch = [make_doc(n) for n in range(1, 4)]
+        docs_single = [make_doc(n) for n in range(11, 14)]
+        session.add_all([*docs_batch, *docs_single])
+        await session.commit()
+
+        batch_reports = await parse_batch(session, docs_batch, RuleExtractor())
+        for doc in docs_single:
+            await parse_document(session, doc, RuleExtractor())
+        await session.commit()
+
+        assert all(r.ok for r in batch_reports)
+        assert {d.parse_status for d in docs_batch} == {ParseStatus.DONE}
+        assert {d.parse_status for d in docs_single} == {ParseStatus.DONE}
+
+        media_rows = list(await session.scalars(select(Media)))
+        assert len(media_rows) == 6, "批处理与逐条处理应产出同样数量的作品"
+
+    @pytest.mark.asyncio
+    async def test_integrity_error_isolates_a_single_doc_in_the_batch(
+        self, session, monkeypatch
+    ) -> None:
+        """批内一条撞唯一约束只回滚它自己，同批其它文档照常成功并提交。"""
+        from sqlalchemy.exc import IntegrityError
+
+        from funflix.services.extract import runner as runner_module
+        from funflix.services.extract.rule import RuleExtractor
+
+        doc_a = make_doc(1)
+        doc_b = make_doc(2)
+        session.add_all([doc_a, doc_b])
+        await session.commit()
+
+        real_persist = runner_module._persist
+
+        async def _boom_for_first_doc(session, doc, outcome, report, cache=None):
+            if doc.id == doc_a.id:
+                raise IntegrityError("INSERT", {}, Exception("uq_media_identity"))
+            return await real_persist(session, doc, outcome, report, cache)
+
+        monkeypatch.setattr(runner_module, "_persist", _boom_for_first_doc)
+
+        reports = await parse_batch(session, [doc_a, doc_b], RuleExtractor())
+        await session.commit()
+
+        report_a, report_b = reports
+        assert report_a.ok is False
+        assert "并发写入冲突" in (report_a.error or "")
+        assert doc_a.parse_attempts == 0
+        assert report_b.ok is True
+        assert doc_b.parse_status == ParseStatus.DONE
+
+    @pytest.mark.asyncio
+    async def test_refresh_media_counters_runs_once_for_the_whole_batch(
+        self, session, monkeypatch
+    ) -> None:
+        from funflix.services.extract import runner as runner_module
+        from funflix.services.extract.rule import RuleExtractor
+
+        docs = [make_doc(n) for n in range(1, 4)]
+        session.add_all(docs)
+        await session.commit()
+
+        calls = []
+        real_refresh = runner_module.refresh_media_counters
+
+        async def _spy(session, media_ids):
+            calls.append(set(media_ids))
+            return await real_refresh(session, media_ids)
+
+        monkeypatch.setattr(runner_module, "refresh_media_counters", _spy)
+
+        await parse_batch(session, docs, RuleExtractor())
+        await session.commit()
+
+        assert len(calls) == 1, "整批应该只重算一次计数，而不是每条文档各一次"
+        assert len(calls[0]) == 3
 
 
 class TestVerifyBatch:

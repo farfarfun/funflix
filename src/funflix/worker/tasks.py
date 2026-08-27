@@ -31,7 +31,7 @@ from funflix.services.collect.registry import get_collector
 from funflix.services.collect.runner import collect_source
 from funflix.services.extract.base import Extractor
 from funflix.services.extract.registry import default_extractor_for, get_extractor
-from funflix.services.extract.runner import parse_document
+from funflix.services.extract.runner import parse_batch
 from funflix.services.verify.registry import get_probe
 from funflix.services.verify.runner import RateLimiter, check_resource
 from funflix.worker.claim import (
@@ -147,7 +147,11 @@ async def run_parse_batch(
             表格源用 sheet、自由文本用 rule，选错不会报错，只会大批归属失败。
         limit: 每批领取多少条，不是这次总共处理多少条 —— 队列有多少待处理的
             文档就处理多少，不设总量上限。
-        write_batch: 攒够多少条处理完的文档再提交一次，见模块 docstring。
+        write_batch: 每 `parse_batch` 调用处理多少条文档再提交一次。也是
+            `parse_batch` 内部批量预读 media/resource/tag 去重键的粒度——
+            见 `services/extract/runner.py` 模块 docstring：单条 SELECT 在
+            远程数据库上一次就要 ~100~150ms，批量预读把这类查询从
+            "每条文档一次往返"折叠成"每批几次往返"。
     """
     report = BatchReport()
     cache: dict[str, Extractor] = {}
@@ -158,30 +162,33 @@ async def run_parse_batch(
         report.reclaimed += claimed.reclaimed
         report.abandoned += claimed.abandoned
 
-        pending = 0
+        groups: dict[str, list[Any]] = {}
         for doc in claimed.rows:
-            try:
-                kind = extractor or default_extractor_for(doc.source_type)
-                if kind not in cache:
-                    # LLM 抽取器在构造时就要读凭证，配置缺失会在这里抛
-                    cache[kind] = get_extractor(kind)
-                result = await parse_document(session, doc, cache[kind])
-                report.succeeded += int(result.ok)
-                report.failed += int(not result.ok)
-                await _mark_done(doc)
-                pending += 1
-            except Exception as exc:
-                # parse_document 自己会吞掉抽取异常并推进状态机，能漏到这里的
-                # 基本是抽取器构造失败之类与具体文档无关的问题。
-                report.failed += 1
-                await _abort(session, "解析", doc.id, exc)
-                pending = 0
-                continue
-            if pending >= write_batch:
+            kind = extractor or default_extractor_for(doc.source_type)
+            groups.setdefault(kind, []).append(doc)
+
+        for kind, docs in groups.items():
+            if kind not in cache:
+                # LLM 抽取器在构造时就要读凭证，配置缺失会在这里抛
+                cache[kind] = get_extractor(kind)
+            for i in range(0, len(docs), write_batch):
+                chunk = docs[i : i + write_batch]
+                try:
+                    results = await parse_batch(session, chunk, cache[kind])
+                except Exception as exc:
+                    # parse_batch 内部已经把每条文档的抽取/落库异常都吞掉
+                    # 并推进了各自的状态机，能漏到这里的是批级别的问题
+                    # （比如批量预读查询本身失败），整个 chunk 未提交的
+                    # 部分一起回滚，靠租约过期自然重试。
+                    report.failed += len(chunk)
+                    await _abort(session, "解析", f"{kind}#{chunk[0].id}..", exc)
+                    continue
+                for result in results:
+                    report.succeeded += int(result.ok)
+                    report.failed += int(not result.ok)
+                for doc in chunk:
+                    await _mark_done(doc)
                 await session.commit()
-                pending = 0
-        if pending:
-            await session.commit()
 
         if not claimed.rows:
             break
