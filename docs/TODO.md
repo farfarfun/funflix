@@ -278,7 +278,7 @@ grep 过 src 和 tests，五个都零引用：
   `repository/` 从未存在、`ratelimit.py` 不存在、漏了 `collect/`、`counters.py`、
   `maintenance.py`、`models/source.py`、`models/tag.py` 等）
 - §10 里程碑表已过时
-- §3.1 缺 `next_parse_at`、§3.5 缺 `latency_ms`、§3.0 缺 `backfill_pages_per_fetch` / `extra`
+- §3.1 缺 `next_parse_at`、§3.5 缺 `latency_ms`、§3.0 缺 `extra`
 - §7.2 的 `GET /search` 实际是 `GET /api/v1/media`，且少了
   `provider` / `quality` / `sort(latest|hot)` 三个筛选维度，
   `check_status` 默认值与文档相反（文档说默认只返 valid，实际默认全返），

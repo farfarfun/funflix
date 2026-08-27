@@ -141,7 +141,6 @@ class TestBackfillResolvesColumnNames:
             identifier="DT0abc",
             enabled=True,
             extra={OK: {"s1": 120}, TK: {"s1": 600}},
-            backfill_pages_per_fetch=2,
         )
         session.add(source)
         await session.commit()
@@ -192,7 +191,6 @@ class TestBackfillResolvesColumnNames:
             identifier="DT0abc",
             enabled=True,
             extra={OK: {"s1": 120}, TK: {"s1": 600}},
-            backfill_pages_per_fetch=2,
         )
         session.add(source)
         await session.commit()

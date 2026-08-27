@@ -263,8 +263,13 @@ class TelegramChannelCollector(SupportsProgress):
     async def backfill(self, source: Source) -> FetchResult:
         """往更早的消息回溯。
 
-        从低水位开始用 `?before=` 一路向前翻。返回空页即到顶 ——
-        此时置 `backfill_done`，此后每轮只追新，不再往前空跑。
+        从低水位开始用 `?before=` 一路向前翻，一次性翻到顶 —— 不再分轮限速。
+        返回空页或翻到 ID 1 即到顶，此时置 `backfill_done`，此后每轮只追新，
+        不再往前空跑。
+
+        翻页途中请求失败（网络抖动、被限流）就地收工，把已经翻到的内容和
+        新低水位一起返回、`backfill_done` 留 False —— 下次 collect 从这里接着
+        翻，而不是让一次抖动扔掉这一整轮已经翻到的内容。
 
         低水位为空时说明还没做过首次采集，本轮不动，等 fetch 立好水位再说。
         """
@@ -282,9 +287,14 @@ class TelegramChannelCollector(SupportsProgress):
         done = False
 
         try:
-            budget = max(1, source.backfill_pages_per_fetch)
-            while pages < budget:
-                html = await self._get_page(client, channel, oldest)
+            while True:
+                try:
+                    html = await self._get_page(client, channel, oldest)
+                except httpx.HTTPError as exc:
+                    logger.warning(
+                        "补历史请求失败 source=%s: %s，先收工这一轮已拿到的", channel, exc
+                    )
+                    break
                 messages, _ = parse_channel_page(html, channel)
                 pages += 1
 
@@ -299,12 +309,11 @@ class TelegramChannelCollector(SupportsProgress):
                     if message.numeric_id is not None and message.numeric_id < oldest:
                         collected[message.numeric_id] = message
                 oldest = min(fresh)
-                self._report("backfill", pages, budget, len(collected), position=oldest)
+                self._report("backfill", pages, 0, len(collected), position=oldest)
                 if oldest <= 1:
                     done = True
                     break
-                if pages < budget:
-                    await asyncio.sleep(self._page_delay)
+                await asyncio.sleep(self._page_delay)
         finally:
             if self._owns_client:
                 await client.aclose()

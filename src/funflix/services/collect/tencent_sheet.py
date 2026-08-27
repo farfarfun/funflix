@@ -273,8 +273,10 @@ class TencentSheetCollector(SupportsProgress):
         `total_row` 已知，低水位就是每个 sheet 已扫到的行偏移，
         推到 `>= total_row` 即该 sheet 补完，全部补完则 `backfill_done`。
 
-        一个 sheet 三万多行、每片 60 行，补完要几百次请求 ——
-        所以每轮只推进 `backfill_pages_per_fetch` 片，靠定时任务慢慢磨。
+        一次性把所有 pending sheet 扫到底，不再分轮限速。扫描途中请求失败
+        （网络抖动、被限流）就地收工，把已经扫到的行和新偏移一起返回、
+        `backfill_done` 留 False —— 下次 collect 从这里接着扫，而不是让
+        一次抖动扔掉这一整轮已经扫到的内容。
         """
         doc_id = source.identifier
         offsets: dict[str, int] = dict(source.extra.get(_OFFSET_KEY) or {})
@@ -291,7 +293,7 @@ class TencentSheetCollector(SupportsProgress):
         client = self._client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         messages: list[CollectedMessage] = []
         pages = 0
-        budget = max(1, source.backfill_pages_per_fetch)
+        aborted = False
 
         try:
             for sheet_id in pending:
@@ -305,8 +307,15 @@ class TencentSheetCollector(SupportsProgress):
                 if columns:
                     pages += 1
 
-                while pages < budget and start < target:
-                    payload = await self._get(client, doc_id, sheet_id, start)
+                while start < target:
+                    try:
+                        payload = await self._get(client, doc_id, sheet_id, start)
+                    except httpx.HTTPError as exc:
+                        logger.warning(
+                            "sheet %s 补历史请求失败：%s，先收工这一轮已拿到的", sheet_id, exc
+                        )
+                        aborted = True
+                        break
                     pages += 1
                     chunk_columns, rows = parse_sheet_chunk(_decode_smartsheet(payload))
                     # 后续片偶尔也会带列定义（比如中途加了列），合并进来
@@ -324,14 +333,14 @@ class TencentSheetCollector(SupportsProgress):
                     self._report(
                         "backfill",
                         pages,
-                        budget,
+                        0,
                         len(messages),
                         position=f"{start}/{target}",
                         detail=f"sheet {sheet_id}",
                     )
-                    if pages < budget and start < target:
+                    if start < target:
                         await asyncio.sleep(self._chunk_delay)
-                if pages >= budget:
+                if aborted:
                     break
         finally:
             if self._owns_client:
@@ -388,10 +397,9 @@ class TencentSheetCollector(SupportsProgress):
     def _merge_offset(existing: int | None, consumed: int) -> int:
         """行偏移只能往前，不能倒退。
 
-        backfill 每轮推进 `backfill_pages_per_fetch` 片，一个三万行的 sheet
-        要几百轮才能推到底。而文档一旦追加新行、`ver` 变化，fetch 就会重扫该
+        backfill 一轮扫到底，但文档一旦追加新行、`ver` 变化，fetch 就会重扫该
         sheet —— 它只读得起最前面几片，直接覆盖就会把 backfill 的进度打回原点，
-        之后几百次请求全被 content_hash 去重、白跑，期间新追加的行一直取不到。
+        之后重扫的内容全被 content_hash 去重、白跑，期间新追加的行一直取不到。
         """
         return max(existing or 0, consumed)
 

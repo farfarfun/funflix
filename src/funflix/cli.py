@@ -688,15 +688,12 @@ def source_set(
     source_id: int,
     interval: Annotated[int | None, typer.Option(help="采集间隔（秒）")] = None,
     max_pages: Annotated[int | None, typer.Option(help="单次翻页上限（追新方向）")] = None,
-    backfill_pages: Annotated[
-        int | None, typer.Option(help="单轮往前回溯几页。补历史慢就调大它")
-    ] = None,
     cursor: Annotated[str | None, typer.Option(help="回拨水位即可重采历史")] = None,
     title: Annotated[str | None, typer.Option(help="展示名")] = None,
 ) -> None:
     """修改采集源配置。
 
-    追新（max_pages）和补历史（backfill_pages）是两个独立方向，互不影响。
+    补历史（backfill）没有翻页上限，每次 collect 都会一口气扫到底。
     """
     from funflix.base.db import session_scope
 
@@ -707,8 +704,6 @@ def source_set(
                 source.fetch_interval_seconds = interval
             if max_pages is not None:
                 source.max_pages_per_fetch = max_pages
-            if backfill_pages is not None:
-                source.backfill_pages_per_fetch = backfill_pages
             if cursor is not None:
                 source.cursor_message_id = cursor
             if title is not None:
