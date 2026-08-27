@@ -714,6 +714,42 @@ def source_set(
     _ok(f"已更新 #{source_id}")
 
 
+@source_app.command("reset-cursor")
+def source_reset_cursor(
+    source_id: Annotated[int | None, typer.Argument(help="留空则重置全部采集源")] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """只归零采集水位，已采集的原始文本原样保留。
+
+    用于定期核查"水位往前走了，但对应内容其实没真正采集成功"这类漂移 ——
+    水位清零后重新 `collect` 会把该源从头再翻一遍，旧内容会被
+    `content_hash` 唯一约束挡掉（不会重复入库），只有真正漏采的部分才会
+    补进来。连原始文本一起清空用 `funflix db reset`。
+    """
+    from sqlalchemy import select
+
+    from funflix.base.db import session_scope
+    from funflix.models import Source
+
+    target = f"#{source_id}" if source_id is not None else "全部采集源"
+    if not yes and not typer.confirm(f"确认重置 {target} 的采集水位？已采文本不受影响"):
+        raise typer.Abort()
+
+    async def _do() -> int:
+        async with session_scope() as session:
+            if source_id is not None:
+                sources = [await _require_source(session, source_id)]
+            else:
+                sources = list(await session.scalars(select(Source)))
+            for source in sources:
+                source.reset_watermark()
+            await session.commit()
+            return len(sources)
+
+    count = _run(_do)
+    _ok(f"已重置 {count} 个采集源的水位")
+
+
 @source_app.command("enable")
 def source_enable(source_id: int) -> None:
     """启用采集源。"""
