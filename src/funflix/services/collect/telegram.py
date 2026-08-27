@@ -39,7 +39,7 @@ CATCHUP_BEFORE_KEY = "catchup_before"
 #: runner 会反复调用本方法接着翻，不靠单次调用把整段历史吃完。
 #: 没翻完就地收工、backfill_done 留 False，下次调用从新低水位接着翻，
 #: 跟翻页途中请求失败的收工方式一致。
-_MAX_BACKFILL_PAGES_PER_RUN = 100
+_MAX_BACKFILL_PAGES_PER_RUN = 1000
 
 #: 频道预览页固定每页最多 20 条消息（Telegram Web 预览的实测值）。消息 ID
 #: 在频道内单调递增，这让我们能在真正抓页面之前就用整数运算规划出后续每一

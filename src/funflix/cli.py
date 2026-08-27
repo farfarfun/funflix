@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -804,8 +805,8 @@ def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
     concurrency: Annotated[
-        int, typer.Option(help="处理单元并发线程数（并发抓 HTTP，不碰数据库）")
-    ] = 4,
+        int, typer.Option(help="处理单元并发线程数（并发抓 HTTP，不碰数据库），默认取 CPU 核数")
+    ] = os.cpu_count() or 4,
 ) -> None:
     """采集：把源里的新内容写成原始文本。
 
@@ -827,6 +828,7 @@ def collect(
     from funflix.services.collect.concurrent_runner import run_collect_pipeline
 
     bar = tqdm(total=0, desc="采集", unit="任务", leave=False)
+    bar.set_postfix_str(f"{concurrency} 线程")
 
     def _on_progress(total: int, done: int) -> None:
         # total 随生产者规划出更多任务动态增长，done 不会超过它——min() 只是
