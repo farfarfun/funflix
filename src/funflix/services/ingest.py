@@ -92,10 +92,63 @@ async def ingest_many(
 ) -> list[IngestOutcome]:
     """批量摄入。
 
-    同一批次内部也可能有重复文本，逐条走 `ingest_document` 天然处理：
-    第一条插入后，后续同 hash 的会在 flush 后的查询里命中它。
+    去重按整批一次 `IN` 查询预读已有 content_hash，而不是像 `ingest_document`
+    那样每条一次 SELECT + flush 各一次往返——远程数据库单次往返约
+    ~100~150ms，一个批次可能有成百上千条消息，逐条查询会让写入耗时线性
+    膨胀，拖慢采集翻页（见 `services/collect/runner.py` 模块 docstring）。
+    批内出现的重复 hash 也在这里就地命中，不用等各自 flush 后再去查库撞见。
     """
+    if not payloads:
+        return []
+
+    digests = [content_hash(p.content) for p in payloads]
+    existing_rows = await session.scalars(
+        select(RawDocument).where(RawDocument.content_hash.in_(set(digests)))
+    )
+    by_hash: dict[str, RawDocument] = {doc.content_hash: doc for doc in existing_rows}
+
+    now = utcnow()
     outcomes: list[IngestOutcome] = []
-    for payload in payloads:
-        outcomes.append(await ingest_document(session, payload))
+    fresh_indices: list[int] = []
+    fresh_docs: list[RawDocument] = []
+
+    for i, (payload, digest) in enumerate(zip(payloads, digests, strict=True)):
+        existing_doc = by_hash.get(digest)
+        if existing_doc is not None:
+            outcomes.append(IngestOutcome(document=existing_doc, duplicated=True))
+            continue
+
+        doc = RawDocument(
+            content=payload.content,
+            content_hash=digest,
+            source_id=payload.source_id,
+            source_type=payload.source_type,
+            source_name=payload.source_name,
+            source_url=payload.source_url,
+            source_msg_id=payload.source_msg_id,
+            published_at=payload.published_at,
+            collected_at=now,
+            extra=payload.extra,
+            parse_status=ParseStatus.PENDING,
+            next_parse_at=now,
+        )
+        session.add(doc)
+        by_hash[digest] = doc  # 批内去重：后续同 hash 直接命中这条，不重复新建
+        fresh_indices.append(i)
+        fresh_docs.append(doc)
+        outcomes.append(IngestOutcome(document=doc, duplicated=False))
+
+    if fresh_docs:
+        try:
+            # 用 savepoint 包住：整批一起 flush 期间撞上并发写入的概率很低，
+            # 一旦撞上就退化到逐条处理，不让整批因为一条冲突同归于尽。
+            async with session.begin_nested():
+                await session.flush()
+        except IntegrityError:
+            logger.info("批量插入命中 content_hash 冲突，退化为逐条处理: %d 条", len(fresh_docs))
+            for doc in fresh_docs:
+                session.expunge(doc)
+            for i in fresh_indices:
+                outcomes[i] = await ingest_document(session, payloads[i])
+
     return outcomes

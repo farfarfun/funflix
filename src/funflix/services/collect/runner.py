@@ -24,7 +24,7 @@ from funflix.services.collect.base import (
     SupportsProgress,
 )
 from funflix.services.collect.registry import get_collector
-from funflix.services.ingest import ingest_document
+from funflix.services.ingest import ingest_many
 
 logger = logging.getLogger(__name__)
 
@@ -233,31 +233,32 @@ async def _run_backfill(
 async def _ingest_messages(
     session: AsyncSession, source: Source, messages: list[CollectedMessage]
 ) -> tuple[int, int, int]:
-    """把消息落成原始文本。返回 (新增, 重复, 跳过的空消息)。"""
-    created = duplicated = skipped = 0
-    for message in messages:
-        if not message.text.strip():
-            # 纯图片/视频消息没有正文，跳过落库 —— 但水位照常推进，
-            # 否则这类消息会卡住水位，每轮都被重新拉取。
-            skipped += 1
-            continue
+    """把消息落成原始文本。返回 (新增, 重复, 跳过的空消息)。
 
-        outcome = await ingest_document(
-            session,
-            RawDocumentCreate(
-                content=message.text,
-                source_id=source.id,
-                source_type=source.source_type,
-                source_name=source.title or source.identifier,
-                source_url=message.url,
-                source_msg_id=message.message_id,
-                published_at=message.published_at,
-            ),
+    走 `ingest_many` 整批一次去重查询，而不是逐条 —— 一块 backfill 可能
+    带回成百上千条消息，逐条查询的往返耗时会跟翻页耗时同一量级甚至更长，
+    批量预读把这块的写入耗时从 O(条数) 折叠成 O(1) 次往返。
+    """
+    payloads = [
+        RawDocumentCreate(
+            content=message.text,
+            source_id=source.id,
+            source_type=source.source_type,
+            source_name=source.title or source.identifier,
+            source_url=message.url,
+            source_msg_id=message.message_id,
+            published_at=message.published_at,
         )
-        if outcome.duplicated:
-            duplicated += 1
-        else:
-            created += 1
+        for message in messages
+        if message.text.strip()
+    ]
+    # 纯图片/视频消息没有正文，跳过落库 —— 但水位照常推进（由调用方处理），
+    # 否则这类消息会卡住水位，每轮都被重新拉取。
+    skipped = len(messages) - len(payloads)
+
+    outcomes = await ingest_many(session, payloads)
+    duplicated = sum(1 for o in outcomes if o.duplicated)
+    created = len(outcomes) - duplicated
     return created, duplicated, skipped
 
 
