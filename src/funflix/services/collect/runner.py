@@ -28,12 +28,13 @@ from funflix.services.ingest import ingest_document
 
 logger = logging.getLogger(__name__)
 
-#: 一个源可能要翻几千上万页才能补完历史，_run_backfill 按块循环调用
-#: collector.backfill()（每块页数由采集器自己定，如 telegram 是 100 页），
-#: 这里是「一次 collect_source 最多跑多少块」的兜底上限，防止一个卡在
-#: 「总也翻不到顶」状态的源占住一整轮 collect 不出来。跑到这个上限就地
-#: 收工，backfill_done 留 False，水位已经推进的部分不受影响，下次接着翻。
-_MAX_BACKFILL_CHUNKS_PER_RUN = 100
+#: 一个源可能要翻几千上万页才能补完历史，总页数本身不是问题——
+#: `CommitBatcher` 保证水位按块持续落盘，中途中断也不会丢已完成的部分。
+#: 真正的约束是墙钟时间：CI 一个 job 有固定超时，且 collect/parse/verify
+#: 顺序跑在同一个 job 里，一个源补历史跑太久会把后面的步骤和下一轮调度
+#: 一起拖住。所以按时间预算收工，而不是猜一个页数/块数上限——到点就地
+#: 停下，backfill_done 留 False，已提交的水位不受影响，下次 collect 接着翻。
+_BACKFILL_TIME_BUDGET = timedelta(minutes=5)
 
 
 @dataclass(slots=True)
@@ -187,19 +188,20 @@ async def _run_backfill(
     一个源可能要翻几千上万页才能补完，不能等它全部跑完再回传水位——
     所以按块循环调用 `collector.backfill()`（每块多少页由采集器自己定），
     每块落库之后都用 `committer.mark()` 报一次量，攒够阈值就提交，
-    不用等这个源彻底补完。`_MAX_BACKFILL_CHUNKS_PER_RUN` 是防止一个
-    「总也翻不到顶」的源占住一整轮 collect 的兜底上限。
+    不用等这个源彻底补完。总页数不设上限——`_BACKFILL_TIME_BUDGET` 按墙钟
+    时间收工（默认 5 分钟/源），到点就地停下，`backfill_done` 留 False，
+    已提交的水位不受影响，下次 collect 从持久化的 `backfill_cursor_id`
+    接着翻。
     补历史失败不影响已经成功的追新和前面已提交的块 —— 所以异常在这里
     就地吞掉并记日志，不让它把已经落盘的进度回滚掉。
     """
-    chunks = 0
-    while not source.backfill_done and chunks < _MAX_BACKFILL_CHUNKS_PER_RUN:
+    deadline = utcnow() + _BACKFILL_TIME_BUDGET
+    while not source.backfill_done and utcnow() < deadline:
         try:
             result = await collector.backfill(source)
         except Exception as exc:
             logger.warning("补历史失败 source=%s: %s", source.identifier, exc)
             return
-        chunks += 1
 
         report.backfilled += len(result.messages)
         report.pages_fetched += result.pages_fetched
