@@ -858,6 +858,7 @@ def collect(
             bar = tqdm(total=total, desc="采集", unit="源", leave=False, disable=total <= 1)
             pending = 0
             last_id = 0
+            total_created = 0
             try:
                 while True:
                     if source_id is not None:
@@ -894,12 +895,15 @@ def collect(
                             _bar.set_postfix_str(f"{stage} {p.messages}条{where}{extra}")
                             _bar.refresh()
 
-                        bar.set_postfix_str(label)
+                        bar.set_postfix_str(f"{label} 已采集{total_created}条")
                         try:
                             report = await collect_source(session, target, on_progress=_tick)
                         finally:
                             inner.close()
                         reports.append((target.identifier, report))
+                        if report.ok:
+                            total_created += report.created + report.backfill_created
+                        bar.set_postfix_str(f"{label} 已采集{total_created}条")
                         bar.update(1)
                         pending += 1
                         if pending >= write_batch:
