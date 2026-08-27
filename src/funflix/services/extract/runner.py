@@ -320,12 +320,21 @@ async def _upsert_resource(
 
 
 async def _link_media_resource(
-    session: AsyncSession, media: Media, resource: Resource, cache: BatchCache | None = None
+    session: AsyncSession,
+    media: Media,
+    resource: Resource,
+    cache: BatchCache | None = None,
+    pending: list[dict] | None = None,
 ) -> bool:
     """建立作品 ↔ 资源关联。已存在则跳过。返回 True 表示新建了关联。
 
     先查后插而不是靠数据库的 ON CONFLICT —— 后者语法各方言不同，
     而 schema 要同时跑在 SQLite 和 PostgreSQL 上。
+
+    新建的关联行默认不在这里单独 `execute` —— 传了 `pending` 就攒进去，
+    由调用方（`_persist`）处理完整条文档后一次性批量 INSERT。一条文档
+    可能有好几个链接，逐条发 INSERT 会让关联表写入的往返次数跟链接数
+    成正比。
     """
     pair = (media.id, resource.id)
     if cache is not None:
@@ -342,11 +351,11 @@ async def _link_media_resource(
     if exists:
         return False
 
-    await session.execute(
-        media_resource.insert().values(
-            media_id=media.id, resource_id=resource.id, created_at=utcnow()
-        )
-    )
+    row = {"media_id": media.id, "resource_id": resource.id, "created_at": utcnow()}
+    if pending is not None:
+        pending.append(row)
+    else:
+        await session.execute(media_resource.insert().values(**row))
     if cache is not None:
         cache.media_resource_pairs.add(pair)
     # 计数不在这里 +1：调用方收尾时按关联表重算一次。
@@ -357,8 +366,17 @@ async def _link_media_resource(
 async def _upsert_tags(
     session: AsyncSession, media: Media, item: ExtractedItem, cache: BatchCache | None = None
 ) -> int:
-    """建立作品 ↔ 标签关联。返回新建的关联数。"""
-    linked = 0
+    """建立作品 ↔ 标签关联。返回新建的关联数。
+
+    一条 item 常常带好几个标签（类型、画质、年份……）。新建的标签先各自
+    `add` 但不逐个 `flush`，攒够这条 item 用到的新标签后一次性 `flush`——
+    SQLAlchemy 会把同批待插入的 `Tag` 行合并成一条多行 INSERT。关联表的
+    新增行同理攒成一条多行 INSERT，而不是每个标签各发一次 `execute`。
+    N 个新标签因此从 2N 次往返（各自 flush + 各自关联 insert）降到 2 次。
+    """
+    resolved: list[Tag] = []
+    pending_new_tags: list[Tag] = []
+
     for kind, name in item.tags:
         key = tag_norm_key(name)
         if not key:
@@ -371,10 +389,17 @@ async def _upsert_tags(
         if tag is None:
             tag = Tag(kind=TagKind(kind), name=name, norm_key=key)
             session.add(tag)
-            await session.flush()
             if cache is not None:
                 cache.tag_by_key[tag_key] = tag
+            pending_new_tags.append(tag)
+        resolved.append(tag)
 
+    if pending_new_tags:
+        await session.flush()
+
+    linked = 0
+    pair_rows: list[dict] = []
+    for tag in resolved:
         pair = (media.id, tag.id)
         if cache is not None:
             exists = pair in cache.media_tag_pairs
@@ -388,13 +413,15 @@ async def _upsert_tags(
             ) is not None
         if exists:
             continue
-        await session.execute(
-            media_tag.insert().values(media_id=media.id, tag_id=tag.id, created_at=utcnow())
-        )
+        pair_rows.append({"media_id": media.id, "tag_id": tag.id, "created_at": utcnow()})
         tag.media_count += 1
         if cache is not None:
             cache.media_tag_pairs.add(pair)
         linked += 1
+
+    if pair_rows:
+        await session.execute(media_tag.insert(), pair_rows)
+
     return linked
 
 
@@ -406,6 +433,9 @@ async def _persist(
     cache: BatchCache | None = None,
 ) -> set[int]:
     touched: set[int] = set()
+    # 一条文档可能有多个链接（合集），新建的 media_resource 关联行攒在这里，
+    # 处理完整条文档后一次性批量 INSERT，而不是每条链接各发一次往返。
+    pending_links: list[dict] = []
     for item in outcome.items:
         media, created = await _upsert_media(session, item, cache)
         report.media_created += int(created)
@@ -419,7 +449,9 @@ async def _persist(
             report.resources_created += int(is_new)
             report.resources_updated += int(not is_new)
             # 一个链接可以关联多部作品（合集），关联表的唯一约束保证不重复
-            report.links_created += int(await _link_media_resource(session, media, resource, cache))
+            report.links_created += int(
+                await _link_media_resource(session, media, resource, cache, pending_links)
+            )
 
     # 没归属到作品的链接照样入库（无任何关联），进人工/二次归属队列，绝不丢弃
     for link in outcome.unattributed_links:
@@ -427,6 +459,9 @@ async def _persist(
         report.resources_created += int(is_new)
         report.resources_updated += int(not is_new)
     report.unattributed_links = len(outcome.unattributed_links)
+
+    if pending_links:
+        await session.execute(media_resource.insert(), pending_links)
 
     await session.flush()
     return touched
