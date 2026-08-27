@@ -805,8 +805,9 @@ def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
     concurrency: Annotated[
-        int, typer.Option(help="处理单元并发线程数（并发抓 HTTP，不碰数据库），默认取 CPU 核数")
-    ] = os.cpu_count() or 4,
+        int,
+        typer.Option(help="处理单元并发线程数（并发抓 HTTP，不碰数据库），默认取 max(8, CPU 核数)"),
+    ] = max(8, os.cpu_count() or 1),
 ) -> None:
     """采集：把源里的新内容写成原始文本。
 
