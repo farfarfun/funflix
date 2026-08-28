@@ -7,6 +7,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import queue
+import time
 from contextlib import asynccontextmanager
 
 import pytest
@@ -17,7 +20,9 @@ from funflix.base.config import Settings
 from funflix.base.enums import ParseStatus, SourceType
 from funflix.models import Base, Media, RawDocument, Resource, utcnow
 from funflix.services.extract.concurrent_runner import (
-    _pipeline_finished,
+    _ParseConsumer,
+    _pipeline_counts,
+    _pipeline_pending,
     count_pending,
     run_parse_pipeline,
 )
@@ -212,18 +217,100 @@ class TestRunParsePipeline:
         assert total == done == 5
 
 
-class TestPipelineFinished:
-    def test_not_finished_while_producer_alive_even_if_counts_match(self) -> None:
-        assert _pipeline_finished(producer_alive=True, total=5, done=5) is False
+class TestPipelinePending:
+    def test_pending_sums_both_queue_backlogs(self) -> None:
+        class _FakeProducer:
+            def stats(self) -> dict[str, int]:
+                return {"output_qsize": 3}
 
-    def test_not_finished_while_in_flight_items_havent_been_counted_as_done(self) -> None:
-        """生产者已经翻完页，但处理单元线程还在处理最后几条——两条队列的
-        qsize 可能都已经归零，可累计处理数还没追上累计入队数，这时不能提前
-        收尾，否则进度回调会在流水线真正跑完前就停止轮询。"""
-        assert _pipeline_finished(producer_alive=False, total=99, done=83) is False
+        class _FakeConsumer:
+            def stats(self) -> dict[str, int]:
+                return {"input_qsize": 2}
 
-    def test_finished_once_done_catches_up_to_total(self) -> None:
-        assert _pipeline_finished(producer_alive=False, total=99, done=99) is True
+        class _FakePipeline:
+            producer = _FakeProducer()
+            consumer = _FakeConsumer()
+
+        assert _pipeline_pending(_FakePipeline()) == 5  # type: ignore[arg-type]
+
+    def test_pending_zero_once_both_queues_drain(self) -> None:
+        """两条队列都空了，即便消费者的提交数还没追上入队总数（还攒在内部
+        缓冲区里没到 `write_batch`），也该判定为"可以收尾了"——不然循环会
+        一直等一个永远不会自然发生的"提交数追上总数"，卡死在这里。"""
+
+        class _FakeProducer:
+            def stats(self) -> dict[str, int]:
+                return {"output_qsize": 0}
+
+        class _FakeConsumer:
+            def stats(self) -> dict[str, int]:
+                return {"input_qsize": 0}
+
+        class _FakePipeline:
+            producer = _FakeProducer()
+            consumer = _FakeConsumer()
+
+        assert _pipeline_pending(_FakePipeline()) == 0  # type: ignore[arg-type]
+
+
+class TestPipelineCounts:
+    def test_done_tracks_consumer_committed_not_pool_processed(self) -> None:
+        """完成数要跟消费者真正提交到数据库的计数走，不能跟处理单元线程池的
+        `processed` 走——后者只反映"内存里处理完了"，写库比抽取慢时会让进度条
+        冲到 100% 后卡住一大截，看着像"瞬间跑完但数据库没写完"。"""
+
+        class _FakeProducer:
+            def stats(self) -> dict[str, int]:
+                return {"produced": 150}
+
+        class _FakePool:
+            def stats(self) -> dict[str, int]:
+                # 处理单元早就跑完了，但这不代表落库跟上了。
+                return {"processed": 140, "failed": 3}
+
+        class _FakeConsumer:
+            def stats(self) -> dict[str, int]:
+                return {"consumed": 40, "failed": 0, "committed": 25}
+
+        class _FakePipeline:
+            producer = _FakeProducer()
+            pool = _FakePool()
+            consumer = _FakeConsumer()
+
+        total, done = _pipeline_counts(_FakePipeline())  # type: ignore[arg-type]
+
+        assert total == 150
+        assert done == 25
+
+
+class TestParseConsumerFlushInterval:
+    def test_flushes_on_time_even_when_under_write_batch(self, monkeypatch) -> None:
+        """缓冲区还没攒够 write_batch，但过了 flush_interval，也要落库——
+        不然处理单元比落库快时，最新一批文档会一直卡在消费者的缓冲区里出不去。"""
+        consumer = _ParseConsumer(
+            queue.Queue(),
+            settings=Settings(database_url="sqlite+aiosqlite:///:memory:"),
+            write_batch=1000,
+            flush_interval=0.01,
+        )
+        consumer._aio_loop = asyncio.new_event_loop()
+        consumer._buffer = []
+        consumer._last_flush_at = time.monotonic()
+
+        flushed: list[list[dict]] = []
+
+        async def _fake_flush() -> None:
+            flushed.append(list(consumer._buffer))
+            consumer._buffer = []
+
+        monkeypatch.setattr(consumer, "_flush", _fake_flush)
+
+        consumer.consume({"doc_id": 1})
+        assert not flushed, "刚开始不该立刻触发落库"
+
+        time.sleep(0.02)
+        consumer.consume({"doc_id": 2})
+        assert flushed == [[{"doc_id": 1}, {"doc_id": 2}]]
 
 
 class TestCountPending:

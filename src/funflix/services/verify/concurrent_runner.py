@@ -15,10 +15,16 @@
 刷新作品的 `valid_resource_count`）留给消费者线程，复用
 `services/verify/runner.py::persist_check_outcome`。
 
-进度用 `on_progress(total_enqueued, total_done)` 按生产者/消费者的累计计数
-轮询喂给调用方（做法照抄 `services/collect/concurrent_runner.py`）：分子是
-"处理过的总数"，分母是"入队列的总数"——入队快照会随生产者继续翻页动态
-增长，不会像"启动前查一次待校验数就固定住"那样跟实际进度对不上。
+进度用 `on_progress(total_enqueued, total_committed)` 轮询喂给调用方：分母是
+"入队列的总数"（随生产者翻页动态增长），分子是"消费者真正提交到数据库的
+资源数"（见 `_VerifyConsumer._committed`）——不用处理单元线程池的
+`processed`/消费者基类的 `consumed`，理由同
+`services/extract/concurrent_runner.py` 模块 docstring。
+
+轮询循环的收尾信号跟进度显示分开算：用 `_pipeline_pending` 看两条队列的
+qsize 是否都归零，不用"提交数追上入队总数"——后者在样本量小、或落库比探测
+慢时可能永远追不上，会让循环卡死，理由同
+`services/extract/concurrent_runner.py` 模块 docstring。
 """
 
 from __future__ import annotations
@@ -198,7 +204,10 @@ class _VerifyProcessor(BaseProcessor):
 
 
 class _VerifyConsumer(BaseConsumer):
-    """攒够 `write_batch` 条（或流水线收尾时）批量落库一次。"""
+    """攒够 `write_batch` 条，或距上次落库过了 `flush_interval` 秒（或流水线收尾时），批量落库一次。
+
+    理由同 `services/extract/concurrent_runner.py::_ParseConsumer`。
+    """
 
     def __init__(
         self,
@@ -206,12 +215,17 @@ class _VerifyConsumer(BaseConsumer):
         *,
         settings: Settings,
         write_batch: int,
+        flush_interval: float = 10.0,
         name: str | None = None,
     ) -> None:
         super().__init__(input_queue, name=name)
         self.settings = settings
         self.write_batch = write_batch
+        self.flush_interval = flush_interval
         self.reports: list[VerifyReport] = []
+        #: 真正提交到数据库的资源数——只在 `_flush` 里 `session.commit()`
+        #: 成功之后才累加，供 `_pipeline_counts` 当作进度条的分子。
+        self._committed = 0
 
     def on_start(self) -> None:
         self._aio_loop = asyncio.new_event_loop()
@@ -220,6 +234,7 @@ class _VerifyConsumer(BaseConsumer):
             self._engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
         )
         self._buffer: list[dict[str, Any]] = []
+        self._last_flush_at = time.monotonic()
 
     def on_stop(self) -> None:
         if self._buffer:
@@ -229,8 +244,11 @@ class _VerifyConsumer(BaseConsumer):
 
     def consume(self, item: dict[str, Any]) -> None:
         self._buffer.append(item)
-        if len(self._buffer) >= self.write_batch:
+        due_by_count = len(self._buffer) >= self.write_batch
+        due_by_time = (time.monotonic() - self._last_flush_at) >= self.flush_interval
+        if due_by_count or due_by_time:
             self._aio_loop.run_until_complete(self._flush())
+            self._last_flush_at = time.monotonic()
 
     async def _flush(self) -> None:
         items, self._buffer = self._buffer, []
@@ -261,32 +279,34 @@ class _VerifyConsumer(BaseConsumer):
                 await session.rollback()
                 raise
 
+        self._committed += len(items)
         self.reports.extend(reports)
+
+    def stats(self) -> dict[str, Any]:
+        return {**super().stats(), "committed": self._committed}
 
 
 def _pipeline_counts(pipeline: Pipeline) -> tuple[int, int]:
-    """(总入队数, 总处理数) —— 处理数按消费者读完队列、处理完（成功或失败）算，
-
-    只算成功会在有失败时永远追不上入队数。
-    """
+    """(总入队数, 总提交数)，理由同 `services/extract/concurrent_runner.py::_pipeline_counts`。"""
     total = pipeline.producer.stats()["produced"]
-    consumer = pipeline.consumer
-    assert consumer is not None
-    consumer_stats = consumer.stats()
-    done = consumer_stats["consumed"] + consumer_stats["failed"]
+    done = pipeline.consumer.stats()["committed"]
     return total, done
 
 
-def _pipeline_finished(*, producer_alive: bool, total: int, done: int) -> bool:
-    """理由同 `services/extract/concurrent_runner.py::_pipeline_finished`。"""
-    return not producer_alive and done >= total
+def _pipeline_pending(pipeline: Pipeline) -> int:
+    """理由同 `services/extract/concurrent_runner.py::_pipeline_pending`。"""
+    pending = pipeline.producer.stats()["output_qsize"]
+    if pipeline.consumer is not None:
+        pending += pipeline.consumer.stats()["input_qsize"]
+    return pending
 
 
 def run_verify_pipeline(
     *,
     limit: int | None = None,
     batch_size: int = 500,
-    write_batch: int = 100,
+    write_batch: int = 20,
+    flush_interval: float = 10.0,
     concurrency: int = 8,
     rate: float = 5.0,
     recheck_all: bool = False,
@@ -298,7 +318,8 @@ def run_verify_pipeline(
     同步阻塞函数——funworker 本身是阻塞式设计，不需要外层 `asyncio.run` 包装。
     生产/消费两端各自持有专属的 `AsyncEngine` + 事件循环（见模块 docstring），
     处理单元线程池并发数由 `concurrency` 控制，全部线程共享同一个
-    `BlockingRateLimiter`。
+    `BlockingRateLimiter`。消费者最多攒 `write_batch` 条或每 `flush_interval`
+    秒批量落库一次，取先满足的那个条件。
 
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，理由同
     `services/extract/concurrent_runner.py::run_parse_pipeline`。
@@ -323,6 +344,7 @@ def run_verify_pipeline(
         consumer_kwargs={
             "settings": settings,
             "write_batch": write_batch,
+            "flush_interval": flush_interval,
         },
     )
     pipeline.start()
@@ -332,12 +354,9 @@ def run_verify_pipeline(
                 pipeline.producer.join(timeout=0.5)
             else:
                 time.sleep(0.5)
-            total, done = _pipeline_counts(pipeline)
             if on_progress is not None:
-                on_progress(total, done)
-            if _pipeline_finished(
-                producer_alive=pipeline.producer.is_alive(), total=total, done=done
-            ):
+                on_progress(*_pipeline_counts(pipeline))
+            if not pipeline.producer.is_alive() and _pipeline_pending(pipeline) == 0:
                 break
     finally:
         pipeline.stop()

@@ -136,7 +136,7 @@ async def run_parse_batch(
     limit: int = 20,
     lease: timedelta = DEFAULT_LEASE,
     extractor: str | None = None,
-    write_batch: int = 100,
+    write_batch: int = 20,
 ) -> BatchReport:
     """循环领取、解析，直到待抽取的文本被清空。
 
@@ -199,7 +199,7 @@ async def run_verify_batch(
     limit: int = 20,
     lease: timedelta = DEFAULT_LEASE,
     limiter: RateLimiter | None = None,
-    write_batch: int = 100,
+    write_batch: int = 20,
 ) -> BatchReport:
     """循环领取、校验，直到到点复查的资源被清空。
 

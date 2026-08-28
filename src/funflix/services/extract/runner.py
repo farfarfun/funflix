@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 #: worker 领取时也要用它判断"崩溃重捞"是否已经捞够次数，故为公开常量。
 MAX_PARSE_ATTEMPTS = 5
 
+#: `persist_extracted` 里共享一个 SAVEPOINT 的文档数上限。一条文档落库要
+#: 固定几次往返（SAVEPOINT begin/release + 每张涉及表各一次 INSERT/UPDATE），
+#: 在远程数据库上这个固定开销才是主要耗时，不是链接/标签数量。把 N 条文档
+#: 打包共享一个 SAVEPOINT、一次 flush，往返次数就从 O(文档数) 摊薄成
+#: O(文档数 / N)。代价是失败隔离变粗：一条文档撞唯一约束会连累同批其余
+#: 文档一起回滚重试（不计入它们的失败次数，见 `persist_extracted`）。
+SAVEPOINT_BATCH_SIZE = 20
+
 
 @dataclass(slots=True)
 class ParseReport:
@@ -276,7 +284,9 @@ async def _upsert_media(
         aliases=[],
     )
     session.add(media)
-    await session.flush()
+    # 不在这里单独 flush——新建的 media 先攒着，跟同一条文档里新建的
+    # resource、Extraction 一起，由调用方（`_persist`）一次性 flush，
+    # 把「一条文档有 N 个链接就要 N 次数据库往返」降到固定次数。
     if cache is not None:
         cache.media_by_key[exact_key] = media
         cache.media_by_relaxed.setdefault(relaxed_key, []).append(media)
@@ -331,7 +341,7 @@ async def _upsert_resource(
         last_seen_at=now,
     )
     session.add(resource)
-    await session.flush()
+    # 同 `_upsert_media`：不在这里单独 flush，攒到调用方一次性 flush。
     if cache is not None:
         cache.resource_by_key[key] = resource
     return resource, True
@@ -381,20 +391,16 @@ async def _link_media_resource(
     return True
 
 
-async def _upsert_tags(
-    session: AsyncSession, media: Media, item: ExtractedItem, cache: BatchCache | None = None
-) -> int:
-    """建立作品 ↔ 标签关联。返回新建的关联数。
+async def _resolve_tags(
+    session: AsyncSession, item: ExtractedItem, cache: BatchCache | None = None
+) -> list[Tag]:
+    """按 item 的标签解析/新建 `Tag` 行，不 flush——新建的行留给调用方
+    （`_persist`）跟同一条文档的 media/resource 合并成一次 flush。
 
-    一条 item 常常带好几个标签（类型、画质、年份……）。新建的标签先各自
-    `add` 但不逐个 `flush`，攒够这条 item 用到的新标签后一次性 `flush`——
-    SQLAlchemy 会把同批待插入的 `Tag` 行合并成一条多行 INSERT。关联表的
-    新增行同理攒成一条多行 INSERT，而不是每个标签各发一次 `execute`。
-    N 个新标签因此从 2N 次往返（各自 flush + 各自关联 insert）降到 2 次。
+    一条 item 常常带好几个标签（类型、画质、年份……），逐个各自 flush
+    会让往返次数跟标签数成正比。
     """
     resolved: list[Tag] = []
-    pending_new_tags: list[Tag] = []
-
     for kind, name in item.tags:
         key = tag_norm_key(name)
         if not key:
@@ -409,15 +415,26 @@ async def _upsert_tags(
             session.add(tag)
             if cache is not None:
                 cache.tag_by_key[tag_key] = tag
-            pending_new_tags.append(tag)
         resolved.append(tag)
+    return resolved
 
-    if pending_new_tags:
-        await session.flush()
 
+async def _link_tags(
+    session: AsyncSession,
+    media: Media,
+    tags: list[Tag],
+    cache: BatchCache | None = None,
+    pending: list[dict] | None = None,
+) -> int:
+    """建立作品 ↔ 标签关联。返回新建的关联数。
+
+    调用时 `tags` 里的行必须已经 flush 过、拿到了真实 id（见 `_resolve_tags`）。
+    新增的关联行同 `_link_media_resource`——传了 `pending` 就攒进去，由调用方
+    一次性批量 INSERT，而不是每个标签各发一次往返。
+    """
     linked = 0
     pair_rows: list[dict] = []
-    for tag in resolved:
+    for tag in tags:
         pair = (media.id, tag.id)
         if cache is not None:
             exists = pair in cache.media_tag_pairs
@@ -437,10 +454,86 @@ async def _upsert_tags(
             cache.media_tag_pairs.add(pair)
         linked += 1
 
-    if pair_rows:
+    if pending is not None:
+        pending.extend(pair_rows)
+    elif pair_rows:
         await session.execute(media_tag.insert(), pair_rows)
 
     return linked
+
+
+@dataclass(slots=True)
+class _PersistState:
+    """`_persist_phase1` 产出的中间态，供 `_persist_phase2` 建关联关系。"""
+
+    media_by_item: list[tuple[Media, list[Tag]]]
+    resource_by_link: list[tuple[Media, Resource]]
+
+
+async def _persist_phase1(
+    session: AsyncSession,
+    doc: RawDocument,
+    outcome: ExtractionOutcome,
+    report: ParseReport,
+    cache: BatchCache | None = None,
+) -> _PersistState:
+    """阶段一：只 `session.add()` 新建的 media/resource/tag，不 flush。
+
+    调用方（`_persist` 单文档场景、`persist_extracted` 批量场景）决定什么
+    时候统一 flush——批量场景把好几条文档的阶段一攒在一起、只 flush 一次，
+    才能把「一条文档一次往返」摊薄成「一批文档一次往返」。
+    """
+    media_by_item: list[tuple[Media, list[Tag]]] = []
+    resource_by_link: list[tuple[Media, Resource]] = []
+
+    for item in outcome.items:
+        media, created = await _upsert_media(session, item, cache)
+        report.media_created += int(created)
+        report.media_reused += int(not created)
+        tags = await _resolve_tags(session, item, cache)
+        media_by_item.append((media, tags))
+        for link in item.links:
+            resource, is_new = await _upsert_resource(
+                session, link, doc=doc, item=item, cache=cache
+            )
+            report.resources_created += int(is_new)
+            report.resources_updated += int(not is_new)
+            resource_by_link.append((media, resource))
+
+    # 没归属到作品的链接照样入库（无任何关联），进人工/二次归属队列，绝不丢弃
+    for link in outcome.unattributed_links:
+        _, is_new = await _upsert_resource(session, link, doc=doc, item=None, cache=cache)
+        report.resources_created += int(is_new)
+        report.resources_updated += int(not is_new)
+    report.unattributed_links = len(outcome.unattributed_links)
+
+    return _PersistState(media_by_item=media_by_item, resource_by_link=resource_by_link)
+
+
+async def _persist_phase2(
+    session: AsyncSession,
+    state: _PersistState,
+    report: ParseReport,
+    cache: BatchCache | None,
+    pending_links: list[dict],
+    pending_tag_links: list[dict],
+) -> set[int]:
+    """阶段二：用阶段一 flush 后拿到的 id 建关联关系，攒进调用方共享的批量列表。
+
+    调用方负责在处理完一批文档后把 `pending_links`/`pending_tag_links` 各批量
+    INSERT 一次——攒的范围越大（单文档 vs 一整个 SAVEPOINT 里的好几条文档），
+    往返就摊得越薄。
+    """
+    touched: set[int] = set()
+    for media, tags in state.media_by_item:
+        report.tags_linked += await _link_tags(session, media, tags, cache, pending_tag_links)
+        touched.add(media.id)
+    for media, resource in state.resource_by_link:
+        # 一个链接可以关联多部作品（合集），关联表的唯一约束保证不重复
+        report.links_created += int(
+            await _link_media_resource(session, media, resource, cache, pending_links)
+        )
+    return touched
 
 
 async def _persist(
@@ -450,38 +543,26 @@ async def _persist(
     report: ParseReport,
     cache: BatchCache | None = None,
 ) -> set[int]:
-    touched: set[int] = set()
-    # 一条文档可能有多个链接（合集），新建的 media_resource 关联行攒在这里，
-    # 处理完整条文档后一次性批量 INSERT，而不是每条链接各发一次往返。
-    pending_links: list[dict] = []
-    for item in outcome.items:
-        media, created = await _upsert_media(session, item, cache)
-        report.media_created += int(created)
-        report.media_reused += int(not created)
-        report.tags_linked += await _upsert_tags(session, media, item, cache)
-        touched.add(media.id)
-        for link in item.links:
-            resource, is_new = await _upsert_resource(
-                session, link, doc=doc, item=item, cache=cache
-            )
-            report.resources_created += int(is_new)
-            report.resources_updated += int(not is_new)
-            # 一个链接可以关联多部作品（合集），关联表的唯一约束保证不重复
-            report.links_created += int(
-                await _link_media_resource(session, media, resource, cache, pending_links)
-            )
+    """单文档场景的两阶段落库封装，往返次数摊平成固定几次。
 
-    # 没归属到作品的链接照样入库（无任何关联），进人工/二次归属队列，绝不丢弃
-    for link in outcome.unattributed_links:
-        _, is_new = await _upsert_resource(session, link, doc=doc, item=None, cache=cache)
-        report.resources_created += int(is_new)
-        report.resources_updated += int(not is_new)
-    report.unattributed_links = len(outcome.unattributed_links)
+    一条文档有 N 个链接、M 个标签，就不该有 N/M 次数据库往返，会让合集帖
+    （一贴好几个网盘链接、好几个标签）的落库时间跟链接/标签数成正比，在
+    往返延迟 ~100ms 的远程库上非常致命。`persist_extracted` 的批量场景不走
+    这个封装，而是把好几条文档的阶段一/阶段二分别攒在一起，摊得更薄——
+    见该函数内部对 `_persist_phase1`/`_persist_phase2` 的直接调用。
+    """
+    state = await _persist_phase1(session, doc, outcome, report, cache)
+    await session.flush()
+
+    pending_links: list[dict] = []
+    pending_tag_links: list[dict] = []
+    touched = await _persist_phase2(session, state, report, cache, pending_links, pending_tag_links)
 
     if pending_links:
         await session.execute(media_resource.insert(), pending_links)
+    if pending_tag_links:
+        await session.execute(media_tag.insert(), pending_tag_links)
 
-    await session.flush()
     return touched
 
 
@@ -533,7 +614,7 @@ async def parse_document(
                         stats=outcome.stats,
                     )
                 )
-                await session.flush()
+                # 不在这里单独 flush——留给 `_persist` 阶段一那次 flush 一并落库。
 
             report.is_catalog = outcome.is_catalog
             touched = await _persist(session, doc, outcome, report)
@@ -597,8 +678,11 @@ async def persist_extracted(
             "这条文档在抽取阶段就失败了、根本没有 outcome"——这类文档直接按
             现有的失败退避逻辑推进状态机，不进入落库流程。
 
-    单条文档的失败隔离不变：每条仍在自己的 SAVEPOINT 里，一条撞唯一约束或
-    落库异常只回滚它自己，不牵连同批其它文档。
+    失败隔离按 `SAVEPOINT_BATCH_SIZE` 条一组：同组文档共享一个 SAVEPOINT、
+    一次 flush，把往返次数摊薄成 O(文档数 / SAVEPOINT_BATCH_SIZE)。代价是
+    隔离变粗——一条文档撞唯一约束（`IntegrityError`）会连累同组其余文档一起
+    回滚重试（不计入失败次数）；其它异常则只把"引发异常那一条"计入失败次数
+    /退避，同组其余文档视为受牵连，同样回滚重试、不计入失败次数。
     """
     reports = {doc.id: ParseReport(document_id=doc.id, status=doc.parse_status) for doc in docs}
     now = utcnow()
@@ -606,6 +690,7 @@ async def persist_extracted(
     cache = await _preload_batch_cache(session, list(outcomes.values()))
     all_touched: set[int] = set()
 
+    persistable_docs: list[RawDocument] = []
     for doc in docs:
         report = reports[doc.id]
 
@@ -626,11 +711,43 @@ async def persist_extracted(
             logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)
             continue
 
-        outcome = outcomes[doc.id]
-        is_cached = doc.id in cached_doc_ids
-        try:
-            async with session.begin_nested():
-                if is_cached:
+        persistable_docs.append(doc)
+
+    for start in range(0, len(persistable_docs), SAVEPOINT_BATCH_SIZE):
+        chunk = persistable_docs[start : start + SAVEPOINT_BATCH_SIZE]
+        await _persist_chunk(
+            session, chunk, outcomes, cached_doc_ids, extractor, cache, reports, now, all_touched
+        )
+
+    if all_touched:
+        await refresh_media_counters(session, all_touched)
+
+    return [reports[doc.id] for doc in docs]
+
+
+async def _persist_chunk(
+    session: AsyncSession,
+    chunk: list[RawDocument],
+    outcomes: dict[int, ExtractionOutcome],
+    cached_doc_ids: set[int],
+    extractor: Extractor,
+    cache: BatchCache | None,
+    reports: dict[int, ParseReport],
+    now: Any,
+    all_touched: set[int],
+) -> None:
+    """把一组文档打包进一个共享 SAVEPOINT：阶段一全组 add 完再统一 flush 一次，
+    阶段二全组的关联行攒成一批 INSERT，往返次数固定不随组内文档数增长。
+    """
+    failed_doc_id: int | None = None
+    try:
+        async with session.begin_nested():
+            states: list[tuple[RawDocument, _PersistState]] = []
+            for doc in chunk:
+                failed_doc_id = doc.id
+                report = reports[doc.id]
+                outcome = outcomes[doc.id]
+                if doc.id in cached_doc_ids:
                     report.from_cache = True
                 else:
                     session.add(
@@ -645,12 +762,32 @@ async def persist_extracted(
                             stats=outcome.stats,
                         )
                     )
-                    await session.flush()
-
+                    # 不在这里单独 flush——留给下面全组共享的那一次 flush。
                 report.is_catalog = outcome.is_catalog
-                touched = await _persist(session, doc, outcome, report, cache)
+                state = await _persist_phase1(session, doc, outcome, report, cache)
+                states.append((doc, state))
+
+            # 阶段一到此结束：一次 flush 把这一组文档新建的
+            # Extraction/media/resource/tag 全部落库，才能拿到它们的 id。
+            await session.flush()
+
+            pending_links: list[dict] = []
+            pending_tag_links: list[dict] = []
+            for doc, state in states:
+                failed_doc_id = doc.id
+                report = reports[doc.id]
+                touched = await _persist_phase2(
+                    session, state, report, cache, pending_links, pending_tag_links
+                )
                 all_touched.update(touched)
 
+            if pending_links:
+                await session.execute(media_resource.insert(), pending_links)
+            if pending_tag_links:
+                await session.execute(media_tag.insert(), pending_tag_links)
+
+        for doc in chunk:
+            report = reports[doc.id]
             doc.parse_status = ParseStatus.SKIPPED if report.is_catalog else ParseStatus.DONE
             doc.parse_error = None
             doc.lease_until = None
@@ -658,31 +795,37 @@ async def persist_extracted(
             doc.last_parsed_at = now
             report.status = doc.parse_status
 
-        except IntegrityError:
-            # 并发撞车不算"处理过"，last_parsed_at 不动，留到下次自然重试。
+    except IntegrityError:
+        # 并发撞车不算"处理过"，同组全部回滚，留到下次自然重试。
+        for doc in chunk:
+            report = reports[doc.id]
             report.status = doc.parse_status
-            report.error = "并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
-            logger.info("解析撞车 doc=%s: 并发写入冲突，留待下次重试", doc.id)
+            report.error = "同批并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
+        logger.info(
+            "解析撞车 docs=%s: 同批并发写入冲突，留待下次重试", [d.id for d in chunk]
+        )
 
-        except Exception as exc:
-            doc.parse_attempts += 1
-            doc.parse_error = f"{type(exc).__name__}: {exc}"
-            doc.lease_until = None
-            doc.last_parsed_at = now
-            if doc.parse_attempts >= MAX_PARSE_ATTEMPTS:
-                doc.parse_status = ParseStatus.FAILED
-                doc.next_parse_at = None
+    except Exception as exc:
+        for doc in chunk:
+            report = reports[doc.id]
+            if doc.id == failed_doc_id:
+                doc.parse_attempts += 1
+                doc.parse_error = f"{type(exc).__name__}: {exc}"
+                doc.lease_until = None
+                doc.last_parsed_at = now
+                if doc.parse_attempts >= MAX_PARSE_ATTEMPTS:
+                    doc.parse_status = ParseStatus.FAILED
+                    doc.next_parse_at = None
+                else:
+                    doc.parse_status = ParseStatus.PENDING
+                    doc.next_parse_at = now + backoff(doc.parse_attempts)
+                report.status = doc.parse_status
+                report.error = doc.parse_error
+                logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)
             else:
-                doc.parse_status = ParseStatus.PENDING
-                doc.next_parse_at = now + backoff(doc.parse_attempts)
-            report.status = doc.parse_status
-            report.error = doc.parse_error
-            logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)
-
-    if all_touched:
-        await refresh_media_counters(session, all_touched)
-
-    return [reports[doc.id] for doc in docs]
+                report.status = doc.parse_status
+                report.error = "同批其它文档处理异常，已回滚，留待下次重试（不计入失败次数）"
+                logger.info("解析连带回滚 doc=%s: 同批其它文档异常，留待下次重试", doc.id)
 
 
 async def parse_batch(

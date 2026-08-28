@@ -7,6 +7,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import queue
+import time
 from contextlib import asynccontextmanager
 
 import pytest
@@ -18,7 +21,11 @@ from funflix.base.enums import CheckStatus, Provider
 from funflix.models import Base, Resource, utcnow
 from funflix.services.verify import concurrent_runner as cr
 from funflix.services.verify.base import CheckOutcome, LinkRef
-from funflix.services.verify.concurrent_runner import _pipeline_finished
+from funflix.services.verify.concurrent_runner import (
+    _pipeline_counts,
+    _pipeline_pending,
+    _VerifyConsumer,
+)
 
 
 class FakeProbe:
@@ -207,16 +214,94 @@ class TestRunVerifyPipeline:
         assert reports[0].resource_id == 2
 
 
-class TestPipelineFinished:
-    def test_not_finished_while_producer_alive_even_if_counts_match(self) -> None:
-        assert _pipeline_finished(producer_alive=True, total=5, done=5) is False
+class TestPipelinePending:
+    def test_pending_sums_both_queue_backlogs(self) -> None:
+        """理由同 `tests/test_concurrent_runner.py::TestPipelinePending`。"""
 
-    def test_not_finished_while_in_flight_items_havent_been_counted_as_done(self) -> None:
-        """理由同 `tests/test_concurrent_runner.py::TestPipelineFinished`。"""
-        assert _pipeline_finished(producer_alive=False, total=99, done=83) is False
+        class _FakeProducer:
+            def stats(self) -> dict[str, int]:
+                return {"output_qsize": 3}
 
-    def test_finished_once_done_catches_up_to_total(self) -> None:
-        assert _pipeline_finished(producer_alive=False, total=99, done=99) is True
+        class _FakeConsumer:
+            def stats(self) -> dict[str, int]:
+                return {"input_qsize": 2}
+
+        class _FakePipeline:
+            producer = _FakeProducer()
+            consumer = _FakeConsumer()
+
+        assert _pipeline_pending(_FakePipeline()) == 5  # type: ignore[arg-type]
+
+    def test_pending_zero_once_both_queues_drain(self) -> None:
+        class _FakeProducer:
+            def stats(self) -> dict[str, int]:
+                return {"output_qsize": 0}
+
+        class _FakeConsumer:
+            def stats(self) -> dict[str, int]:
+                return {"input_qsize": 0}
+
+        class _FakePipeline:
+            producer = _FakeProducer()
+            consumer = _FakeConsumer()
+
+        assert _pipeline_pending(_FakePipeline()) == 0  # type: ignore[arg-type]
+
+
+class TestPipelineCounts:
+    def test_done_tracks_consumer_committed_not_pool_processed(self) -> None:
+        """理由同 `tests/test_concurrent_runner.py::TestPipelineCounts`。"""
+
+        class _FakeProducer:
+            def stats(self) -> dict[str, int]:
+                return {"produced": 150}
+
+        class _FakePool:
+            def stats(self) -> dict[str, int]:
+                return {"processed": 140, "failed": 3}
+
+        class _FakeConsumer:
+            def stats(self) -> dict[str, int]:
+                return {"consumed": 40, "failed": 0, "committed": 25}
+
+        class _FakePipeline:
+            producer = _FakeProducer()
+            pool = _FakePool()
+            consumer = _FakeConsumer()
+
+        total, done = _pipeline_counts(_FakePipeline())  # type: ignore[arg-type]
+
+        assert total == 150
+        assert done == 25
+
+
+class TestVerifyConsumerFlushInterval:
+    def test_flushes_on_time_even_when_under_write_batch(self, monkeypatch) -> None:
+        """理由同 `tests/test_concurrent_runner.py::TestParseConsumerFlushInterval`。"""
+        consumer = _VerifyConsumer(
+            queue.Queue(),
+            settings=Settings(database_url="sqlite+aiosqlite:///:memory:"),
+            write_batch=1000,
+            flush_interval=0.01,
+        )
+        consumer._aio_loop = asyncio.new_event_loop()
+        consumer._buffer = []
+        consumer._last_flush_at = time.monotonic()
+
+        flushed: list[list[dict]] = []
+
+        async def _fake_flush() -> None:
+            flushed.append(list(consumer._buffer))
+            consumer._buffer = []
+
+        monkeypatch.setattr(consumer, "_flush", _fake_flush)
+
+        consumer.consume({"resource_id": 1})
+        assert not flushed, "刚开始不该立刻触发落库"
+
+        time.sleep(0.02)
+        consumer.consume({"resource_id": 2})
+        assert flushed == [[{"resource_id": 1}, {"resource_id": 2}]]
 
 
 class TestCountDue:

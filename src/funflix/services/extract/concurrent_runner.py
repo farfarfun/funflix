@@ -22,10 +22,24 @@ funworker 是纯线程 + `queue.Queue` 模型，完全不感知 asyncio，而 fu
 `doc.parse_attempts`/`next_parse_at`。消费者复用 `persist_extracted` 的退避
 逻辑统一处理"处理单元报告的失败"和"落库时自己抛出的失败"两种来源。
 
-进度用 `on_progress(total_enqueued, total_done)` 按生产者/消费者的累计计数
-轮询喂给调用方（做法照抄 `services/collect/concurrent_runner.py`）：分子是
-"处理过的总数"，分母是"入队列的总数"——入队快照会随生产者继续翻页动态
-增长，不会像"启动前查一次待处理数就固定住"那样跟实际进度对不上。
+进度用 `on_progress(total_enqueued, total_committed)` 轮询喂给调用方：分母是
+"入队列的总数"（`producer.stats()["produced"]`，随生产者翻页动态增长），
+分子是"消费者真正提交到数据库的文档数"（见下面 `_ParseConsumer._committed`）。
+
+分子特意不用处理单元线程池的 `processed` 计数，也不用消费者基类自带的
+`consumed` 计数——两者都只反映"内存里处理完了"，不反映"落库成功了"。当
+落库（消费者单线程、每条约等于一次 SAVEPOINT+若干 INSERT/UPDATE 往返）比
+抽取慢得多时，用这两个计数会让进度条冲到 100% 后卡住一大截——用户看到的
+是"瞬间跑完"，但数据库其实还在慢慢追。进度条要如实反映"写进去了多少"，
+不是"内存里处理到哪了"，宁可看起来爬得慢，也不能显示假的"已完成"。
+
+但"提交数"不能同时兼任轮询循环的收尾信号：消费者攒够 `write_batch` 条或等到
+`flush_interval` 才落库一次，样本量小、或落库比抽取慢时，提交数可能在生产者
+已经退出、两条队列也都空了之后依然追不上入队总数——循环会一直等一个永远
+不会自然发生的"提交数追上总数"，`pipeline.stop()`（连带它触发的收尾 flush）
+就永远不会被调用，直接卡死。所以收尾判断改用 `_pipeline_pending`：只看两条
+队列的 qsize 是否都归零，跟提交数、跟处理单元的 `processed` 都无关，保证一定
+能收敛，再把"是否已经彻底跑空"和"进度条显示到哪了"分成两件事。
 """
 
 from __future__ import annotations
@@ -220,7 +234,12 @@ class _ParseProcessor(BaseProcessor):
 
 
 class _ParseConsumer(BaseConsumer):
-    """攒够 `write_batch` 条（或流水线收尾时）批量落库一次。"""
+    """攒够 `write_batch` 条，或距上次落库过了 `flush_interval` 秒（或流水线收尾时），批量落库一次。
+
+    单纯按条数攒批，在处理单元跑得比落库快时会让最新一批文档迟迟提交不了——
+    条数上限没到之前，缓冲区只会越攒越大，用户完全看不出流水线还在正常前进。
+    加一条按时间的下限，保证再慢也最多等 `flush_interval` 秒就能看到一批落库。
+    """
 
     def __init__(
         self,
@@ -228,12 +247,17 @@ class _ParseConsumer(BaseConsumer):
         *,
         settings: Settings,
         write_batch: int,
+        flush_interval: float = 10.0,
         name: str | None = None,
     ) -> None:
         super().__init__(input_queue, name=name)
         self.settings = settings
         self.write_batch = write_batch
+        self.flush_interval = flush_interval
         self.reports: list[ParseReport] = []
+        #: 真正提交到数据库的文档数——只在 `_flush` 里 `session.commit()`
+        #: 成功之后才累加，供 `_pipeline_counts` 当作进度条的分子。
+        self._committed = 0
 
     def on_start(self) -> None:
         self._aio_loop = asyncio.new_event_loop()
@@ -243,6 +267,7 @@ class _ParseConsumer(BaseConsumer):
         )
         self._extractor_cache: dict[str, Extractor] = {}
         self._buffer: list[dict[str, Any]] = []
+        self._last_flush_at = time.monotonic()
 
     def on_stop(self) -> None:
         if self._buffer:
@@ -257,8 +282,11 @@ class _ParseConsumer(BaseConsumer):
 
     def consume(self, item: dict[str, Any]) -> None:
         self._buffer.append(item)
-        if len(self._buffer) >= self.write_batch:
+        due_by_count = len(self._buffer) >= self.write_batch
+        due_by_time = (time.monotonic() - self._last_flush_at) >= self.flush_interval
+        if due_by_count or due_by_time:
             self._aio_loop.run_until_complete(self._flush())
+            self._last_flush_at = time.monotonic()
 
     async def _flush(self) -> None:
         items, self._buffer = self._buffer, []
@@ -309,30 +337,40 @@ class _ParseConsumer(BaseConsumer):
                 await session.rollback()
                 raise
 
+        self._committed += len(items)
         self.reports.extend(reports)
+
+    def stats(self) -> dict[str, Any]:
+        return {**super().stats(), "committed": self._committed}
 
 
 def _pipeline_counts(pipeline: Pipeline) -> tuple[int, int]:
-    """(总入队数, 总处理数) —— 处理数按消费者读完队列、处理完（成功或失败）算，
+    """(总入队数, 总提交数) —— 提交数按消费者真正 `session.commit()` 成功的文档数算。
 
-    只算成功会在有失败时永远追不上入队数。
+    不用处理单元线程池的 `processed`/消费者基类的 `consumed` 计数：两者都只
+    反映"内存里处理完了"，不反映"落库成功了"，详见模块 docstring。
     """
     total = pipeline.producer.stats()["produced"]
-    consumer = pipeline.consumer
-    assert consumer is not None
-    consumer_stats = consumer.stats()
-    done = consumer_stats["consumed"] + consumer_stats["failed"]
+    done = pipeline.consumer.stats()["committed"]
     return total, done
 
 
-def _pipeline_finished(*, producer_alive: bool, total: int, done: int) -> bool:
-    """生产者已经不在跑，且累计处理数追上了累计入队数，才算真的跑完。
+def _pipeline_pending(pipeline: Pipeline) -> int:
+    """两条队列里当前还没被取走的积压条数，用来判断"是否已经彻底跑空"。
 
-    不能用"两条队列的 qsize 都是 0"判断——处理单元线程可能正把条目从输入
-    队列取走、还没处理完就没写回输出队列，那一刻两条队列恰好都是空的，但
-    实际还有条目在处理单元线程里"飞行中"，谁的 stats() 快照都看不见。
+    不能拿"提交数追上入队数"（`_pipeline_counts` 的返回值）当收尾信号：消费者
+    是攒够 `write_batch` 条或等到 `flush_interval` 才落库一次，样本量小、或
+    落库比抽取慢时，提交数可能在两条队列都空、生产者也退出之后依然追不上
+    入队数——循环会永远等不到"完成"，`pipeline.stop()` 就永远不会被调用。
+    这里只看队列 qsize：队列空了、生产者也不在跑了，就说明再没有新数据会
+    进来，可以放心收尾——`pipeline.stop()` 里 `stage.stop(drain=True)` 会等
+    飞行中的条目跑完，消费者 `on_stop()` 会把内部缓冲区里的残留条目做最后
+    一次落库，理由同 `services/collect/concurrent_runner.py::_pipeline_pending`。
     """
-    return not producer_alive and done >= total
+    pending = pipeline.producer.stats()["output_qsize"]
+    if pipeline.consumer is not None:
+        pending += pipeline.consumer.stats()["input_qsize"]
+    return pending
 
 
 def run_parse_pipeline(
@@ -340,7 +378,8 @@ def run_parse_pipeline(
     extractor_name: str | None = None,
     limit: int | None = None,
     batch_size: int = 500,
-    write_batch: int = 100,
+    write_batch: int = 20,
+    flush_interval: float = 10.0,
     concurrency: int = 4,
     force: bool = False,
     settings: Settings | None = None,
@@ -350,7 +389,8 @@ def run_parse_pipeline(
 
     同步阻塞函数——funworker 本身是阻塞式设计，不需要外层 `asyncio.run` 包装。
     生产/消费两端各自持有专属的 `AsyncEngine` + 事件循环（见模块 docstring），
-    处理单元线程池并发数由 `concurrency` 控制。
+    处理单元线程池并发数由 `concurrency` 控制。消费者最多攒 `write_batch` 条
+    或每 `flush_interval` 秒批量落库一次，取先满足的那个条件。
 
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者
     已经翻完页（规划通常比 `extract()` 快得多），只要队列里还有积压就继续
@@ -376,6 +416,7 @@ def run_parse_pipeline(
         consumer_kwargs={
             "settings": settings,
             "write_batch": write_batch,
+            "flush_interval": flush_interval,
         },
     )
     pipeline.start()
@@ -385,12 +426,9 @@ def run_parse_pipeline(
                 pipeline.producer.join(timeout=0.5)
             else:
                 time.sleep(0.5)
-            total, done = _pipeline_counts(pipeline)
             if on_progress is not None:
-                on_progress(total, done)
-            if _pipeline_finished(
-                producer_alive=pipeline.producer.is_alive(), total=total, done=done
-            ):
+                on_progress(*_pipeline_counts(pipeline))
+            if not pipeline.producer.is_alive() and _pipeline_pending(pipeline) == 0:
                 break
     finally:
         pipeline.stop()

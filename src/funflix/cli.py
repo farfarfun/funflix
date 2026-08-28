@@ -853,7 +853,7 @@ def parse(
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
     write_batch: Annotated[
         int, typer.Option(help="每批内部按此粒度批量预读去重键、处理完再提交一次")
-    ] = 100,
+    ] = 20,
     concurrency: Annotated[
         int,
         typer.Option(
@@ -973,7 +973,7 @@ def verify(
         int | None, typer.Option(help="最多校验多少条，默认不设上限、处理到清空为止")
     ] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少条")] = 500,
-    write_batch: Annotated[int, typer.Option(help="消费者每攒够几条批量落库、提交一次")] = 100,
+    write_batch: Annotated[int, typer.Option(help="消费者每攒够几条批量落库、提交一次")] = 20,
     concurrency: Annotated[
         int,
         typer.Option(help="处理单元并发线程数（并发探测，不碰数据库），默认取 max(8, CPU 核数)"),

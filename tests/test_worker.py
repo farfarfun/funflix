@@ -19,7 +19,12 @@ from funflix.base.backoff import BASE_BACKOFF, MAX_BACKOFF, backoff
 from funflix.base.config import Settings
 from funflix.base.enums import CheckStatus, ParseStatus, Provider, Quality, SourceType
 from funflix.models import Base, LinkCheck, Media, RawDocument, Resource, Source, utcnow
-from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS, parse_batch, parse_document
+from funflix.services.extract.runner import (
+    MAX_PARSE_ATTEMPTS,
+    SAVEPOINT_BATCH_SIZE,
+    parse_batch,
+    parse_document,
+)
 from funflix.services.verify.base import CheckOutcome
 from funflix.worker.claim import claim_documents, claim_resources, claim_sources
 from funflix.worker.scheduler import Worker, progress_snapshot, stale_summary
@@ -462,10 +467,34 @@ class TestRunnerParseBatch:
         assert len(media_rows) == 6, "批处理与逐条处理应产出同样数量的作品"
 
     @pytest.mark.asyncio
-    async def test_integrity_error_isolates_a_single_doc_in_the_batch(
+    async def test_batch_larger_than_savepoint_chunk_still_persists_every_doc(
+        self, session
+    ) -> None:
+        """批量比 `SAVEPOINT_BATCH_SIZE` 还大时要跨好几个 SAVEPOINT 分片处理，
+        不能漏掉最后一个不满一整片的尾巴。"""
+        from funflix.services.extract.rule import RuleExtractor
+
+        n = SAVEPOINT_BATCH_SIZE * 2 + 3
+        docs = [make_doc(i) for i in range(1, n + 1)]
+        session.add_all(docs)
+        await session.commit()
+
+        reports = await parse_batch(session, docs, RuleExtractor())
+        await session.commit()
+
+        assert len(reports) == n
+        assert all(r.ok for r in reports)
+        assert {d.parse_status for d in docs} == {ParseStatus.DONE}
+        resource_rows = list(await session.scalars(select(Resource)))
+        assert len(resource_rows) == n
+
+    @pytest.mark.asyncio
+    async def test_integrity_error_rolls_back_the_whole_shared_savepoint_batch(
         self, session, monkeypatch
     ) -> None:
-        """批内一条撞唯一约束只回滚它自己，同批其它文档照常成功并提交。"""
+        """`persist_extracted` 把多条文档打包共享一个 SAVEPOINT（见
+        `SAVEPOINT_BATCH_SIZE`）以摊薄往返次数，代价是失败隔离变粗：一条撞
+        唯一约束会连累同组其它文档一起回滚重试，都不计入失败次数。"""
         from sqlalchemy.exc import IntegrityError
 
         from funflix.services.extract import runner as runner_module
@@ -476,14 +505,14 @@ class TestRunnerParseBatch:
         session.add_all([doc_a, doc_b])
         await session.commit()
 
-        real_persist = runner_module._persist
+        real_phase1 = runner_module._persist_phase1
 
         async def _boom_for_first_doc(session, doc, outcome, report, cache=None):
             if doc.id == doc_a.id:
                 raise IntegrityError("INSERT", {}, Exception("uq_media_identity"))
-            return await real_persist(session, doc, outcome, report, cache)
+            return await real_phase1(session, doc, outcome, report, cache)
 
-        monkeypatch.setattr(runner_module, "_persist", _boom_for_first_doc)
+        monkeypatch.setattr(runner_module, "_persist_phase1", _boom_for_first_doc)
 
         reports = await parse_batch(session, [doc_a, doc_b], RuleExtractor())
         await session.commit()
@@ -492,8 +521,51 @@ class TestRunnerParseBatch:
         assert report_a.ok is False
         assert "并发写入冲突" in (report_a.error or "")
         assert doc_a.parse_attempts == 0
-        assert report_b.ok is True
-        assert doc_b.parse_status == ParseStatus.DONE
+        assert doc_a.parse_status == ParseStatus.PENDING
+        assert report_b.ok is False
+        assert "同批" in (report_b.error or "")
+        assert doc_b.parse_attempts == 0
+        assert doc_b.parse_status == ParseStatus.PENDING
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_penalizes_only_the_doc_that_raised(
+        self, session, monkeypatch
+    ) -> None:
+        """同一共享 SAVEPOINT 里的非 `IntegrityError` 异常：只有引发异常那条
+        文档计入失败次数/退避，同组其它文档视为受牵连，回滚重试但不罚。"""
+        from funflix.services.extract import runner as runner_module
+        from funflix.services.extract.rule import RuleExtractor
+
+        doc_a = make_doc(1)
+        doc_b = make_doc(2)
+        doc_c = make_doc(3)
+        session.add_all([doc_a, doc_b, doc_c])
+        await session.commit()
+
+        real_phase1 = runner_module._persist_phase1
+
+        async def _boom_for_second_doc(session, doc, outcome, report, cache=None):
+            if doc.id == doc_b.id:
+                raise RuntimeError("boom")
+            return await real_phase1(session, doc, outcome, report, cache)
+
+        monkeypatch.setattr(runner_module, "_persist_phase1", _boom_for_second_doc)
+
+        reports = await parse_batch(session, [doc_a, doc_b, doc_c], RuleExtractor())
+        await session.commit()
+
+        report_a, report_b, report_c = reports
+        assert report_a.ok is False and "同批" in (report_a.error or "")
+        assert doc_a.parse_attempts == 0
+        assert doc_a.parse_status == ParseStatus.PENDING
+
+        assert report_b.ok is False and "boom" in (report_b.error or "")
+        assert doc_b.parse_attempts == 1
+        assert doc_b.parse_status == ParseStatus.PENDING
+
+        assert report_c.ok is False and "同批" in (report_c.error or "")
+        assert doc_c.parse_attempts == 0
+        assert doc_c.parse_status == ParseStatus.PENDING
 
     @pytest.mark.asyncio
     async def test_refresh_media_counters_runs_once_for_the_whole_batch(
