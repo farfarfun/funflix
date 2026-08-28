@@ -801,9 +801,7 @@ async def _persist_chunk(
             report = reports[doc.id]
             report.status = doc.parse_status
             report.error = "同批并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
-        logger.info(
-            "解析撞车 docs=%s: 同批并发写入冲突，留待下次重试", [d.id for d in chunk]
-        )
+        logger.info("解析撞车 docs=%s: 同批并发写入冲突，留待下次重试", [d.id for d in chunk])
 
     except Exception as exc:
         for doc in chunk:
