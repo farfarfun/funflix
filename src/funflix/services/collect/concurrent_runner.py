@@ -325,12 +325,14 @@ class _CollectProducer(BaseProducer):
         settings: Settings,
         source_id: int | None,
         batch_size: int,
+        limit: int | None = None,
         name: str | None = None,
     ) -> None:
         super().__init__(output_queue, name=name)
         self.settings = settings
         self.source_id = source_id
         self.batch_size = batch_size
+        self.limit = limit
 
     def on_start(self) -> None:
         self._aio_loop = asyncio.new_event_loop()
@@ -349,7 +351,13 @@ class _CollectProducer(BaseProducer):
 
     def produce(self) -> Any:
         if not self._buffer and not self._exhausted:
-            self._aio_loop.run_until_complete(self._fetch_page())
+            if self.limit is not None and self._produced >= self.limit:
+                #: 已经规划够 `limit` 个任务了——这一次 collect 到此为止，不再扫
+                #: 描剩下的源。它们没被跳过，下次 collect 重新按 id 升序扫描时
+                #: 会从头再来（`_last_id` 只在本实例内存里，不跨进程持久化）。
+                self._exhausted = True
+            else:
+                self._aio_loop.run_until_complete(self._fetch_page())
         if not self._buffer:
             raise StopIteration
         return self._buffer.pop(0)
@@ -388,6 +396,10 @@ class _CollectProducer(BaseProducer):
 
             now = utcnow()
             for source in sources:
+                if self.limit is not None and self._produced + len(self._buffer) >= self.limit:
+                    #: 本轮已经攒够 limit——没扫到的源留给下次 collect，别再往
+                    #: buffer 里塞更多任务了。
+                    break
                 self._plan_source(source, now)
 
             await session.commit()
@@ -404,8 +416,14 @@ class _CollectProducer(BaseProducer):
             return
 
         if collector_cls is TelegramChannelCollector:
+            max_pages = _TELEGRAM_PAGES_PER_VISIT
+            if self.limit is not None:
+                #: 单个源的补历史一次最多能规划 1000 页，budget 快见底时得掐
+                #: 短它，不然游标会乐观提交到远超本轮实际入队的位置。
+                remaining = self.limit - self._produced - len(self._buffer)
+                max_pages = max(min(max_pages, remaining), 0)
             pages, new_cursor, done = plan_backfill_pages(
-                source.backfill_cursor_id, max_pages=_TELEGRAM_PAGES_PER_VISIT
+                source.backfill_cursor_id, max_pages=max_pages
             )
             if pages:
                 source.backfill_cursor_id = new_cursor
@@ -640,6 +658,12 @@ def _pipeline_pending(pipeline: Pipeline) -> int:
 #: 处理单元消化掉一些再继续规划下一批，形成背压。
 _QUEUE_MAXSIZE = 2000
 
+#: 一次 collect 最多累计规划这么多个任务就收工（见 `run_collect_pipeline`
+#: 的 `limit` 参数）——跟 `_QUEUE_MAXSIZE` 是两回事：那个限的是队列瞬时
+#: 积压，这个限的是整次运行的累计总量，避免进度条上的分母（累计规划数）
+#: 无限往上跑。
+_DEFAULT_LIMIT = 2000
+
 
 def run_collect_pipeline(
     *,
@@ -649,6 +673,7 @@ def run_collect_pipeline(
     flush_interval: float = 10.0,
     concurrency: int = 4,
     queue_maxsize: int = _QUEUE_MAXSIZE,
+    limit: int | None = _DEFAULT_LIMIT,
     settings: Settings | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> CollectPipelineResult:
@@ -666,7 +691,17 @@ def run_collect_pipeline(
     `queue_maxsize` 给生产者->处理单元 那条队列设容量上限（见
     `_QUEUE_MAXSIZE`），满了生产者就阻塞在写入上，防止规划任务的速度远超
     实际抓取/落库速度，既避免并发抓取过猛触发限流，也避免堆积过多"游标已经
-    乐观提交、任务却还没被消费"的翻页任务。
+    乐观提交、任务却还没被消费"的翻页任务。这只限制"同一时刻还没被消费的
+    积压"，不限制一次 collect 下来累计规划的总数——累计数完全可能远超
+    `queue_maxsize`，因为队列消费一批、生产者又补一批，进度条上的分母
+    （`_pipeline_counts` 里的 `total`）是 `producer.stats()["produced"]`，
+    这是个跨整次运行单调递增的累计计数，不是队列瞬时深度。
+
+    `limit` 才是管累计总数的开关：一次 collect 最多规划这么多个任务
+    （Telegram 单页翻页任务、其它源的整源任务都算）就收工，扫描到一半的源
+    留给下次 collect 继续（`_last_id` 只存在这次运行的内存里，不持久化，
+    不会丢）。默认 `_DEFAULT_LIMIT`，适合"跑一次别刷太猛，配合外部定时任务
+    分批把存量慢慢啃完"这种用法；传 `None` 关掉，一次性扫完所有到期的源。
 
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者
     已经跑完（规划本身通常比 HTTP 抓取快得多），只要队列里还有积压就继续
@@ -680,7 +715,12 @@ def run_collect_pipeline(
         _CollectConsumer,
         num_workers=max(1, concurrency),
         input_maxsize=queue_maxsize,
-        producer_kwargs={"settings": settings, "source_id": source_id, "batch_size": batch_size},
+        producer_kwargs={
+            "settings": settings,
+            "source_id": source_id,
+            "batch_size": batch_size,
+            "limit": limit,
+        },
         consumer_kwargs={
             "settings": settings,
             "write_batch": write_batch,

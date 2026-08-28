@@ -779,6 +779,13 @@ def collect(
     queue_maxsize: Annotated[
         int, typer.Option(help="待抓取任务队列的容量上限，塞满就阻塞生产者，避免抓太猛被限流")
     ] = 2000,
+    limit: Annotated[
+        int,
+        typer.Option(
+            help="这一次 collect 累计最多规划这么多个任务就收工（跟 --queue-maxsize"
+            " 限的瞬时积压不是一回事），扫不到的源留给下次 collect。0 表示不限，一次扫完"
+        ),
+    ] = 2000,
 ) -> None:
     """采集：把源里的新内容写成原始文本。
 
@@ -819,6 +826,7 @@ def collect(
             flush_interval=flush_interval,
             concurrency=concurrency,
             queue_maxsize=queue_maxsize,
+            limit=limit or None,
             on_progress=_on_progress,
         )
     finally:
