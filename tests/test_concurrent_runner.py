@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import queue
+import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -254,10 +254,11 @@ class TestPipelinePending:
 
 
 class TestPipelineCounts:
-    def test_done_tracks_consumer_committed_not_pool_processed(self) -> None:
-        """完成数要跟消费者真正提交到数据库的计数走，不能跟处理单元线程池的
-        `processed` 走——后者只反映"内存里处理完了"，写库比抽取慢时会让进度条
-        冲到 100% 后卡住一大截，看着像"瞬间跑完但数据库没写完"。"""
+    def test_done_tracks_consumer_consumed_not_pool_processed(self) -> None:
+        """完成数要跟消费者（`BaseBatchConsumer`）真正提交到数据库的计数走，不能
+        跟处理单元线程池的 `processed` 走——后者只反映"内存里处理完了"，写库比
+        抽取慢时会让进度条冲到 100% 后卡住一大截，看着像"瞬间跑完但数据库没写完"。
+        """
 
         class _FakeProducer:
             def stats(self) -> dict[str, int]:
@@ -270,7 +271,10 @@ class TestPipelineCounts:
 
         class _FakeConsumer:
             def stats(self) -> dict[str, int]:
-                return {"consumed": 40, "failed": 0, "committed": 25}
+                # BaseBatchConsumer 只在 consume_batch 跑完之后才按整批累加
+                # consumed，语义上就是"落库成功的条目数"，跟 pool 的 processed
+                # 不是一回事。
+                return {"consumed": 25, "failed": 0}
 
         class _FakePipeline:
             producer = _FakeProducer()
@@ -286,31 +290,37 @@ class TestPipelineCounts:
 class TestParseConsumerFlushInterval:
     def test_flushes_on_time_even_when_under_write_batch(self, monkeypatch) -> None:
         """缓冲区还没攒够 write_batch，但过了 flush_interval，也要落库——
-        不然处理单元比落库快时，最新一批文档会一直卡在消费者的缓冲区里出不去。"""
+        不然处理单元比落库快时，最新一批文档会一直卡在消费者的缓冲区里出不去。
+        `_ParseConsumer` 是 `funworker.BaseBatchConsumer` 的子类，攒批/计时
+        轮询逻辑都在基类的 `_loop()` 里，这里直接驱动真实的 `_loop()` 验证
+        `flush_interval`（映射成基类的 `batch_timeout`）确实靠轮询触发，不
+        依赖"下一条数据到达才检查"。"""
+        q: queue.Queue = queue.Queue()
         consumer = _ParseConsumer(
-            queue.Queue(),
+            q,
             settings=Settings(database_url="sqlite+aiosqlite:///:memory:"),
             write_batch=1000,
             flush_interval=0.01,
         )
-        consumer._aio_loop = asyncio.new_event_loop()
-        consumer._buffer = []
-        consumer._last_flush_at = time.monotonic()
+        consumer.get_timeout = 0.01
 
         flushed: list[list[dict]] = []
+        monkeypatch.setattr(consumer, "consume_batch", flushed.append)
 
-        async def _fake_flush() -> None:
-            flushed.append(list(consumer._buffer))
-            consumer._buffer = []
+        thread = threading.Thread(target=consumer._loop)
+        thread.start()
+        try:
+            q.put({"doc_id": 1})
+            time.sleep(0.05)
+            assert flushed == [[{"doc_id": 1}]], "过了 flush_interval 应该已经落库一次"
 
-        monkeypatch.setattr(consumer, "_flush", _fake_flush)
+            q.put({"doc_id": 2})
+            time.sleep(0.05)
+        finally:
+            consumer.request_stop()
+            thread.join(timeout=2)
 
-        consumer.consume({"doc_id": 1})
-        assert not flushed, "刚开始不该立刻触发落库"
-
-        time.sleep(0.02)
-        consumer.consume({"doc_id": 2})
-        assert flushed == [[{"doc_id": 1}, {"doc_id": 2}]]
+        assert flushed == [[{"doc_id": 1}], [{"doc_id": 2}]]
 
 
 class TestCountPending:

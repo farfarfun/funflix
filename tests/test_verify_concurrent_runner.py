@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import queue
+import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -249,7 +249,7 @@ class TestPipelinePending:
 
 
 class TestPipelineCounts:
-    def test_done_tracks_consumer_committed_not_pool_processed(self) -> None:
+    def test_done_tracks_consumer_consumed_not_pool_processed(self) -> None:
         """理由同 `tests/test_concurrent_runner.py::TestPipelineCounts`。"""
 
         class _FakeProducer:
@@ -262,7 +262,7 @@ class TestPipelineCounts:
 
         class _FakeConsumer:
             def stats(self) -> dict[str, int]:
-                return {"consumed": 40, "failed": 0, "committed": 25}
+                return {"consumed": 25, "failed": 0}
 
         class _FakePipeline:
             producer = _FakeProducer()
@@ -278,30 +278,32 @@ class TestPipelineCounts:
 class TestVerifyConsumerFlushInterval:
     def test_flushes_on_time_even_when_under_write_batch(self, monkeypatch) -> None:
         """理由同 `tests/test_concurrent_runner.py::TestParseConsumerFlushInterval`。"""
+        q: queue.Queue = queue.Queue()
         consumer = _VerifyConsumer(
-            queue.Queue(),
+            q,
             settings=Settings(database_url="sqlite+aiosqlite:///:memory:"),
             write_batch=1000,
             flush_interval=0.01,
         )
-        consumer._aio_loop = asyncio.new_event_loop()
-        consumer._buffer = []
-        consumer._last_flush_at = time.monotonic()
+        consumer.get_timeout = 0.01
 
         flushed: list[list[dict]] = []
+        monkeypatch.setattr(consumer, "consume_batch", flushed.append)
 
-        async def _fake_flush() -> None:
-            flushed.append(list(consumer._buffer))
-            consumer._buffer = []
+        thread = threading.Thread(target=consumer._loop)
+        thread.start()
+        try:
+            q.put({"resource_id": 1})
+            time.sleep(0.05)
+            assert flushed == [[{"resource_id": 1}]], "过了 flush_interval 应该已经落库一次"
 
-        monkeypatch.setattr(consumer, "_flush", _fake_flush)
+            q.put({"resource_id": 2})
+            time.sleep(0.05)
+        finally:
+            consumer.request_stop()
+            thread.join(timeout=2)
 
-        consumer.consume({"resource_id": 1})
-        assert not flushed, "刚开始不该立刻触发落库"
-
-        time.sleep(0.02)
-        consumer.consume({"resource_id": 2})
-        assert flushed == [[{"resource_id": 1}, {"resource_id": 2}]]
+        assert flushed == [[{"resource_id": 1}], [{"resource_id": 2}]]
 
 
 class TestCountDue:

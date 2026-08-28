@@ -32,11 +32,26 @@
 （命名 `self._aio_loop`，不能叫 `self._loop`——那是 `funworker.BaseWorker`
 保留的方法名）。处理单元线程池完全不碰数据库，只负责 HTTP 抓取 + 解析。
 
+`funworker.Pipeline` 的消费者永远只有一个线程，不受 `--concurrency` 影响；
+`_CollectConsumer` 跟 `_ParseConsumer`/`_VerifyConsumer` 一样继承
+`funworker.BaseBatchConsumer`，攒够 `write_batch` 条或每 `flush_interval`
+秒批量落库一次，而不是逐条开 session、逐条提交——8 个处理单元线程并发
+抓取带来的吞吐提升，如果消费者还是一条一提交（一条约 2~3 次远程往返，见
+`services/ingest.py` 的批量去重注释），会被这个单线程的落库速度重新拖回
+串行水平，加再多并发线程也无济于事。攒批/计时逻辑本身不用自己写：
+`BaseBatchConsumer` 内部用 `Queue.get(timeout=...)` 主动轮询，`flush_interval`
+超时是真正靠时间轮询触发的，不依赖"下一条数据到达才检查"（早期手搓版本
+的隐患）。
+
 进度不再按"处理了百分之几"算——一个源可能被拆成几十个并发页任务，
 "整体百分比"这个概念本身就不成立了。改用生产者/消费者的累计计数喂给
 `on_progress(total_enqueued, total_done)`：总数随生产者规划出更多任务动态
-增长，已处理数随消费者收尾（成功或失败）逐步逼近，交给调用方（CLI）驱动
-一个真正会跑动的 `tqdm` 进度条，而不是只有文字后缀的空转指示器。
+增长，已完成数取消费者真正提交成功的条目数。`BaseBatchConsumer` 的
+`consumed` 计数只在 `consume_batch` 跑完之后才按整批累加，语义上就是
+"落库成功的条目数"，不再需要额外维护一个 `_committed` 字段——这跟自带的
+`BaseConsumer.consumed`（逐条累加，只反映"进了消费者的缓冲区"）不是一回
+事，用错了会让进度条冲到 100% 后卡住一大截，交给调用方（CLI）驱动一个
+真正会跑动的 `tqdm` 进度条，而不是只有文字后缀的空转指示器。
 """
 
 from __future__ import annotations
@@ -50,7 +65,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
-from funworker import BaseConsumer, BaseProcessor, BaseProducer, Pipeline
+from funworker import BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -457,17 +472,31 @@ class _CollectProcessor(BaseProcessor):
         )
 
 
-class _CollectConsumer(BaseConsumer):
-    """把处理单元的产出批量落库；整源任务顺带把水位字段写回真正的 Source 行。"""
+class _CollectConsumer(BaseBatchConsumer):
+    """攒够 `write_batch` 条，或距上次落库过了 `flush_interval` 秒（或流水线收尾时），批量落库一次。
+
+    继承 `funworker.BaseBatchConsumer`，攒批/计时轮询逻辑交给基类，这里只
+    实现 `consume_batch`。整源任务顺带把水位字段写回真正的 Source 行。同一
+    批里多个 Telegram 翻页结果如果落在同一个源上，合并成一次
+    `_ingest_messages` 调用——Telegram 补历史一个源一次运行能拆出上千个翻页
+    任务，逐条查询/提交的往返耗时会远超实际抓取耗时（见模块 docstring、
+    `services/ingest.py` 的批量去重注释），攒批处理才能让 `--concurrency`
+    条抓取线程的并发收益真正体现在总耗时上，理由同
+    `extract/concurrent_runner.py::_ParseConsumer`。
+    """
 
     def __init__(
         self,
         input_queue: Any,
         *,
         settings: Settings,
+        write_batch: int = 100,
+        flush_interval: float = 10.0,
         name: str | None = None,
     ) -> None:
-        super().__init__(input_queue, name=name)
+        super().__init__(
+            input_queue, batch_size=write_batch, batch_timeout=flush_interval, name=name
+        )
         self.settings = settings
         self.reports: list[tuple[str, CollectReport]] = []
         self.page_totals = BackfillPageTotals()
@@ -483,38 +512,58 @@ class _CollectConsumer(BaseConsumer):
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
-    def consume(self, item: Any) -> None:
-        self._aio_loop.run_until_complete(self._consume(item))
+    def consume_batch(self, items: list[Any]) -> None:
+        self._aio_loop.run_until_complete(self._flush_batch(items))
 
-    async def _consume(self, item: Any) -> None:
-        if isinstance(item, _ErrorJob):
-            self.reports.append((item.identifier, item.report))
+    async def _flush_batch(self, items: list[Any]) -> None:
+        # ErrorJob 规划阶段就已经确定失败，不碰数据库，直接记报告。
+        for item in items:
+            if isinstance(item, _ErrorJob):
+                self.reports.append((item.identifier, item.report))
+
+        # 同一批里同源的翻页结果先在内存里合并，落库时一个源只查一次去重键、
+        # 只推进一次水位——而不是每页各查各的。
+        page_messages: dict[int, list[CollectedMessage]] = {}
+        page_counts: dict[int, int] = {}
+        opaque_items: list[_OpaqueResult] = []
+        for item in items:
+            if isinstance(item, _PageResult):
+                page_messages.setdefault(item.source_id, []).extend(item.messages)
+                page_counts[item.source_id] = page_counts.get(item.source_id, 0) + 1
+            elif isinstance(item, _OpaqueResult):
+                opaque_items.append(item)
+
+        if not page_messages and not opaque_items:
             return
 
+        source_ids = set(page_messages) | {item.source.id for item in opaque_items}
         async with self._sessionmaker() as session:
             try:
-                if isinstance(item, _PageResult):
-                    await self._consume_page(session, item)
-                elif isinstance(item, _OpaqueResult):
-                    await self._consume_opaque(session, item)
+                rows = list(await session.scalars(select(Source).where(Source.id.in_(source_ids))))
+                sources_by_id = {s.id: s for s in rows}
+
+                for source_id, messages in page_messages.items():
+                    source = sources_by_id.get(source_id)
+                    if source is None:  # 源在这期间被删了，落库无意义
+                        continue
+                    created, duplicated, skipped = await _ingest_messages(session, source, messages)
+                    source.total_backfilled += created
+                    self.page_totals.pages += page_counts[source_id]
+                    self.page_totals.created += created
+                    self.page_totals.duplicated += duplicated
+                    self.page_totals.skipped += skipped
+
+                for item in opaque_items:
+                    await self._consume_opaque(session, sources_by_id.get(item.source.id), item)
+
                 await session.commit()
             except Exception:
                 await session.rollback()
                 raise
 
-    async def _consume_page(self, session: AsyncSession, item: _PageResult) -> None:
-        source = await session.get(Source, item.source_id)
-        if source is None:  # 源在这期间被删了，落库无意义
-            return
-        created, duplicated, skipped = await _ingest_messages(session, source, item.messages)
-        source.total_backfilled += created
-        self.page_totals.pages += 1
-        self.page_totals.created += created
-        self.page_totals.duplicated += duplicated
-        self.page_totals.skipped += skipped
-
-    async def _consume_opaque(self, session: AsyncSession, item: _OpaqueResult) -> None:
-        source = await session.get(Source, item.source.id)
+    async def _consume_opaque(
+        self, session: AsyncSession, source: Source | None, item: _OpaqueResult
+    ) -> None:
         report = item.report
         if source is None:
             self.reports.append((item.source.identifier, report))
@@ -548,17 +597,19 @@ class _CollectConsumer(BaseConsumer):
 
 
 def _pipeline_counts(pipeline: Pipeline) -> tuple[int, int]:
-    """(累计入队总数, 累计出队总数)。
+    """(累计入队总数, 累计已提交总数)。
 
     入队总数取生产者写入第一条队列的历史累计（`BaseProducer.stats()['produced']`），
     随生产者规划出更多任务（尤其是 Telegram 补历史拆出来的翻页任务）动态增长。
-    出队总数取消费者读完最后一条队列、处理完（成功或失败）的历史累计——两者
-    加起来才是"这条任务已经走完流水线"，只算成功会在有失败时永远追不上总数。
+    已提交总数取 `BaseBatchConsumer.stats()['consumed']`——`BaseBatchConsumer`
+    只在 `consume_batch` 跑完之后才按整批累加这个计数，语义上就是"落库成功的
+    条目数"，不是"进了消费者缓冲区的条目数"（那是手搓版本才需要担心的问题，
+    见模块 docstring）。
     """
     total = pipeline.producer.stats()["produced"]
     consumer_stats = pipeline.consumer.stats() if pipeline.consumer is not None else None
     if consumer_stats is not None:
-        done = consumer_stats["consumed"] + consumer_stats["failed"]
+        done = consumer_stats["consumed"]
     else:
         last_stage = pipeline.stages[-1].stats()
         done = last_stage["processed"] + last_stage["failed"]
@@ -585,6 +636,8 @@ def run_collect_pipeline(
     *,
     source_id: int | None = None,
     batch_size: int = 500,
+    write_batch: int = 100,
+    flush_interval: float = 10.0,
     concurrency: int = 4,
     settings: Settings | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -594,7 +647,11 @@ def run_collect_pipeline(
     同步阻塞函数——funworker 本身是阻塞式设计，不需要外层 `asyncio.run`
     包装。生产/消费两端各自持有专属的 `AsyncEngine` + 事件循环（见模块
     docstring），处理单元线程池并发数由 `concurrency` 控制，多个源（含
-    Telegram 拆出来的并发翻页任务）共享同一条队列。
+    Telegram 拆出来的并发翻页任务）共享同一条队列。消费者最多攒
+    `write_batch` 条或每 `flush_interval` 秒批量落库一次，取先满足的那个
+    条件——funworker 的 `Pipeline` 只让处理单元这一段并发，消费者永远是单
+    线程，逐条提交会让落库耗时线性堆在这一个线程上，抵消掉抓取侧的并发
+    收益。
 
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者
     已经跑完（规划本身通常比 HTTP 抓取快得多），只要队列里还有积压就继续
@@ -608,7 +665,11 @@ def run_collect_pipeline(
         _CollectConsumer,
         num_workers=max(1, concurrency),
         producer_kwargs={"settings": settings, "source_id": source_id, "batch_size": batch_size},
-        consumer_kwargs={"settings": settings},
+        consumer_kwargs={
+            "settings": settings,
+            "write_batch": write_batch,
+            "flush_interval": flush_interval,
+        },
     )
     pipeline.start()
     try:

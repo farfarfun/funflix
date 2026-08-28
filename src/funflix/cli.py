@@ -768,6 +768,10 @@ def source_collect(
 def collect(
     source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
+    write_batch: Annotated[int, typer.Option(help="消费者每攒够几条落库结果批量提交一次")] = 100,
+    flush_interval: Annotated[
+        float, typer.Option(help="消费者最多攒这么多秒也强制提交一次，避免看起来卡住")
+    ] = 10.0,
     concurrency: Annotated[
         int,
         typer.Option(help="处理单元并发线程数（并发抓 HTTP，不碰数据库），默认取 max(8, CPU 核数)"),
@@ -781,14 +785,16 @@ def collect(
     运算把后续每一页的游标提前算出来，拆成多个可并发抓取的翻页任务；其余
     情况（Telegram 追新、腾讯文档）当一个不透明的整源任务，内部翻页原样在
     处理单元线程里跑完。所有任务不分源、不分类型，全部丢进同一条队列，由
-    `--concurrency` 个处理单元线程并发抓取，一个消费者线程批量落库、回写
-    水位。水位在规划阶段就乐观提交，不等对应任务真的被消费——中途异常顶多
-    丢掉几个还没来得及抓的页面，content_hash 唯一约束保证不会重复入库，
-    每周的水位重置也会把整个源重新刷一遍，可接受。
+    `--concurrency` 个处理单元线程并发抓取，一个消费者线程每攒够
+    `--write-batch` 条或每 `--flush-interval` 秒批量落库、回写水位一次——
+    消费者永远只有一个线程，逐条提交会让落库耗时线性堆在这一个线程上，抵消
+    掉抓取侧的并发收益。水位在规划阶段就乐观提交，不等对应任务真的被消费——
+    中途异常顶多丢掉几个还没来得及抓的页面，content_hash 唯一约束保证不会
+    重复入库，每周的水位重置也会把整个源重新刷一遍，可接受。
 
     进度条不再按"处理了百分之几"算——一个源可能被拆成几十个并发任务，
-    "整体百分比"这个概念本身就不成立了，改成展示队列的入队/出队/已处理
-    条数，跟着任务被拆分、并发消化的真实节奏走。
+    "整体百分比"这个概念本身就不成立了，改成展示队列的入队数、以及消费者
+    真正提交成功的条数，跟着任务被拆分、并发消化、批量落库的真实节奏走。
     """
     from funflix.services.collect.concurrent_runner import run_collect_pipeline
 
@@ -806,6 +812,8 @@ def collect(
         result = run_collect_pipeline(
             source_id=source_id,
             batch_size=batch_size,
+            write_batch=write_batch,
+            flush_interval=flush_interval,
             concurrency=concurrency,
             on_progress=_on_progress,
         )

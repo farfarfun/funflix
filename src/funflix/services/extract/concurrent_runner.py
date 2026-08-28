@@ -24,14 +24,17 @@ funworker 是纯线程 + `queue.Queue` 模型，完全不感知 asyncio，而 fu
 
 进度用 `on_progress(total_enqueued, total_committed)` 轮询喂给调用方：分母是
 "入队列的总数"（`producer.stats()["produced"]`，随生产者翻页动态增长），
-分子是"消费者真正提交到数据库的文档数"（见下面 `_ParseConsumer._committed`）。
+分子是"消费者真正提交到数据库的文档数"（见下面 `_ParseConsumer`）。
 
-分子特意不用处理单元线程池的 `processed` 计数，也不用消费者基类自带的
-`consumed` 计数——两者都只反映"内存里处理完了"，不反映"落库成功了"。当
+`_ParseConsumer` 继承 `funworker.BaseBatchConsumer`，攒批/计时轮询逻辑交给
+基类，只实现 `consume_batch`。分子用的是 `BaseBatchConsumer.stats()`
+自带的 `consumed` 计数——它只在 `consume_batch` 跑完之后才按整批累加，
+语义上就是"落库成功的文档数"；跟处理单元线程池的 `processed` 计数、跟普通
+`BaseConsumer.consumed`（逐条累加，只反映"内存里处理完了"）不是一回事。
 落库（消费者单线程、每条约等于一次 SAVEPOINT+若干 INSERT/UPDATE 往返）比
-抽取慢得多时，用这两个计数会让进度条冲到 100% 后卡住一大截——用户看到的
-是"瞬间跑完"，但数据库其实还在慢慢追。进度条要如实反映"写进去了多少"，
-不是"内存里处理到哪了"，宁可看起来爬得慢，也不能显示假的"已完成"。
+抽取慢得多时，用后两者会让进度条冲到 100% 后卡住一大截——用户看到的是
+"瞬间跑完"，但数据库其实还在慢慢追。进度条要如实反映"写进去了多少"，不是
+"内存里处理到哪了"，宁可看起来爬得慢，也不能显示假的"已完成"。
 
 但"提交数"不能同时兼任轮询循环的收尾信号：消费者攒够 `write_batch` 条或等到
 `flush_interval` 才落库一次，样本量小、或落库比抽取慢时，提交数可能在生产者
@@ -49,7 +52,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from funworker import BaseConsumer, BaseProcessor, BaseProducer, Pipeline
+from funworker import BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -233,12 +236,12 @@ class _ParseProcessor(BaseProcessor):
         }
 
 
-class _ParseConsumer(BaseConsumer):
+class _ParseConsumer(BaseBatchConsumer):
     """攒够 `write_batch` 条，或距上次落库过了 `flush_interval` 秒（或流水线收尾时），批量落库一次。
 
-    单纯按条数攒批，在处理单元跑得比落库快时会让最新一批文档迟迟提交不了——
-    条数上限没到之前，缓冲区只会越攒越大，用户完全看不出流水线还在正常前进。
-    加一条按时间的下限，保证再慢也最多等 `flush_interval` 秒就能看到一批落库。
+    继承 `funworker.BaseBatchConsumer`：攒批按条数触发，缓冲区未满时也保证
+    最多等 `flush_interval` 秒就强制落库一次，这个轮询由基类负责，不依赖
+    "下一条数据到达才检查"，这里只实现 `consume_batch`。
     """
 
     def __init__(
@@ -250,14 +253,11 @@ class _ParseConsumer(BaseConsumer):
         flush_interval: float = 10.0,
         name: str | None = None,
     ) -> None:
-        super().__init__(input_queue, name=name)
+        super().__init__(
+            input_queue, batch_size=write_batch, batch_timeout=flush_interval, name=name
+        )
         self.settings = settings
-        self.write_batch = write_batch
-        self.flush_interval = flush_interval
         self.reports: list[ParseReport] = []
-        #: 真正提交到数据库的文档数——只在 `_flush` 里 `session.commit()`
-        #: 成功之后才累加，供 `_pipeline_counts` 当作进度条的分子。
-        self._committed = 0
 
     def on_start(self) -> None:
         self._aio_loop = asyncio.new_event_loop()
@@ -266,12 +266,8 @@ class _ParseConsumer(BaseConsumer):
             self._engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
         )
         self._extractor_cache: dict[str, Extractor] = {}
-        self._buffer: list[dict[str, Any]] = []
-        self._last_flush_at = time.monotonic()
 
     def on_stop(self) -> None:
-        if self._buffer:
-            self._aio_loop.run_until_complete(self._flush())
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
@@ -280,19 +276,10 @@ class _ParseConsumer(BaseConsumer):
             self._extractor_cache[kind] = get_extractor(kind)
         return self._extractor_cache[kind]
 
-    def consume(self, item: dict[str, Any]) -> None:
-        self._buffer.append(item)
-        due_by_count = len(self._buffer) >= self.write_batch
-        due_by_time = (time.monotonic() - self._last_flush_at) >= self.flush_interval
-        if due_by_count or due_by_time:
-            self._aio_loop.run_until_complete(self._flush())
-            self._last_flush_at = time.monotonic()
+    def consume_batch(self, items: list[dict[str, Any]]) -> None:
+        self._aio_loop.run_until_complete(self._flush_batch(items))
 
-    async def _flush(self) -> None:
-        items, self._buffer = self._buffer, []
-        if not items:
-            return
-
+    async def _flush_batch(self, items: list[dict[str, Any]]) -> None:
         doc_ids = [it["doc_id"] for it in items]
         async with self._sessionmaker() as session:
             try:
@@ -337,21 +324,18 @@ class _ParseConsumer(BaseConsumer):
                 await session.rollback()
                 raise
 
-        self._committed += len(items)
         self.reports.extend(reports)
-
-    def stats(self) -> dict[str, Any]:
-        return {**super().stats(), "committed": self._committed}
 
 
 def _pipeline_counts(pipeline: Pipeline) -> tuple[int, int]:
     """(总入队数, 总提交数) —— 提交数按消费者真正 `session.commit()` 成功的文档数算。
 
-    不用处理单元线程池的 `processed`/消费者基类的 `consumed` 计数：两者都只
-    反映"内存里处理完了"，不反映"落库成功了"，详见模块 docstring。
+    不用处理单元线程池的 `processed` 计数：只反映"内存里处理完了"，不反映
+    "落库成功了"，详见模块 docstring。`BaseBatchConsumer.stats()["consumed"]`
+    才是"落库成功"的口径，跟普通 `BaseConsumer.consumed`（逐条累加）语义不同。
     """
     total = pipeline.producer.stats()["produced"]
-    done = pipeline.consumer.stats()["committed"]
+    done = pipeline.consumer.stats()["consumed"]
     return total, done
 
 
