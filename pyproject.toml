@@ -26,6 +26,8 @@ dependencies = [
     "httpx>=0.27",
     "typer>=0.12",
     "tqdm>=4.66",
+    # 交互式菜单：命令/选项的上下箭头选择
+    "questionary>=2.0",
     "psycopg2-binary>=2.9.12",
     # 异步驱动。config 会把密钥库里的同步 URL（psycopg2）自动换成 asyncpg，
     # 所以这两个都要在。

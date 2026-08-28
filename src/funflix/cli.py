@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
 import click
+import questionary
 import typer
 from sqlalchemy import select
 from tqdm import tqdm
@@ -1317,24 +1318,36 @@ def _interactive_search() -> None:
             continue
 
         typer.echo()
-        for i, media in enumerate(rows, 1):
+        headers = ["作品", "类型", "资源", "有效"]
+        table_rows: list[list[Any]] = []
+        for media in rows:
             year = f" ({media.year})" if media.year else ""
             valid_count = sum(1 for r in media.resources if r.check_status is CheckStatus.VALID)
-            typer.echo(
-                f"  {i}) {media.title}{year}  [{media.media_type.value}]  "
-                f"资源:{len(media.resources)} 有效:{valid_count}"
+            table_rows.append(
+                [f"{media.title}{year}", media.media_type.value, len(media.resources), valid_count]
             )
-        typer.echo("  0) 重新搜索")
+        widths = [
+            max([_width(headers[i])] + [_width(str(row[i])) for row in table_rows])
+            for i in range(len(headers))
+        ]
+
+        def render(values: list[Any], widths: list[int] = widths) -> str:
+            return "  ".join(
+                str(v) + " " * (widths[i] - _width(str(v))) for i, v in enumerate(values)
+            )
+
+        _dim(render(headers))
+        select_choices = [
+            questionary.Choice(title=render(row), value=i) for i, row in enumerate(table_rows)
+        ]
+        select_choices.append(questionary.Choice(title="重新搜索", value=None))
 
         while True:
-            choice = typer.prompt("选择要查看的作品编号", default="0", show_default=False).strip()
-            if choice in ("0", ""):
+            choice = questionary.select("选择要查看的作品：", choices=select_choices).ask()
+            if choice is None:
                 break
-            if not choice.isdigit() or not (1 <= int(choice) <= len(rows)):
-                _warn(f"请输入 0-{len(rows)} 之间的编号")
-                continue
             typer.echo()
-            _print_media_detail(rows[int(choice) - 1])
+            _print_media_detail(rows[choice])
             typer.echo()
 
 
@@ -1342,10 +1355,8 @@ def _prompt_param_tokens(param: click.Parameter) -> list[str]:
     """为一个 click 参数交互式问值，返回要拼进 argv 的 token；留空且非必填就返回
     空列表，让 Click 自己套用默认值——不用在这儿重复一遍每个命令的默认值。"""
     label = param.opts[0] if isinstance(param, click.Option) else param.name
-    help_text = getattr(param, "help", None) or ""
-    choices = getattr(param.type, "choices", None)
-    hint_parts = [p for p in (help_text, f"可选: {'/'.join(choices)}" if choices else "") if p]
-    hint = f"  ({'，'.join(hint_parts)})" if hint_parts else ""
+    help_text = (getattr(param, "help", None) or "").strip()
+    hint = f"  ({help_text})" if help_text else ""
 
     if isinstance(param, click.Option) and param.is_flag:
         default_bool = bool(param.default)
@@ -1359,6 +1370,23 @@ def _prompt_param_tokens(param: click.Parameter) -> list[str]:
         return []
 
     required = bool(getattr(param, "required", False))
+
+    choices = getattr(param.type, "choices", None)
+    if choices:
+        # 有限选项集直接上下箭头选，不用记住/敲对拼写
+        select_choices = [questionary.Choice(title=c, value=c) for c in choices]
+        if not required:
+            default_hint = f" {param.default}" if param.default not in (None, ...) else ""
+            select_choices.append(
+                questionary.Choice(title=f"（跳过，用默认{default_hint}）", value=None)
+            )
+        answer = questionary.select(f"{label}{hint}", choices=select_choices).ask()
+        if answer is None:
+            if required:
+                raise click.Abort()
+            return []
+        return [answer] if isinstance(param, click.Argument) else [param.opts[0], answer]
+
     default_display = "" if param.default in (None, ...) else f" [默认 {param.default}]"
     while True:
         raw = typer.prompt(
@@ -1394,24 +1422,22 @@ def _run_leaf_command(cmd: click.Command, qualified_name: str) -> None:
 
 
 def _menu_loop(group: click.Group, *, path: list[str]) -> None:
-    names = list(group.commands)
     while True:
         typer.echo()
-        _heading("请选择操作：" if not path else f"{' '.join(path)} 下的操作：")
-        for i, name in enumerate(names, 1):
-            sub = group.commands[name]
+        select_choices = []
+        for name, sub in group.commands.items():
             desc = (sub.help or sub.short_help or "").strip().splitlines()[0] if sub.help else ""
-            typer.echo(f"  {i}) {name}" + (f"  {desc}" if desc else ""))
-        typer.echo("  0) " + ("退出" if not path else "返回上级"))
+            title = f"{name}  {desc}" if desc else name
+            select_choices.append(questionary.Choice(title=title, value=name))
+        select_choices.append(
+            questionary.Choice(title="退出" if not path else "返回上级", value=None)
+        )
 
-        choice = typer.prompt("请输入编号", default="0", show_default=False).strip()
-        if choice in ("0", ""):
+        message = "请选择操作：" if not path else f"{' '.join(path)} 下的操作："
+        name = questionary.select(message, choices=select_choices).ask()
+        if name is None:
             return
-        if not choice.isdigit() or not (1 <= int(choice) <= len(names)):
-            _warn(f"请输入 0-{len(names)} 之间的编号")
-            continue
 
-        name = names[int(choice) - 1]
         sub = group.commands[name]
         qualified = [*path, name]
 
