@@ -27,10 +27,11 @@ class Media(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(PkType, primary_key=True)
 
     #: 展示用主标题（取首次见到的清洗后标题）
-    title: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    title: Mapped[str] = mapped_column(sa.String(500), nullable=False)
     #: 归一键，由 services.normalize 的纯函数产出，见 docs/DESIGN.md §4.3
-    norm_key: Mapped[str] = mapped_column(sa.String(255), nullable=False)
-    original_title: Mapped[str | None] = mapped_column(sa.String(255))
+    #: 长度上限低于 title——它参与 uq_media_identity 唯一索引，不能无限放大。
+    norm_key: Mapped[str] = mapped_column(sa.String(500), nullable=False)
+    original_title: Mapped[str | None] = mapped_column(sa.Text)
 
     media_type: Mapped[MediaType] = mapped_column(
         enum_col(MediaType), nullable=False, default=MediaType.UNKNOWN
