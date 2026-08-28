@@ -776,6 +776,9 @@ def collect(
         int,
         typer.Option(help="处理单元并发线程数（并发抓 HTTP，不碰数据库），默认取 max(8, CPU 核数)"),
     ] = max(8, os.cpu_count() or 1),
+    queue_maxsize: Annotated[
+        int, typer.Option(help="待抓取任务队列的容量上限，塞满就阻塞生产者，避免抓太猛被限流")
+    ] = 2000,
 ) -> None:
     """采集：把源里的新内容写成原始文本。
 
@@ -815,6 +818,7 @@ def collect(
             write_batch=write_batch,
             flush_interval=flush_interval,
             concurrency=concurrency,
+            queue_maxsize=queue_maxsize,
             on_progress=_on_progress,
         )
     finally:

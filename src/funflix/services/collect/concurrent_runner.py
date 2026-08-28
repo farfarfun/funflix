@@ -632,6 +632,15 @@ def _pipeline_pending(pipeline: Pipeline) -> int:
     return pending
 
 
+#: 生产者->处理单元 这条队列（装等待抓取的翻页/整源任务）的容量上限。Telegram
+#: 补历史一次规划就能拆出上千个翻页任务，队列不限容量的话，生产者会远远跑在
+#: 实际抓取速度前面——不但抓取并发一下子冲太高容易被 Telegram 限流，规划阶段
+#: 又是乐观提交游标（见模块 docstring），堆积越多，中途异常时被跳过、水位却
+#: 已经往前跳过的翻页任务就越多。塞满就让生产者线程阻塞在 `put()` 上，等
+#: 处理单元消化掉一些再继续规划下一批，形成背压。
+_QUEUE_MAXSIZE = 2000
+
+
 def run_collect_pipeline(
     *,
     source_id: int | None = None,
@@ -639,6 +648,7 @@ def run_collect_pipeline(
     write_batch: int = 100,
     flush_interval: float = 10.0,
     concurrency: int = 4,
+    queue_maxsize: int = _QUEUE_MAXSIZE,
     settings: Settings | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> CollectPipelineResult:
@@ -653,6 +663,11 @@ def run_collect_pipeline(
     线程，逐条提交会让落库耗时线性堆在这一个线程上，抵消掉抓取侧的并发
     收益。
 
+    `queue_maxsize` 给生产者->处理单元 那条队列设容量上限（见
+    `_QUEUE_MAXSIZE`），满了生产者就阻塞在写入上，防止规划任务的速度远超
+    实际抓取/落库速度，既避免并发抓取过猛触发限流，也避免堆积过多"游标已经
+    乐观提交、任务却还没被消费"的翻页任务。
+
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者
     已经跑完（规划本身通常比 HTTP 抓取快得多），只要队列里还有积压就继续
     轮询——不然进度条会在处理单元/消费者还在忙的时候看起来像卡死了。
@@ -664,6 +679,7 @@ def run_collect_pipeline(
         _CollectProcessor,
         _CollectConsumer,
         num_workers=max(1, concurrency),
+        input_maxsize=queue_maxsize,
         producer_kwargs={"settings": settings, "source_id": source_id, "batch_size": batch_size},
         consumer_kwargs={
             "settings": settings,
