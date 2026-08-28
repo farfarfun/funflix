@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
+import click
 import typer
 from sqlalchemy import select
 from tqdm import tqdm
@@ -22,11 +23,19 @@ from funflix.base.enums import CheckStatus, MediaType, ParseStatus, SourceType
 
 logger = logging.getLogger(__name__)
 
-app = typer.Typer(help="funflix 命令行工具", no_args_is_help=True)
+app = typer.Typer(help="funflix 命令行工具")
 db_app = typer.Typer(help="数据库迁移与检查", no_args_is_help=True)
 source_app = typer.Typer(help="采集源管理与采集", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(source_app, name="source")
+
+
+@app.callback(invoke_without_command=True)
+def _main(ctx: typer.Context) -> None:
+    """不带子命令直接执行 `funflix` 时，进交互菜单，而不是打印帮助。"""
+    if ctx.invoked_subcommand is None:
+        _interactive_menu()
+
 
 # --- 输出 helpers ------------------------------------------------------------
 
@@ -1121,6 +1130,58 @@ def extractors() -> None:
 # --- 查询 --------------------------------------------------------------------
 
 
+async def _search_media_rows(
+    keyword: str,
+    *,
+    limit: int = 20,
+    media_type: MediaType | None = None,
+    year: int | None = None,
+    valid_only: bool = False,
+) -> tuple[str, list[Any]]:
+    from sqlalchemy.orm import selectinload
+
+    from funflix.base.db import session_scope
+    from funflix.models import Media
+    from funflix.services.search import SearchQuery, get_backend, search_media
+
+    async with session_scope() as session:
+        backend = get_backend(session)
+        rows = await search_media(
+            session,
+            SearchQuery(
+                keyword=keyword,
+                media_type=media_type,
+                year=year,
+                valid_only=valid_only,
+                limit=limit,
+            ),
+        )
+        if rows:
+            # 预加载资源，避免逐条访问时触发异步上下文外的懒加载
+            await session.execute(
+                select(Media)
+                .options(selectinload(Media.resources))
+                .where(Media.id.in_([m.id for m in rows]))
+            )
+        return backend.name, rows
+
+
+def _print_media_detail(media: Any, *, valid_only: bool = False) -> None:
+    year = f" ({media.year})" if media.year else ""
+    _heading(f"#{media.id} {media.title}{year}  [{media.media_type.value}]")
+    if media.aliases:
+        _dim("  别名: " + "、".join(media.aliases))
+    resources = [
+        r for r in media.resources if not valid_only or r.check_status is CheckStatus.VALID
+    ]
+    if not resources:
+        _dim("    （无资源）")
+        return
+    for r in resources:
+        passcode = f"  提取码 {r.passcode}" if r.passcode else ""
+        typer.echo(f"    [{r.provider.value:<7}] {r.check_status.value:<11} {r.url}{passcode}")
+
+
 @app.command()
 def search(
     keyword: Annotated[str, typer.Argument(help="剧名关键词")],
@@ -1133,52 +1194,18 @@ def search(
 
     PostgreSQL 上走 pg_trgm 模糊匹配并按相似度排序，其余方言回落到 LIKE。
     """
-    from sqlalchemy.orm import selectinload
-
-    from funflix.base.db import session_scope
-    from funflix.models import Media
-    from funflix.services.search import SearchQuery, get_backend, search_media
-
-    async def _do():
-        async with session_scope() as session:
-            backend = get_backend(session)
-            rows = await search_media(
-                session,
-                SearchQuery(
-                    keyword=keyword,
-                    media_type=media_type,
-                    year=year,
-                    valid_only=valid_only,
-                    limit=limit,
-                ),
-            )
-            if rows:
-                # 预加载资源，避免逐条访问时触发异步上下文外的懒加载
-                await session.execute(
-                    select(Media)
-                    .options(selectinload(Media.resources))
-                    .where(Media.id.in_([m.id for m in rows]))
-                )
-            return backend.name, rows
-
-    backend_name, rows = _run(_do)
+    backend_name, rows = _run(
+        lambda: _search_media_rows(
+            keyword, limit=limit, media_type=media_type, year=year, valid_only=valid_only
+        )
+    )
     _dim(f"搜索后端 {backend_name}")
     if not rows:
         typer.echo(f"没有匹配 {keyword!r} 的作品")
         return
 
     for media in rows:
-        year = f" ({media.year})" if media.year else ""
-        _heading(f"#{media.id} {media.title}{year}  [{media.media_type.value}]")
-        resources = [
-            r for r in media.resources if not valid_only or r.check_status is CheckStatus.VALID
-        ]
-        if not resources:
-            _dim("    （无资源）")
-            continue
-        for r in resources:
-            passcode = f"  提取码 {r.passcode}" if r.passcode else ""
-            typer.echo(f"    [{r.provider.value:<7}] {r.check_status.value:<11} {r.url}{passcode}")
+        _print_media_detail(media, valid_only=valid_only)
 
 
 @app.command("doc")
@@ -1263,6 +1290,147 @@ def ingest(
 
     created, duplicated = _run(_do)
     _ok(f"导入完成：新增 {created} 条，重复跳过 {duplicated} 条")
+
+
+# --- 交互式菜单 ----------------------------------------------------------------
+#
+# 全量覆盖：菜单项直接从 Typer/Click 的命令树里反射出来（`db`/`source` 这些子
+# 分组也会递归进去），不用给每条命令另外手写一遍参数收集逻辑——新增命令、改
+# 选项都不需要再回来同步这里。`search` 是唯一的例外：它有单独一套"关键词 ->
+# 结果列表 -> 选一条看详情"的体验，比"逐个参数问一遍再原样拼回命令行"更顺手，
+# 所以在分发时特判掉，其余命令一律走通用的“列参数、挨个问、拼成 argv、交给
+# Click 自己解析校验”这条路径。
+
+
+def _interactive_search() -> None:
+    while True:
+        keyword = typer.prompt(
+            "请输入搜索关键词（直接回车返回菜单）", default="", show_default=False
+        ).strip()
+        if not keyword:
+            return
+
+        backend_name, rows = _run(lambda kw=keyword: _search_media_rows(kw))
+        _dim(f"搜索后端 {backend_name}")
+        if not rows:
+            typer.echo(f"没有匹配 {keyword!r} 的作品")
+            continue
+
+        typer.echo()
+        for i, media in enumerate(rows, 1):
+            year = f" ({media.year})" if media.year else ""
+            valid_count = sum(1 for r in media.resources if r.check_status is CheckStatus.VALID)
+            typer.echo(
+                f"  {i}) {media.title}{year}  [{media.media_type.value}]  "
+                f"资源:{len(media.resources)} 有效:{valid_count}"
+            )
+        typer.echo("  0) 重新搜索")
+
+        while True:
+            choice = typer.prompt("选择要查看的作品编号", default="0", show_default=False).strip()
+            if choice in ("0", ""):
+                break
+            if not choice.isdigit() or not (1 <= int(choice) <= len(rows)):
+                _warn(f"请输入 0-{len(rows)} 之间的编号")
+                continue
+            typer.echo()
+            _print_media_detail(rows[int(choice) - 1])
+            typer.echo()
+
+
+def _prompt_param_tokens(param: click.Parameter) -> list[str]:
+    """为一个 click 参数交互式问值，返回要拼进 argv 的 token；留空且非必填就返回
+    空列表，让 Click 自己套用默认值——不用在这儿重复一遍每个命令的默认值。"""
+    label = param.opts[0] if isinstance(param, click.Option) else param.name
+    help_text = getattr(param, "help", None) or ""
+    choices = getattr(param.type, "choices", None)
+    hint_parts = [p for p in (help_text, f"可选: {'/'.join(choices)}" if choices else "") if p]
+    hint = f"  ({'，'.join(hint_parts)})" if hint_parts else ""
+
+    if isinstance(param, click.Option) and param.is_flag:
+        default_bool = bool(param.default)
+        answer = typer.confirm(f"{label}{hint}", default=default_bool)
+        if answer == default_bool:
+            return []
+        if answer and param.opts:
+            return [param.opts[0]]
+        if not answer and getattr(param, "secondary_opts", None):
+            return [param.secondary_opts[0]]
+        return []
+
+    required = bool(getattr(param, "required", False))
+    default_display = "" if param.default in (None, ...) else f" [默认 {param.default}]"
+    while True:
+        raw = typer.prompt(
+            f"{label}{hint}{default_display}", default="", show_default=False
+        ).strip()
+        if raw:
+            break
+        if required:
+            _warn("必填，不能留空")
+            continue
+        return []
+
+    return [raw] if isinstance(param, click.Argument) else [param.opts[0], raw]
+
+
+def _run_leaf_command(cmd: click.Command, qualified_name: str) -> None:
+    try:
+        argv: list[str] = []
+        for param in cmd.params:
+            if isinstance(param, click.Option) and "--help" in param.opts:
+                continue
+            argv.extend(_prompt_param_tokens(param))
+
+        typer.echo()
+        cmd.main(args=argv, prog_name=f"funflix {qualified_name}", standalone_mode=False)
+    except (click.exceptions.Exit, typer.Exit, SystemExit):
+        pass
+    except (click.Abort, typer.Abort, KeyboardInterrupt):
+        typer.echo()
+        _warn("已取消")
+    except click.ClickException as exc:
+        exc.show()
+
+
+def _menu_loop(group: click.Group, *, path: list[str]) -> None:
+    names = list(group.commands)
+    while True:
+        typer.echo()
+        _heading("请选择操作：" if not path else f"{' '.join(path)} 下的操作：")
+        for i, name in enumerate(names, 1):
+            sub = group.commands[name]
+            desc = (sub.help or sub.short_help or "").strip().splitlines()[0] if sub.help else ""
+            typer.echo(f"  {i}) {name}" + (f"  {desc}" if desc else ""))
+        typer.echo("  0) " + ("退出" if not path else "返回上级"))
+
+        choice = typer.prompt("请输入编号", default="0", show_default=False).strip()
+        if choice in ("0", ""):
+            return
+        if not choice.isdigit() or not (1 <= int(choice) <= len(names)):
+            _warn(f"请输入 0-{len(names)} 之间的编号")
+            continue
+
+        name = names[int(choice) - 1]
+        sub = group.commands[name]
+        qualified = [*path, name]
+
+        if not path and name == "search":
+            _interactive_search()
+            continue
+        if isinstance(sub, click.Group):
+            _menu_loop(sub, path=qualified)
+            continue
+        _run_leaf_command(sub, " ".join(qualified))
+
+
+def _interactive_menu() -> None:
+    root = typer.main.get_command(app)
+    assert isinstance(root, click.Group)
+    try:
+        _menu_loop(root, path=[])
+    except (click.Abort, typer.Abort, KeyboardInterrupt):
+        typer.echo()
 
 
 # --- 供 status 之外的引用 ------------------------------------------------------
