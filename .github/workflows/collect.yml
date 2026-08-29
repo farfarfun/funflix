@@ -1,4 +1,4 @@
-name: Collect Pipeline
+name: Data Pipeline
 
 on:
   schedule:
@@ -13,14 +13,16 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: daily-collect
-  cancel-in-progress: false
-
 jobs:
+  # collect/parse/verify 各消费自己的队列（采集水位 / 待解析文档 / 待校验资源），
+  # 互不依赖对方产出的结果才能跑，所以拆成三个独立 job 并行执行，而不是
+  # 一个 job 里顺序跑三步——一步卡住不该拖着后面两步一起等。
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    concurrency:
+      group: pipeline-collect
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -59,10 +61,60 @@ jobs:
       - name: Collect
         run: funflix collect --limit 3000
 
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: pipeline-parse
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Load secrets
+        env:
+          FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
+        run: |
+          url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
+          funsecret load "$url"
+
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
-      # 影响范围有限，不会一次把所有待处理/待校验的都搭进去。
+      # 影响范围有限，不会一次把所有待解析的都搭进去。
       - name: Parse
         run: funflix parse --limit 5000
+
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: pipeline-verify
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Load secrets
+        env:
+          FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
+        run: |
+          url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
+          funsecret load "$url"
 
       - name: Verify
         run: funflix verify --limit 2000
