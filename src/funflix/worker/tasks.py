@@ -26,7 +26,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from funflix.base.enums import CheckStatus
+from funflix.base.enums import CheckStatus, Provider
 from funflix.services.collect.registry import get_collector
 from funflix.services.collect.runner import collect_source
 from funflix.services.extract.base import Extractor
@@ -208,45 +208,62 @@ async def run_verify_batch(
     提交一次，见模块 docstring。`check_resource` 不像 `parse_document` 那样
     自己兜底异常，探测/落库出错会直接抛到这里，因此校验阶段撞上 `_abort` 的
     概率比解析阶段更高，一次探测异常会连带丢掉同一撮里还未提交的其它几条。
+
+    探针按 provider 缓存在本函数调用范围内，同一 provider 的多条资源复用
+    同一个探针实例，探针内部持有的 httpx client 也就跟着复用，省掉每次
+    请求重建连接的开销（见 `services/verify/base.py::AnonymousHttpProbe`）；
+    函数退出前 `finally` 里统一关掉，不会跨批次残留。
     """
     report = BatchReport()
+    probes: dict[Provider, Any] = {}
 
-    while True:
-        claimed = await claim_resources(session, limit=limit, lease=lease)
-        report.claimed += len(claimed)
-        report.reclaimed += claimed.reclaimed
-        report.abandoned += claimed.abandoned
+    def _probe_for(provider: Provider) -> Any:
+        if provider not in probes:
+            probes[provider] = get_probe(provider)
+        return probes[provider]
 
-        pending = 0
-        for resource in claimed.rows:
-            try:
-                probe = get_probe(resource.provider)
-                result = await check_resource(
-                    session,
-                    resource,
-                    probe,
-                    limiter,
-                    # 领取时状态已被改成 checking，那只是占位。不把领取前的结论
-                    # 传进去，"连续两次失效就停止复查"永远算不出来。
-                    prior_status=claimed.priors.get(resource.id),
-                )
-                # error / rate_limited 不是关于链接的结论，是"没探出来"，算失败。
-                inconclusive = result.status in {CheckStatus.ERROR, CheckStatus.RATE_LIMITED}
-                report.succeeded += int(not inconclusive)
-                report.failed += int(inconclusive)
-                await _mark_done(resource)
-                pending += 1
-            except Exception as exc:
-                report.failed += 1
-                await _abort(session, "校验", resource.id, exc)
-                pending = 0
-                continue
-            if pending >= write_batch:
+    try:
+        while True:
+            claimed = await claim_resources(session, limit=limit, lease=lease)
+            report.claimed += len(claimed)
+            report.reclaimed += claimed.reclaimed
+            report.abandoned += claimed.abandoned
+
+            pending = 0
+            for resource in claimed.rows:
+                try:
+                    probe = _probe_for(resource.provider)
+                    result = await check_resource(
+                        session,
+                        resource,
+                        probe,
+                        limiter,
+                        # 领取时状态已被改成 checking，那只是占位。不把领取前的结论
+                        # 传进去，"连续两次失效就停止复查"永远算不出来。
+                        prior_status=claimed.priors.get(resource.id),
+                    )
+                    # error / rate_limited 不是关于链接的结论，是"没探出来"，算失败。
+                    inconclusive = result.status in {CheckStatus.ERROR, CheckStatus.RATE_LIMITED}
+                    report.succeeded += int(not inconclusive)
+                    report.failed += int(inconclusive)
+                    await _mark_done(resource)
+                    pending += 1
+                except Exception as exc:
+                    report.failed += 1
+                    await _abort(session, "校验", resource.id, exc)
+                    pending = 0
+                    continue
+                if pending >= write_batch:
+                    await session.commit()
+                    pending = 0
+            if pending:
                 await session.commit()
-                pending = 0
-        if pending:
-            await session.commit()
 
-        if not claimed.rows:
-            break
+            if not claimed.rows:
+                break
+    finally:
+        for probe in probes.values():
+            aclose = getattr(probe, "aclose", None)
+            if aclose is not None:
+                await aclose()
     return report

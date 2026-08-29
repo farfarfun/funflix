@@ -6,10 +6,14 @@
 `worker/tasks.py::run_verify_batch`（常驻 worker 模式，走租约领取，是完全
 独立的调用路径）；这里只服务 `funflix verify` 这条一次性批处理 CLI 命令。
 
-处理单元线程只负责 `probe.check()`，不碰数据库——探针本身是无状态的（见
-`registry.get_probe`），线程私有缓存一份即可。限流器要跨线程共享同一个
-`BlockingRateLimiter` 实例（`asyncio.Lock` 版的 `RateLimiter` 绑在各自线程的
-事件循环上，不能跨线程用），这样"每个网盘每秒最多几次请求"才是全局生效。
+处理单元线程只负责 `probe.check()`，不碰数据库——探针（见 `registry.get_probe`）
+线程私有缓存一份即可，`_probe_for` 按 provider 缓存，同一线程内的多次
+`check()` 复用同一个探针实例，探针内部的 httpx client 也就跟着复用，
+省掉每次请求重建 TCP/TLS 连接的开销（实测每次约 1.3s，是校验环节的真正瓶颈，
+不是限流）；线程退出时 `on_stop` 显式关掉缓存里每个探针的连接池。限流器要
+跨线程共享同一个 `BlockingRateLimiter` 实例（`asyncio.Lock` 版的 `RateLimiter`
+绑在各自线程的事件循环上，不能跨线程用），这样"每个网盘每秒最多几次请求"
+才是全局生效。
 
 落库逻辑（写 `LinkCheck`、推进 `resource.check_status`/`next_check_at`、
 刷新作品的 `valid_resource_count`）留给消费者线程，复用
@@ -168,6 +172,12 @@ class _VerifyProcessor(BaseProcessor):
         self._probe_cache: dict[Provider, LinkProbe | None] = {}
 
     def on_stop(self) -> None:
+        # 探针的 httpx client 在 on_start 之后惰性建、线程存活期内一直复用
+        # （见 base.py::AnonymousHttpProbe），线程退出前得显式关掉，不然连接池泄漏。
+        for probe in self._probe_cache.values():
+            aclose = getattr(probe, "aclose", None)
+            if aclose is not None:
+                self._aio_loop.run_until_complete(aclose())
         self._aio_loop.close()
 
     def _probe_for(self, provider: Provider) -> LinkProbe | None:

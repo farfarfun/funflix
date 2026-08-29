@@ -105,6 +105,24 @@ class AnonymousHttpProbe:
         self._owns_client = client is None
         self._timeout = timeout
 
+    def _get_client(self) -> Any:
+        """惰性建连、长期复用，见 `check` 的说明。"""
+        import httpx
+
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """关闭本探针持有的连接池。调用方（处理单元线程退出时）负责调用。
+
+        只关自己建的 client——调用方注入的 client 生命周期由调用方管理，
+        探针不该替它做主。
+        """
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
     def build_payload(self, ref: LinkRef) -> dict[str, Any]:
         """请求体。子类必须实现。"""
         raise NotImplementedError
@@ -119,7 +137,7 @@ class AnonymousHttpProbe:
     async def check(self, ref: LinkRef) -> CheckOutcome:
         import httpx
 
-        client = self._client or httpx.AsyncClient(timeout=self._timeout)
+        client = self._get_client()
         started = time.monotonic()
         outcome: CheckOutcome
         try:
@@ -155,9 +173,6 @@ class AnonymousHttpProbe:
             # 解析逻辑自己抛了 —— 同样不能算链接失效
             logger.exception("%s 探针异常", self.name)
             outcome = CheckOutcome(status=CheckStatus.ERROR, detail=f"{type(exc).__name__}: {exc}")
-        finally:
-            if self._owns_client:
-                await client.aclose()
 
         outcome.latency_ms = int((time.monotonic() - started) * 1000)
         return outcome

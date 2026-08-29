@@ -1080,7 +1080,13 @@ def verify(
                     _fail(f"资源 #{resource_id} 不存在")
                 probe = get_probe(target.provider)
                 limiter = RateLimiter(rate_per_second=rate)
-                report = await check_resource(session, target, probe, limiter)
+                try:
+                    report = await check_resource(session, target, probe, limiter)
+                finally:
+                    if probe is not None:
+                        aclose = getattr(probe, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
                 await session.commit()
                 return [report]
 
