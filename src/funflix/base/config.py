@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,7 +13,11 @@ logger = logging.getLogger(__name__)
 
 #: funsecret 里都没有、环境变量也没给时的兜底。
 #: 用本地 SQLite 而不是报错 —— 让"刚 clone 下来就能跑起来"成立。
-DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./funflix.db"
+#:
+#: 固定放在 `~/.cache/farfarfun/funflix/` 下（而不是 CWD 相对路径），
+#: 这样不论从哪个目录执行 `funflix`，读写的都是同一份库。
+DEFAULT_DATABASE_PATH = Path.home() / ".cache" / "farfarfun" / "funflix" / "funflix.db"
+DEFAULT_DATABASE_URL = f"sqlite+aiosqlite:///{DEFAULT_DATABASE_PATH}"
 
 #: 同步驱动 → 异步驱动的映射。
 #: 密钥库里的 db/url 通常是给同步工具（psycopg2 等）用的、被多个项目共享，
@@ -41,6 +46,13 @@ def to_async_url(url: str) -> str:
     return f"{replacement}://{rest}" if replacement else url
 
 
+def _fallback_to_default() -> str:
+    """落到本地 SQLite 前确保目录存在——只在真正要用到这条兜底路径时才建，
+    不在模块导入时就动文件系统。"""
+    DEFAULT_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_DATABASE_URL
+
+
 def resolve_database_url() -> str:
     """从 funsecret 读数据库地址：`read_secret("funflix", "db", "url")`。
 
@@ -55,17 +67,17 @@ def resolve_database_url() -> str:
         from funsecret import read_secret
     except ImportError:
         logger.debug("未安装 funsecret，使用默认数据库地址")
-        return DEFAULT_DATABASE_URL
+        return _fallback_to_default()
 
     try:
         value = read_secret("funflix", "db", "url")
     except Exception as exc:  # 密钥库损坏 / 权限问题，不该让整个应用起不来
         logger.warning("读取 funsecret 数据库配置失败，回落到默认值：%s", exc)
-        return DEFAULT_DATABASE_URL
+        return _fallback_to_default()
 
     if not value:
         logger.debug("funsecret 中未配置 funflix/db/url，使用默认数据库地址")
-        return DEFAULT_DATABASE_URL
+        return _fallback_to_default()
 
     # 只记方言，不记完整 URL —— 它可能带账号密码
     logger.info("数据库地址来自 funsecret（%s）", value.split("://", 1)[0])
