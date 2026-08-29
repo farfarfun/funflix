@@ -112,9 +112,7 @@ def upgrade() -> None:
             "FROM raw_document rd WHERE rd.id = t.raw_document_id"
         )
     # extraction.raw_document_id 原本是 NOT NULL，回填后补回这个约束。
-    op.alter_column(
-        "extraction", "raw_document_id_new", existing_type=_UUID, nullable=False
-    )
+    op.alter_column("extraction", "raw_document_id_new", existing_type=_UUID, nullable=False)
 
     op.add_column("media_resource", sa.Column("media_id_new", _UUID, nullable=True))
     op.add_column("media_resource", sa.Column("resource_id_new", _UUID, nullable=True))
@@ -123,9 +121,7 @@ def upgrade() -> None:
         "FROM media m, resource r WHERE m.id = mr.media_id AND r.id = mr.resource_id"
     )
     op.alter_column("media_resource", "media_id_new", existing_type=_UUID, nullable=False)
-    op.alter_column(
-        "media_resource", "resource_id_new", existing_type=_UUID, nullable=False
-    )
+    op.alter_column("media_resource", "resource_id_new", existing_type=_UUID, nullable=False)
 
     op.add_column("media_tag", sa.Column("media_id_new", _UUID, nullable=True))
     op.add_column("media_tag", sa.Column("tag_id_new", _UUID, nullable=True))
@@ -141,9 +137,7 @@ def upgrade() -> None:
     # --- 阶段 2：清空全部挡着删旧列的约束，再统一切列 ---------------------------
     # 引用旧 id 的外键（都在子表上，跟父表处理顺序无关，可以先一口气全删掉）。
     op.drop_constraint("fk_raw_document_source_id_source", "raw_document", type_="foreignkey")
-    op.drop_constraint(
-        "fk_resource_raw_document_id_raw_document", "resource", type_="foreignkey"
-    )
+    op.drop_constraint("fk_resource_raw_document_id_raw_document", "resource", type_="foreignkey")
     op.drop_constraint(
         "fk_extraction_raw_document_id_raw_document", "extraction", type_="foreignkey"
     )
@@ -240,9 +234,7 @@ def upgrade() -> None:
         "fk_media_tag_tag_id_tag", "media_tag", "tag", ["tag_id"], ["id"], ondelete="CASCADE"
     )
 
-    op.create_index(
-        "ix_raw_document_source_msg", "raw_document", ["source_id", "source_msg_id"]
-    )
+    op.create_index("ix_raw_document_source_msg", "raw_document", ["source_id", "source_msg_id"])
     op.create_unique_constraint(
         "uq_extraction_doc_model_version",
         "extraction",
@@ -276,9 +268,7 @@ def downgrade() -> None:
             f"UPDATE {table} t SET raw_document_id_old = rd.id_old "
             "FROM raw_document rd WHERE rd.id = t.raw_document_id"
         )
-    op.alter_column(
-        "extraction", "raw_document_id_old", existing_type=_OLD_ID_TYPE, nullable=False
-    )
+    op.alter_column("extraction", "raw_document_id_old", existing_type=_OLD_ID_TYPE, nullable=False)
 
     op.add_column("media_resource", sa.Column("media_id_old", _OLD_ID_TYPE, nullable=True))
     op.add_column("media_resource", sa.Column("resource_id_old", _OLD_ID_TYPE, nullable=True))
@@ -286,12 +276,8 @@ def downgrade() -> None:
         "UPDATE media_resource mr SET media_id_old = m.id_old, resource_id_old = r.id_old "
         "FROM media m, resource r WHERE m.id = mr.media_id AND r.id = mr.resource_id"
     )
-    op.alter_column(
-        "media_resource", "media_id_old", existing_type=_OLD_ID_TYPE, nullable=False
-    )
-    op.alter_column(
-        "media_resource", "resource_id_old", existing_type=_OLD_ID_TYPE, nullable=False
-    )
+    op.alter_column("media_resource", "media_id_old", existing_type=_OLD_ID_TYPE, nullable=False)
+    op.alter_column("media_resource", "resource_id_old", existing_type=_OLD_ID_TYPE, nullable=False)
 
     op.add_column("media_tag", sa.Column("media_id_old", _OLD_ID_TYPE, nullable=True))
     op.add_column("media_tag", sa.Column("tag_id_old", _OLD_ID_TYPE, nullable=True))
@@ -304,9 +290,7 @@ def downgrade() -> None:
 
     # 清空挡着删 uuid 列的约束。
     op.drop_constraint("fk_raw_document_source_id_source", "raw_document", type_="foreignkey")
-    op.drop_constraint(
-        "fk_resource_raw_document_id_raw_document", "resource", type_="foreignkey"
-    )
+    op.drop_constraint("fk_resource_raw_document_id_raw_document", "resource", type_="foreignkey")
     op.drop_constraint(
         "fk_extraction_raw_document_id_raw_document", "extraction", type_="foreignkey"
     )
@@ -346,12 +330,8 @@ def downgrade() -> None:
         op.create_primary_key(f"pk_{table}", table, ["id"])
         # 补回 BIGSERIAL 等价的序列，让降级后的表结构跟迁移前完全一致。
         op.execute(f"CREATE SEQUENCE {table}_id_seq OWNED BY {table}.id")
-        op.execute(
-            f"SELECT setval('{table}_id_seq', (SELECT COALESCE(MAX(id), 0) FROM {table}))"
-        )
-        op.alter_column(
-            table, "id", server_default=sa.text(f"nextval('{table}_id_seq'::regclass)")
-        )
+        op.execute(f"SELECT setval('{table}_id_seq', (SELECT COALESCE(MAX(id), 0) FROM {table}))")
+        op.alter_column(table, "id", server_default=sa.text(f"nextval('{table}_id_seq'::regclass)"))
     op.create_primary_key("pk_media_resource", "media_resource", ["media_id", "resource_id"])
     op.create_primary_key("pk_media_tag", "media_tag", ["media_id", "tag_id"])
 
@@ -407,9 +387,7 @@ def downgrade() -> None:
         "fk_media_tag_tag_id_tag", "media_tag", "tag", ["tag_id"], ["id"], ondelete="CASCADE"
     )
 
-    op.create_index(
-        "ix_raw_document_source_msg", "raw_document", ["source_id", "source_msg_id"]
-    )
+    op.create_index("ix_raw_document_source_msg", "raw_document", ["source_id", "source_msg_id"])
     op.create_unique_constraint(
         "uq_extraction_doc_model_version",
         "extraction",
