@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -96,7 +97,7 @@ class BlockingRateLimiter:
 
 @dataclass(slots=True)
 class VerifyReport:
-    resource_id: int
+    resource_id: uuid.UUID
     status: CheckStatus
     before: CheckStatus
     detail: str | None = None

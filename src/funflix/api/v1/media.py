@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import case, select
 from sqlalchemy.orm import selectinload
@@ -61,7 +63,7 @@ async def list_media(
 
 
 @router.get("/{media_id}", response_model=MediaDetail)
-async def get_media(media_id: int, session: SessionDep) -> MediaDetail:
+async def get_media(media_id: uuid.UUID, session: SessionDep) -> MediaDetail:
     """作品详情，含网盘资源与标签。
 
     关联对象一律预加载 —— 异步会话下懒加载会在序列化时抛 MissingGreenlet，

@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from funflix.models.base import Base, JsonType, PkType, TimestampMixin
+from funflix.models.base import Base, JsonType, PkType, TimestampMixin, uuid7
 
 if TYPE_CHECKING:
     from funflix.models.raw import RawDocument
@@ -21,8 +22,8 @@ if TYPE_CHECKING:
 class Extraction(TimestampMixin, Base):
     __tablename__ = "extraction"
 
-    id: Mapped[int] = mapped_column(PkType, primary_key=True)
-    raw_document_id: Mapped[int] = mapped_column(
+    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
+    raw_document_id: Mapped[uuid.UUID] = mapped_column(
         PkType, sa.ForeignKey("raw_document.id", ondelete="CASCADE"), nullable=False
     )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from funflix.base.enums import CheckStatus, Provider, Quality, enum_col
 from funflix.models.association import media_resource
-from funflix.models.base import Base, BigIntType, PkType, TimestampMixin, UTCDateTime
+from funflix.models.base import Base, BigIntType, PkType, TimestampMixin, UTCDateTime, uuid7
 
 if TYPE_CHECKING:
     from funflix.models.media import Media
@@ -20,10 +21,10 @@ if TYPE_CHECKING:
 class Resource(TimestampMixin, Base):
     __tablename__ = "resource"
 
-    id: Mapped[int] = mapped_column(PkType, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
 
     #: 首次发现该资源的原始文本，用于溯源
-    raw_document_id: Mapped[int | None] = mapped_column(
+    raw_document_id: Mapped[uuid.UUID | None] = mapped_column(
         PkType, sa.ForeignKey("raw_document.id", ondelete="SET NULL")
     )
 

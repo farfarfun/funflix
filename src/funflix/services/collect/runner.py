@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -39,7 +40,7 @@ _BACKFILL_TIME_BUDGET = timedelta(minutes=5)
 
 @dataclass(slots=True)
 class CollectReport:
-    source_id: int
+    source_id: uuid.UUID
     fetched: int = 0
     created: int = 0
     duplicated: int = 0

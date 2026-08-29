@@ -11,6 +11,7 @@ tag 去重、关联是否已存在……），批量预读把这些查询从 O(�
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,7 +55,7 @@ SAVEPOINT_BATCH_SIZE = 20
 
 @dataclass(slots=True)
 class ParseReport:
-    document_id: int
+    document_id: uuid.UUID
     status: ParseStatus
     is_catalog: bool = False
     from_cache: bool = False
@@ -88,8 +89,8 @@ class BatchCache:
     media_by_relaxed: dict[tuple[str, int], list[Media]] = field(default_factory=dict)
     resource_by_key: dict[tuple[str, str], Resource] = field(default_factory=dict)
     tag_by_key: dict[tuple[str, str], Tag] = field(default_factory=dict)
-    media_resource_pairs: set[tuple[int, int]] = field(default_factory=set)
-    media_tag_pairs: set[tuple[int, int]] = field(default_factory=set)
+    media_resource_pairs: set[tuple[uuid.UUID, uuid.UUID]] = field(default_factory=set)
+    media_tag_pairs: set[tuple[uuid.UUID, uuid.UUID]] = field(default_factory=set)
 
 
 def _snapshot_cache(cache: BatchCache) -> tuple:
@@ -124,7 +125,7 @@ def _restore_cache(cache: BatchCache, snapshot: tuple) -> None:
     ) = snapshot
 
 
-def keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: int) -> Any:
+def keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: uuid.UUID) -> Any:
     """`ORDER BY ts_col.nulls_first(), id_col` 场景下的翻页游标条件。
 
     不能直接拿 `id_col > last_id` 当游标——排序主键换成了 ts_col 之后，
@@ -142,7 +143,7 @@ def keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: int) -> Any:
 
 
 async def _load_cached(
-    session: AsyncSession, doc_id: int, name: str, version: str
+    session: AsyncSession, doc_id: uuid.UUID, name: str, version: str
 ) -> Extraction | None:
     """按 (文档, 抽取器身份, 版本) 找留档。换抽取器或升版本都会 miss，从而重新抽取。"""
     return await session.scalar(
@@ -155,8 +156,8 @@ async def _load_cached(
 
 
 async def _load_cached_batch(
-    session: AsyncSession, doc_ids: list[int], name: str, version: str
-) -> dict[int, Extraction]:
+    session: AsyncSession, doc_ids: list[uuid.UUID], name: str, version: str
+) -> dict[uuid.UUID, Extraction]:
     """`_load_cached` 的批量版本：一次查询整批文档的留档。"""
     if not doc_ids:
         return {}
@@ -557,14 +558,14 @@ async def _persist_phase2(
     cache: BatchCache | None,
     pending_links: list[dict],
     pending_tag_links: list[dict],
-) -> set[int]:
+) -> set[uuid.UUID]:
     """阶段二：用阶段一 flush 后拿到的 id 建关联关系，攒进调用方共享的批量列表。
 
     调用方负责在处理完一批文档后把 `pending_links`/`pending_tag_links` 各批量
     INSERT 一次——攒的范围越大（单文档 vs 一整个 SAVEPOINT 里的好几条文档），
     往返就摊得越薄。
     """
-    touched: set[int] = set()
+    touched: set[uuid.UUID] = set()
     for media, tags in state.media_by_item:
         report.tags_linked += await _link_tags(session, media, tags, cache, pending_tag_links)
         touched.add(media.id)
@@ -582,7 +583,7 @@ async def _persist(
     outcome: ExtractionOutcome,
     report: ParseReport,
     cache: BatchCache | None = None,
-) -> set[int]:
+) -> set[uuid.UUID]:
     """单文档场景的两阶段落库封装，往返次数摊平成固定几次。
 
     一条文档有 N 个链接、M 个标签，就不该有 N/M 次数据库往返，会让合集帖
@@ -698,11 +699,11 @@ async def parse_document(
 async def persist_extracted(
     session: AsyncSession,
     docs: list[RawDocument],
-    outcomes: dict[int, ExtractionOutcome],
-    cached_doc_ids: set[int],
+    outcomes: dict[uuid.UUID, ExtractionOutcome],
+    cached_doc_ids: set[uuid.UUID],
     extractor: Extractor,
     *,
-    extraction_errors: dict[int, str] | None = None,
+    extraction_errors: dict[uuid.UUID, str] | None = None,
 ) -> list[ParseReport]:
     """把一批**已经产出**的抽取结果批量落库。要求 `docs` 已按同一个 extractor 分组。
 
@@ -728,7 +729,7 @@ async def persist_extracted(
     now = utcnow()
 
     cache = await _preload_batch_cache(session, list(outcomes.values()))
-    all_touched: set[int] = set()
+    all_touched: set[uuid.UUID] = set()
 
     persistable_docs: list[RawDocument] = []
     for doc in docs:
@@ -768,18 +769,18 @@ async def persist_extracted(
 async def _persist_chunk(
     session: AsyncSession,
     chunk: list[RawDocument],
-    outcomes: dict[int, ExtractionOutcome],
-    cached_doc_ids: set[int],
+    outcomes: dict[uuid.UUID, ExtractionOutcome],
+    cached_doc_ids: set[uuid.UUID],
     extractor: Extractor,
     cache: BatchCache | None,
-    reports: dict[int, ParseReport],
+    reports: dict[uuid.UUID, ParseReport],
     now: Any,
-    all_touched: set[int],
+    all_touched: set[uuid.UUID],
 ) -> None:
     """把一组文档打包进一个共享 SAVEPOINT：阶段一全组 add 完再统一 flush 一次，
     阶段二全组的关联行攒成一批 INSERT，往返次数固定不随组内文档数增长。
     """
-    failed_doc_id: int | None = None
+    failed_doc_id: uuid.UUID | None = None
     cache_snapshot = _snapshot_cache(cache) if cache is not None else None
     try:
         async with session.begin_nested():
@@ -904,7 +905,7 @@ async def parse_batch(
         )
     )
 
-    outcomes: dict[int, ExtractionOutcome] = {}
+    outcomes: dict[uuid.UUID, ExtractionOutcome] = {}
     for doc in docs:
         cached = cached_by_doc.get(doc.id)
         outcomes[doc.id] = (

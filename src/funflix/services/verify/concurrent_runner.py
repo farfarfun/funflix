@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -102,7 +103,9 @@ class _VerifyProducer(BaseProducer):
         )
         self._buffer: list[dict[str, Any]] = []
         self._last_ts: Any = None
-        self._last_id = 0
+        # 全零 UUID 当"比任何真实 UUIDv7 都小"的哨兵，理由同
+        # `services/extract/concurrent_runner.py::_ParseProducer.on_start`。
+        self._last_id: uuid.UUID = uuid.UUID(int=0)
         self._remaining_limit = self.limit
         self._exhausted = False
 

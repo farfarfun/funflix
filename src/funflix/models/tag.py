@@ -9,13 +9,14 @@
 
 from __future__ import annotations
 
+import uuid
 from enum import StrEnum
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from funflix.base.enums import enum_col
-from funflix.models.base import Base, PkType, TimestampMixin, UTCDateTime, utcnow
+from funflix.models.base import Base, PkType, TimestampMixin, UTCDateTime, utcnow, uuid7
 
 
 class TagKind(StrEnum):
@@ -31,7 +32,7 @@ class TagKind(StrEnum):
 class Tag(TimestampMixin, Base):
     __tablename__ = "tag"
 
-    id: Mapped[int] = mapped_column(PkType, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
     kind: Mapped[TagKind] = mapped_column(enum_col(TagKind), nullable=False, default=TagKind.OTHER)
     #: 展示名
     name: Mapped[str] = mapped_column(sa.String(64), nullable=False)

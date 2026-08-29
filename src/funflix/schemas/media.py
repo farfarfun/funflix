@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -14,7 +15,7 @@ from funflix.models.tag import TagKind
 class TagOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: uuid.UUID
     kind: TagKind
     name: str
 
@@ -28,7 +29,7 @@ class ResourceOut(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: uuid.UUID
     provider: Provider
     url: str
     passcode: str | None
@@ -48,7 +49,7 @@ class MediaSummary(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: uuid.UUID
     title: str
     original_title: str | None
     media_type: MediaType

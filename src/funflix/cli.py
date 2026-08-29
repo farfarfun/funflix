@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -565,7 +566,7 @@ def db_info() -> None:
 # --- source ------------------------------------------------------------------
 
 
-async def _require_source(session, source_id: int):
+async def _require_source(session, source_id: uuid.UUID):
     from funflix.models import Source
 
     source = await session.get(Source, source_id)
@@ -593,7 +594,7 @@ def source_add(
         _fail(f"无法识别采集源: {url}\n当前支持：{[s.value for s in supported_source_types()]}")
     source_type, identifier = detected
 
-    async def _do() -> tuple[int, bool]:
+    async def _do() -> tuple[uuid.UUID, bool]:
         async with session_scope() as session:
             existing = await session.scalar(
                 select(Source).where(
@@ -654,7 +655,7 @@ def source_list() -> None:
 
 
 @source_app.command("show")
-def source_show(source_id: int) -> None:
+def source_show(source_id: uuid.UUID) -> None:
     """查看采集源详情。"""
     from funflix.base.db import session_scope
 
@@ -685,7 +686,7 @@ def source_show(source_id: int) -> None:
 
 @source_app.command("set")
 def source_set(
-    source_id: int,
+    source_id: uuid.UUID,
     interval: Annotated[int | None, typer.Option(help="采集间隔（秒）")] = None,
     max_pages: Annotated[int | None, typer.Option(help="单次翻页上限（追新方向）")] = None,
     cursor: Annotated[str | None, typer.Option(help="回拨水位即可重采历史")] = None,
@@ -716,7 +717,7 @@ def source_set(
 
 @source_app.command("reset-cursor")
 def source_reset_cursor(
-    source_id: Annotated[int | None, typer.Argument(help="留空则重置全部采集源")] = None,
+    source_id: Annotated[uuid.UUID | None, typer.Argument(help="留空则重置全部采集源")] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
 ) -> None:
     """只归零采集水位，已采集的原始文本原样保留。
@@ -751,18 +752,18 @@ def source_reset_cursor(
 
 
 @source_app.command("enable")
-def source_enable(source_id: int) -> None:
+def source_enable(source_id: uuid.UUID) -> None:
     """启用采集源。"""
     _toggle_source(source_id, True)
 
 
 @source_app.command("disable")
-def source_disable(source_id: int) -> None:
+def source_disable(source_id: uuid.UUID) -> None:
     """停用采集源。"""
     _toggle_source(source_id, False)
 
 
-def _toggle_source(source_id: int, value: bool) -> None:
+def _toggle_source(source_id: uuid.UUID, value: bool) -> None:
     from funflix.base.db import session_scope
 
     async def _do() -> None:
@@ -777,7 +778,7 @@ def _toggle_source(source_id: int, value: bool) -> None:
 
 @source_app.command("remove")
 def source_remove(
-    source_id: int,
+    source_id: uuid.UUID,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
 ) -> None:
     """删除采集源。已采集的原始文本会保留。"""
@@ -808,7 +809,7 @@ def source_types() -> None:
 
 @source_app.command("collect")
 def source_collect(
-    source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
+    source_id: Annotated[uuid.UUID | None, typer.Argument(help="留空则采集全部启用的源")] = None,
 ) -> None:
     """立即采集一次。"""
     collect(source_id)
@@ -816,7 +817,7 @@ def source_collect(
 
 @app.command("collect")
 def collect(
-    source_id: Annotated[int | None, typer.Argument(help="留空则采集全部启用的源")] = None,
+    source_id: Annotated[uuid.UUID | None, typer.Argument(help="留空则采集全部启用的源")] = None,
     batch_size: Annotated[int, typer.Option(help="内部每批拉取多少个源")] = 500,
     write_batch: Annotated[int, typer.Option(help="消费者每攒够几条落库结果批量提交一次")] = 100,
     flush_interval: Annotated[
@@ -930,7 +931,7 @@ def parse(
             help="处理单元并发线程数（并发跑 extract()，不碰数据库），默认取 max(8, CPU 核数)"
         ),
     ] = max(8, os.cpu_count() or 1),
-    doc_id: Annotated[int | None, typer.Option(help="只解析指定文档")] = None,
+    doc_id: Annotated[uuid.UUID | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
 ) -> None:
     """抽取：把原始文本解析成作品与资源。
@@ -1048,7 +1049,7 @@ def verify(
         int,
         typer.Option(help="处理单元并发线程数（并发探测，不碰数据库），默认取 max(8, CPU 核数)"),
     ] = max(8, os.cpu_count() or 1),
-    resource_id: Annotated[int | None, typer.Option(help="只校验指定资源")] = None,
+    resource_id: Annotated[uuid.UUID | None, typer.Option(help="只校验指定资源")] = None,
     rate: Annotated[float, typer.Option(help="每个网盘每秒最多几次请求")] = 5.0,
     recheck_all: Annotated[
         bool, typer.Option("--recheck-all", help="忽略复查时间，重校验全部可校验资源")
@@ -1256,7 +1257,7 @@ def search(
 
 
 @app.command("doc")
-def show_doc(doc_id: int) -> None:
+def show_doc(doc_id: uuid.UUID) -> None:
     """查看一条原始文本及其解析状态。"""
     from funflix.base.db import session_scope
     from funflix.models import RawDocument

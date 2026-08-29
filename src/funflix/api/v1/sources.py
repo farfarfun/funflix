@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
@@ -115,7 +117,7 @@ async def list_sources(
     )
 
 
-async def _get_or_404(session: SessionDep, source_id: int) -> Source:
+async def _get_or_404(session: SessionDep, source_id: uuid.UUID) -> Source:
     source = await session.get(Source, source_id)
     if source is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="采集源不存在")
@@ -123,13 +125,13 @@ async def _get_or_404(session: SessionDep, source_id: int) -> Source:
 
 
 @router.get("/{source_id}", response_model=SourceOut)
-async def get_source(source_id: int, session: SessionDep) -> SourceOut:
+async def get_source(source_id: uuid.UUID, session: SessionDep) -> SourceOut:
     return SourceOut.model_validate(await _get_or_404(session, source_id))
 
 
 @router.patch("/{source_id}", response_model=SourceOut)
 async def update_source(
-    source_id: int, payload: SourceUpdate, session: SessionDep, _: AdminDep
+    source_id: uuid.UUID, payload: SourceUpdate, session: SessionDep, _: AdminDep
 ) -> SourceOut:
     """修改采集源。把 `cursor_message_id` 回拨即可重采历史。"""
     source = await _get_or_404(session, source_id)
@@ -141,7 +143,7 @@ async def update_source(
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_source(source_id: int, session: SessionDep, _: AdminDep) -> None:
+async def delete_source(source_id: uuid.UUID, session: SessionDep, _: AdminDep) -> None:
     """删除采集源。已采集的原始文本会保留（source_id 置空）。"""
     source = await _get_or_404(session, source_id)
     await session.delete(source)
@@ -149,7 +151,9 @@ async def delete_source(source_id: int, session: SessionDep, _: AdminDep) -> Non
 
 
 @router.post("/{source_id}/collect", response_model=CollectReportOut)
-async def trigger_collect(source_id: int, session: SessionDep, _: AdminDep) -> CollectReportOut:
+async def trigger_collect(
+    source_id: uuid.UUID, session: SessionDep, _: AdminDep
+) -> CollectReportOut:
     """立即采集一次（同步执行，便于接入时观察结果）。"""
     source = await _get_or_404(session, source_id)
     report = await collect_source(session, source)

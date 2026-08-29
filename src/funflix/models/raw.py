@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -9,7 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from funflix.base.enums import ParseStatus, SourceType, enum_col
-from funflix.models.base import Base, JsonType, PkType, TimestampMixin, UTCDateTime
+from funflix.models.base import Base, JsonType, PkType, TimestampMixin, UTCDateTime, uuid7
 
 if TYPE_CHECKING:
     from funflix.models.extraction import Extraction
@@ -25,7 +26,7 @@ class RawDocument(TimestampMixin, Base):
 
     __tablename__ = "raw_document"
 
-    id: Mapped[int] = mapped_column(PkType, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
 
     content: Mapped[str] = mapped_column(sa.Text, nullable=False)
     #: sha256(规范化后的 content)。入口去重锚点，挡住重复提交带来的 LLM 开销。
@@ -33,7 +34,7 @@ class RawDocument(TimestampMixin, Base):
 
     # --- 来源 ---
     #: 采集源。手工提交的文档没有 source，故可空。
-    source_id: Mapped[int | None] = mapped_column(
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
         PkType, sa.ForeignKey("source.id", ondelete="SET NULL")
     )
     source_type: Mapped[SourceType] = mapped_column(

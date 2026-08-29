@@ -183,7 +183,9 @@ class TestGetMedia:
         assert body["tags"] == []
 
     async def test_404_for_missing(self, client, seeded) -> None:
-        assert (await client.get("/api/v1/media/99999")).status_code == 404
+        assert (
+            await client.get("/api/v1/media/00000000-0000-0000-0000-000000000000")
+        ).status_code == 404
 
     async def test_resources_are_capped(self, client, session, seeded, monkeypatch) -> None:
         """热门剧集会被很多频道反复分享，关联只增不删，全量返回能到几 MB。"""
@@ -254,7 +256,9 @@ class TestListResources:
         assert body["total"] == 0
 
     async def test_404_for_missing(self, admin_client, seeded) -> None:
-        assert (await admin_client.get("/api/v1/resources/99999")).status_code == 404
+        assert (
+            await admin_client.get("/api/v1/resources/00000000-0000-0000-0000-000000000000")
+        ).status_code == 404
 
     async def test_single_lookup_requires_key(self, client, seeded) -> None:
         """issue #2：id 是自增整数，单条不上锁等于列表那把锁白加。"""

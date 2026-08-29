@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterable
 
 from sqlalchemy import case, func, select, update
@@ -20,7 +21,7 @@ from funflix.base.enums import CheckStatus
 from funflix.models import Media, Resource, media_resource
 
 
-async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[int]) -> int:
+async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[uuid.UUID]) -> int:
     """按关联表重算这些作品的资源计数。返回被更新的作品数。"""
     ids = {i for i in media_ids if i is not None}
     if not ids:
@@ -63,7 +64,7 @@ async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[int]
     return len(ids)
 
 
-async def refresh_for_resource(session: AsyncSession, resource_id: int) -> int:
+async def refresh_for_resource(session: AsyncSession, resource_id: uuid.UUID) -> int:
     """重算与某条资源相关联的全部作品的计数。
 
     校验结果变化后用 —— 一条链接可能属于多部作品（合集），

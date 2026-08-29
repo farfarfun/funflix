@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import os
+import time
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -57,8 +60,34 @@ class UTCDateTime(sa.types.TypeDecorator):
         return value.astimezone(UTC)
 
 
-#: 自增主键。SQLite 只有 INTEGER PRIMARY KEY 才是 rowid 别名并自增，BIGINT 不行。
-PkType = sa.BigInteger().with_variant(sa.Integer(), "sqlite")
+def uuid7() -> uuid.UUID:
+    """客户端生成的时间排序主键（RFC 9562 UUIDv7）：48 位毫秒时间戳前缀 + 74 位
+    随机数。字典序等于生成顺序，全局唯一且多机并发生成不会冲突——这是本地库
+    拉取/推送同步方案的前提（自增整数主键在多机各自写入时必然撞号）。
+
+    标准库要到 3.14 才有 `uuid.uuid7()`，项目要求 `>=3.12`，这里自己实现。
+    时间前缀是为了保留现有代码依赖的"id 与入库先后同序"语义——
+    `api/v1/resources.py` 等列表接口靠 `order_by(id.desc())` 做"最新优先"排序，
+    换成纯随机的 UUIDv4 会打乱这个顺序。
+    """
+    ts_ms = time.time_ns() // 1_000_000
+    rand = int.from_bytes(os.urandom(10), "big")
+    rand_a = (rand >> 62) & 0xFFF
+    rand_b = rand & 0x3FFFFFFFFFFFFFFF
+    value = (
+        ((ts_ms & 0xFFFFFFFFFFFF) << 80)
+        | (0x7 << 76)
+        | (rand_a << 64)
+        | (0b10 << 62)
+        | rand_b
+    )
+    return uuid.UUID(int=value)
+
+
+#: 主键。PostgreSQL 上是原生 uuid 列，SQLite 上退化成 CHAR(32) 存十六进制
+#: （`sa.Uuid` 是 SQLAlchemy 2.0 内置的跨方言类型）。客户端生成（见 `uuid7`），
+#: 不依赖数据库分配——多机各自写入互不冲突，也省掉 INSERT...RETURNING 往返。
+PkType = sa.Uuid(as_uuid=True)
 
 #: JSON 列。PostgreSQL 上自动升级为 JSONB（可索引、可查询）。
 JsonType = sa.JSON().with_variant(JSONB(), "postgresql")

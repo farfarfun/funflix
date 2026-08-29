@@ -13,19 +13,20 @@ resource 的生命周期有任何耦合——哪怕是可空外键。身份与�
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from funflix.base.enums import CheckStatus, Provider, enum_col
-from funflix.models.base import Base, PkType, UTCDateTime, utcnow
+from funflix.models.base import Base, PkType, UTCDateTime, utcnow, uuid7
 
 
 class LinkCheck(Base):
     __tablename__ = "link_check"
 
-    id: Mapped[int] = mapped_column(PkType, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
     #: 链接身份，见 resource.py 里 (provider, share_id) 是全局去重锚点、而不是 url
     #: 字符串的说明。这两列而不是外键才是这张表跟 resource 之间唯一的关联方式。
     provider: Mapped[Provider] = mapped_column(enum_col(Provider), nullable=False)

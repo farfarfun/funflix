@@ -104,9 +104,11 @@ class TestRunVerifyPipeline:
         self, db_url, monkeypatch
     ) -> None:
         monkeypatch.setattr(cr, "get_probe", fake_get_probe)
+        resources = [make_resource(n) for n in range(1, 7)]
         async with open_session(db_url) as session:
-            session.add_all([make_resource(n) for n in range(1, 7)])
+            session.add_all(resources)
             await session.commit()
+        resource_ids = {r.id for r in resources}
 
         reports = cr.run_verify_pipeline(
             settings=Settings(database_url=db_url),
@@ -117,7 +119,7 @@ class TestRunVerifyPipeline:
         )
 
         assert len(reports) == 6
-        assert {r.resource_id for r in reports} == set(range(1, 7))
+        assert {r.resource_id for r in reports} == resource_ids
         async with open_session(db_url) as session:
             rows = list(await session.scalars(select(Resource)))
             assert all(r.check_attempts == 1 for r in rows), "重复校验了同一条资源"
@@ -128,9 +130,11 @@ class TestRunVerifyPipeline:
     ) -> None:
         """处理单元线程里探针抛异常不能让流水线崩掉——兜底成 ERROR 结论传给消费者。"""
         monkeypatch.setattr(cr, "get_probe", fake_get_probe)
+        resource = make_resource(1, share_id="boom001")
         async with open_session(db_url) as session:
-            session.add(make_resource(1, share_id="boom001"))
+            session.add(resource)
             await session.commit()
+        resource_id = resource.id
 
         reports = cr.run_verify_pipeline(
             settings=Settings(database_url=db_url), concurrency=1, rate=0.0
@@ -139,7 +143,7 @@ class TestRunVerifyPipeline:
         assert len(reports) == 1
         assert reports[0].status is CheckStatus.ERROR
         async with open_session(db_url) as session:
-            resource = await session.get(Resource, 1)
+            resource = await session.get(Resource, resource_id)
             assert resource.check_status is CheckStatus.ERROR
             assert resource.next_check_at is not None, "ERROR 要退避重试，不是永久停手"
 
@@ -193,8 +197,9 @@ class TestRunVerifyPipeline:
         self, db_url, monkeypatch
     ) -> None:
         monkeypatch.setattr(cr, "get_probe", fake_get_probe)
+        pending_resource = make_resource(2)
+        now = utcnow()
         async with open_session(db_url) as session:
-            now = utcnow()
             session.add(
                 make_resource(
                     1,
@@ -203,7 +208,7 @@ class TestRunVerifyPipeline:
                     next_check_at=now + __import__("datetime").timedelta(days=7),
                 )
             )
-            session.add(make_resource(2))
+            session.add(pending_resource)
             await session.commit()
 
         reports = cr.run_verify_pipeline(
@@ -211,7 +216,7 @@ class TestRunVerifyPipeline:
         )
 
         assert len(reports) == 1
-        assert reports[0].resource_id == 2
+        assert reports[0].resource_id == pending_resource.id
 
 
 class TestPipelinePending:

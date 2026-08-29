@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
@@ -120,7 +122,7 @@ async def list_raw_documents(
 
 
 @router.get("/{doc_id}", response_model=RawDocumentOut)
-async def get_raw_document(doc_id: int, session: SessionDep) -> RawDocumentOut:
+async def get_raw_document(doc_id: uuid.UUID, session: SessionDep) -> RawDocumentOut:
     doc = await session.get(RawDocument, doc_id)
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始文本不存在")

@@ -205,21 +205,19 @@ class TestClaimDocuments:
     @pytest.mark.asyncio
     async def test_gives_up_after_max_attempts(self, session) -> None:
         """反复让 worker 崩溃的文档必须被放弃，否则它会一直把队列堵死。"""
-        session.add(
-            make_doc(
-                1,
-                parse_status=ParseStatus.RUNNING,
-                lease_until=utcnow() - timedelta(minutes=1),
-                parse_attempts=MAX_PARSE_ATTEMPTS - 1,
-            )
+        doc = make_doc(
+            1,
+            parse_status=ParseStatus.RUNNING,
+            lease_until=utcnow() - timedelta(minutes=1),
+            parse_attempts=MAX_PARSE_ATTEMPTS - 1,
         )
+        session.add(doc)
         await session.commit()
 
         claimed = await claim_documents(session, limit=10)
 
         assert len(claimed) == 0
         assert claimed.abandoned == 1
-        doc = await session.get(RawDocument, 1)
         await session.refresh(doc)
         assert doc.parse_status is ParseStatus.FAILED
         assert doc.lease_until is None
@@ -355,14 +353,14 @@ class TestClaimSources:
 class TestParseBatch:
     @pytest.mark.asyncio
     async def test_parses_and_releases_lease(self, session) -> None:
-        session.add(make_doc(1))
+        doc = make_doc(1)
+        session.add(doc)
         await session.commit()
 
         report = await run_parse_batch(session, limit=10, extractor="rule")
 
         assert report.claimed == 1
         assert report.succeeded == 1
-        doc = await session.get(RawDocument, 1)
         await session.refresh(doc)
         assert doc.lease_until is None, "租约没归还，这条会空转一整个租约周期"
         assert doc.parse_status is not ParseStatus.RUNNING
@@ -675,17 +673,20 @@ class TestVerifyBatch:
     async def test_verifies_and_releases_lease(self, session, monkeypatch) -> None:
         probe = StubProbe(CheckStatus.VALID)
         monkeypatch.setattr("funflix.worker.tasks.get_probe", lambda _p: probe)
-        session.add(make_resource(1))
+        resource = make_resource(1)
+        session.add(resource)
         await session.commit()
 
         report = await run_verify_batch(session, limit=10)
 
         assert report.succeeded == 1
-        resource = await session.get(Resource, 1)
         await session.refresh(resource)
         assert resource.check_status is CheckStatus.VALID
         assert resource.lease_until is None
-        assert await session.get(LinkCheck, 1) is not None
+        link_check = (
+            await session.execute(select(LinkCheck).where(LinkCheck.share_id == resource.share_id))
+        ).scalar_one_or_none()
+        assert link_check is not None
 
     @pytest.mark.asyncio
     async def test_consecutive_invalid_stops_rechecking(self, session, monkeypatch) -> None:
@@ -698,11 +699,11 @@ class TestVerifyBatch:
         monkeypatch.setattr(
             "funflix.worker.tasks.get_probe", lambda _p: StubProbe(CheckStatus.INVALID)
         )
-        session.add(make_resource(1))
+        resource = make_resource(1)
+        session.add(resource)
         await session.commit()
 
         await run_verify_batch(session, limit=10)
-        resource = await session.get(Resource, 1)
         await session.refresh(resource)
         assert resource.check_status is CheckStatus.INVALID
         assert resource.next_check_at is not None, "第一次失效应该再确认一次"

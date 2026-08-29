@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -14,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from funflix.base.enums import SourceType, enum_col
-from funflix.models.base import Base, JsonType, PkType, TimestampMixin, UTCDateTime
+from funflix.models.base import Base, JsonType, PkType, TimestampMixin, UTCDateTime, uuid7
 
 if TYPE_CHECKING:
     from funflix.models.raw import RawDocument
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 class Source(TimestampMixin, Base):
     __tablename__ = "source"
 
-    id: Mapped[int] = mapped_column(PkType, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
 
     source_type: Mapped[SourceType] = mapped_column(enum_col(SourceType), nullable=False)
     #: 采集源地址，如 https://t.me/s/Quark_Movies

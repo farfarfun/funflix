@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -28,7 +29,7 @@ class RawDocumentCreate(BaseModel):
     """提交一条原始分享文本。"""
 
     content: str = Field(min_length=1, description="原始文本全文，原样提交，不要预处理")
-    source_id: int | None = Field(default=None, description="采集源 ID；手工提交可不填")
+    source_id: uuid.UUID | None = Field(default=None, description="采集源 ID；手工提交可不填")
     source_type: SourceType = SourceType.UNKNOWN
     source_name: str | None = Field(default=None, max_length=128, description="频道名 / 站点名")
     source_url: str | None = Field(default=None, max_length=1024, description="原帖链接")
@@ -44,7 +45,7 @@ class RawDocumentBatchCreate(BaseModel):
 class IngestResult(BaseModel):
     """摄入结果。`duplicated=True` 表示命中 content_hash，返回的是已存在的记录。"""
 
-    id: int
+    id: uuid.UUID
     content_hash: str
     duplicated: bool
     parse_status: ParseStatus
@@ -60,7 +61,7 @@ class BatchIngestResult(BaseModel):
 class RawDocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: uuid.UUID
     content: str
     content_hash: str
     source_type: SourceType
@@ -82,7 +83,7 @@ class RawDocumentSummary(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: uuid.UUID
     content_hash: str
     source_type: SourceType
     source_name: str | None

@@ -65,7 +65,9 @@ class TestQueryRawDocument:
         assert resp.json()["content"] == "剧名A\n链接x"
 
     async def test_get_missing_returns_404(self, client) -> None:
-        assert (await client.get("/api/v1/raw/999999")).status_code == 404
+        assert (
+            await client.get("/api/v1/raw/00000000-0000-0000-0000-000000000000")
+        ).status_code == 404
 
     async def test_list_filters_by_status(self, client) -> None:
         await client.post("/api/v1/raw", json={"content": "剧名A"})

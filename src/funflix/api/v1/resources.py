@@ -8,13 +8,14 @@
 `/media` 与 `/media/{id}`，保持开放。
 
 > ⚠️ 这道锁防的是**成批导出的便利**，不是保密。链接本身来自公开频道，
-> 而且 `/media/{id}` 无凭据就会返回同一份 url 与 passcode，media id 同样
-> 是自增整数 —— 顺序枚举 `/media/{id}` 依然能把全库链接抓走。
-> 真要挡住枚举得靠限流，目前没有（见 docs/TODO.md）。
+> 而且 `/media/{id}` 无凭据就会返回同一份 url 与 passcode ——
+> `/resources` 这层锁挡不住已经拿到某个具体 media id 的人。
 > 把这里当成机密边界会得到虚假的安全感。
 """
 
 from __future__ import annotations
+
+import uuid
 
 from fastapi import APIRouter
 from sqlalchemy import func, select
@@ -66,11 +67,11 @@ async def list_resources(
 
 
 @router.get("/{resource_id}", response_model=ResourceOut)
-async def get_resource(resource_id: int, session: SessionDep, _: AdminDep) -> ResourceOut:
+async def get_resource(resource_id: uuid.UUID, session: SessionDep, _: AdminDep) -> ResourceOut:
     """单条资源详情。与列表接口同样要 key。
 
-    这里曾经是开放的，理由写的是「知道 id 才查得到」—— 那个推理是错的：
-    id 是自增整数，`seq 1 100000` 就能把列表接口上的锁绕过去（issue #2）。
+    这里曾经是开放的，理由写的是「知道 id 才查得到」—— 那个推理在 id 还是
+    自增整数时是错的：`seq 1 100000` 就能把列表接口上的锁绕过去（issue #2）。
     """
     return ResourceOut.model_validate(
         await get_or_404(session, Resource, resource_id, "资源不存在")

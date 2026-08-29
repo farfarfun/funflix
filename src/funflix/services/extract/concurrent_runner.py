@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -119,7 +120,8 @@ class _ParseProducer(BaseProducer):
         self._extractor_cache: dict[str, Extractor] = {}
         self._buffer: list[dict[str, Any]] = []
         self._last_ts: Any = None
-        self._last_id = 0
+        # 全零 UUID 当"比任何真实 UUIDv7 都小"的哨兵，跟旧版用 0 当起始整数游标同理。
+        self._last_id: uuid.UUID = uuid.UUID(int=0)
         self._remaining_limit = self.limit
         self._exhausted = False
 
@@ -288,9 +290,9 @@ class _ParseConsumer(BaseBatchConsumer):
                 )
                 docs_by_id = {d.id: d for d in rows}
 
-                outcomes: dict[int, Any] = {}
-                cached_doc_ids: set[int] = set()
-                extraction_errors: dict[int, str] = {}
+                outcomes: dict[uuid.UUID, Any] = {}
+                cached_doc_ids: set[uuid.UUID] = set()
+                extraction_errors: dict[uuid.UUID, str] = {}
                 by_extractor: dict[str, list[RawDocument]] = {}
 
                 for it in items:

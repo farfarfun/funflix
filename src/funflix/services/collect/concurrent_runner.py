@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -181,14 +182,14 @@ class _OpaqueResult:
 class _TelegramPageJob:
     """Telegram 补历史的一页——`before` 游标已经在生产者阶段算好。"""
 
-    source_id: int
+    source_id: uuid.UUID
     identifier: str
     before: int
 
 
 @dataclass(slots=True)
 class _PageResult:
-    source_id: int
+    source_id: uuid.UUID
     messages: list[CollectedMessage]
 
 
@@ -323,7 +324,7 @@ class _CollectProducer(BaseProducer):
         output_queue: Any,
         *,
         settings: Settings,
-        source_id: int | None,
+        source_id: uuid.UUID | None,
         batch_size: int,
         limit: int | None = None,
         name: str | None = None,
@@ -341,7 +342,9 @@ class _CollectProducer(BaseProducer):
             self._engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
         )
         self._buffer: list[Any] = []
-        self._last_id = 0
+        # 全零 UUID 当"比任何真实 UUIDv7 都小"的哨兵，理由同
+        # `services/extract/concurrent_runner.py::_ParseProducer.on_start`。
+        self._last_id: uuid.UUID = uuid.UUID(int=0)
         self._exhausted = False
         self._single_done = False
 
@@ -541,8 +544,8 @@ class _CollectConsumer(BaseBatchConsumer):
 
         # 同一批里同源的翻页结果先在内存里合并，落库时一个源只查一次去重键、
         # 只推进一次水位——而不是每页各查各的。
-        page_messages: dict[int, list[CollectedMessage]] = {}
-        page_counts: dict[int, int] = {}
+        page_messages: dict[uuid.UUID, list[CollectedMessage]] = {}
+        page_counts: dict[uuid.UUID, int] = {}
         opaque_items: list[_OpaqueResult] = []
         for item in items:
             if isinstance(item, _PageResult):
@@ -667,7 +670,7 @@ _DEFAULT_LIMIT = 2000
 
 def run_collect_pipeline(
     *,
-    source_id: int | None = None,
+    source_id: uuid.UUID | None = None,
     batch_size: int = 500,
     write_batch: int = 100,
     flush_interval: float = 10.0,

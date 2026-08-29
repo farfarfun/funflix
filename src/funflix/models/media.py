@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from funflix.base.enums import MediaType, enum_col
 from funflix.models.association import media_resource
-from funflix.models.base import Base, JsonType, PkType, TimestampMixin
+from funflix.models.base import Base, JsonType, PkType, TimestampMixin, uuid7
 from funflix.models.tag import Tag, media_tag
 
 if TYPE_CHECKING:
@@ -24,7 +25,7 @@ UNKNOWN_YEAR = 0
 class Media(TimestampMixin, Base):
     __tablename__ = "media"
 
-    id: Mapped[int] = mapped_column(PkType, primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
 
     #: 展示用主标题（取首次见到的清洗后标题）
     title: Mapped[str] = mapped_column(sa.String(500), nullable=False)

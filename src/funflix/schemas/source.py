@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -38,7 +39,7 @@ class SourceUpdate(BaseModel):
 class SourceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: uuid.UUID
     source_type: SourceType
     url: str
     identifier: str
@@ -61,7 +62,7 @@ class SourceOut(BaseModel):
 class CollectReportOut(BaseModel):
     """一次采集的结果。"""
 
-    source_id: int
+    source_id: uuid.UUID
     ok: bool
     fetched: int = Field(description="本轮拉到的水位之后的消息数")
     created: int = Field(description="新落库的原始文本数")
