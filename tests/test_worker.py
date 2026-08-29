@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from funflix.base.backoff import BASE_BACKOFF, MAX_BACKOFF, backoff
 from funflix.base.config import Settings
 from funflix.base.enums import CheckStatus, ParseStatus, Provider, Quality, SourceType
-from funflix.models import Base, LinkCheck, Media, RawDocument, Resource, Source, utcnow
+from funflix.models import Base, LinkCheck, Media, RawDocument, Resource, Source, Tag, utcnow
 from funflix.services.extract.runner import (
     MAX_PARSE_ATTEMPTS,
     SAVEPOINT_BATCH_SIZE,
@@ -566,6 +566,58 @@ class TestRunnerParseBatch:
         assert report_c.ok is False and "同批" in (report_c.error or "")
         assert doc_c.parse_attempts == 0
         assert doc_c.parse_status == ParseStatus.PENDING
+
+    @pytest.mark.asyncio
+    async def test_chunk_rollback_does_not_poison_shared_cache_for_next_chunk(
+        self, session, monkeypatch
+    ) -> None:
+        """`persist_extracted` 整批共用一个 `BatchCache`，跨好几个 SAVEPOINT
+        分片（chunk）复用。某个 chunk 因异常整体回滚时，它在这个 chunk 期间
+        新建、写进缓存的 Tag 不能被下一个 chunk 继续复用——那个对象已经随
+        SAVEPOINT 回滚失效，`media_count` 会读出 `None`，下一个 chunk 里
+        `tag.media_count += 1` 就会炸 `TypeError`。"""
+        from funflix.services.extract import runner as runner_module
+        from funflix.services.extract.rule import RuleExtractor
+
+        n = SAVEPOINT_BATCH_SIZE + 1
+        docs = [
+            make_doc(
+                i,
+                content=(
+                    f"名称：测试剧集{i}\n标签：#悬疑\n链接：https://pan.quark.cn/s/fake{i:06d}"
+                ),
+            )
+            for i in range(1, n + 1)
+        ]
+        session.add_all(docs)
+        await session.commit()
+
+        real_phase1 = runner_module._persist_phase1
+        # 第一个 chunk 里，排在这条后面的文档才会撞——保证前面已经有别的
+        # 文档把「悬疑」标签建进了共享缓存。
+        boom_doc_id = docs[5].id
+
+        async def _boom_once(session, doc, outcome, report, cache=None):
+            if doc.id == boom_doc_id:
+                raise RuntimeError("boom")
+            return await real_phase1(session, doc, outcome, report, cache)
+
+        monkeypatch.setattr(runner_module, "_persist_phase1", _boom_once)
+
+        reports = await parse_batch(session, docs, RuleExtractor())
+        await session.commit()
+
+        # 第一个 chunk 全体回滚重试（不计入失败次数），只有引发异常的那条计次；
+        # 第二个 chunk（跨过 SAVEPOINT_BATCH_SIZE 边界）应该正常落库，不该被
+        # 第一个 chunk 留下的坏缓存条目带崩。
+        boom_report = next(r for r in reports if r.document_id == boom_doc_id)
+        assert boom_report.ok is False
+        assert "boom" in (boom_report.error or "")
+
+        tags = list(await session.scalars(select(Tag).where(Tag.norm_key == "悬疑")))
+        assert len(tags) == 1, "同一个标签跨 chunk 只应该有一行，不该被回滚后的坏对象带出重复/异常"
+        assert tags[0].media_count is not None
+        assert tags[0].media_count >= 1
 
     @pytest.mark.asyncio
     async def test_refresh_media_counters_runs_once_for_the_whole_batch(

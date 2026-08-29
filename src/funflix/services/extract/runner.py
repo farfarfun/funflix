@@ -92,6 +92,38 @@ class BatchCache:
     media_tag_pairs: set[tuple[int, int]] = field(default_factory=set)
 
 
+def _snapshot_cache(cache: BatchCache) -> tuple:
+    """浅拷贝 `BatchCache` 各容器，供单个 chunk 失败时回滚用。
+
+    只拷贝容器本身（dict/list/set 的壳），不深拷贝里面的 ORM 对象——
+    对已经在 chunk 开始前就存在的对象，SAVEPOINT 回滚会由 SQLAlchemy
+    自己把它们过期掉，下次访问自动重新 SELECT，值总是对的；这里要防的
+    是"这个 chunk 里新建、又被这个 chunk 的回滚撤销"的对象继续赖在缓存里
+    被后面的 chunk 复用——那些对象的默认值（比如 `Tag.media_count=0`）
+    在回滚后就丢了，再复用会在 `+= 1` 时炸出 `None + int`。
+    """
+    return (
+        dict(cache.media_by_key),
+        {key: list(value) for key, value in cache.media_by_relaxed.items()},
+        dict(cache.resource_by_key),
+        dict(cache.tag_by_key),
+        set(cache.media_resource_pairs),
+        set(cache.media_tag_pairs),
+    )
+
+
+def _restore_cache(cache: BatchCache, snapshot: tuple) -> None:
+    """把 `cache` 的容器换回 `_snapshot_cache` 之前的状态。"""
+    (
+        cache.media_by_key,
+        cache.media_by_relaxed,
+        cache.resource_by_key,
+        cache.tag_by_key,
+        cache.media_resource_pairs,
+        cache.media_tag_pairs,
+    ) = snapshot
+
+
 def keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: int) -> Any:
     """`ORDER BY ts_col.nulls_first(), id_col` 场景下的翻页游标条件。
 
@@ -743,6 +775,7 @@ async def _persist_chunk(
     阶段二全组的关联行攒成一批 INSERT，往返次数固定不随组内文档数增长。
     """
     failed_doc_id: int | None = None
+    cache_snapshot = _snapshot_cache(cache) if cache is not None else None
     try:
         async with session.begin_nested():
             states: list[tuple[RawDocument, _PersistState]] = []
@@ -800,6 +833,10 @@ async def _persist_chunk(
 
     except IntegrityError:
         # 并发撞车不算"处理过"，同组全部回滚，留到下次自然重试。
+        # 缓存也要跟着回滚——这个 chunk 里新建、写进 cache 的对象已经随
+        # SAVEPOINT 一起失效，留着会被下一个 chunk 当"已存在"复用到坏对象。
+        if cache is not None and cache_snapshot is not None:
+            _restore_cache(cache, cache_snapshot)
         for doc in chunk:
             report = reports[doc.id]
             report.status = doc.parse_status
@@ -807,6 +844,12 @@ async def _persist_chunk(
         logger.info("解析撞车 docs=%s: 同批并发写入冲突，留待下次重试", [d.id for d in chunk])
 
     except Exception as exc:
+        # 同上：这个 chunk 的 SAVEPOINT 整体回滚了，缓存里这个 chunk 期间
+        # 新增/新建的条目也得跟着撤销，不然下一个 chunk 会复用到已经失效
+        # 的 ORM 对象（比如新建的 Tag，其 `media_count` 回滚后读出来是
+        # None，下一个 chunk 里 `+= 1` 直接抛 TypeError）。
+        if cache is not None and cache_snapshot is not None:
+            _restore_cache(cache, cache_snapshot)
         for doc in chunk:
             report = reports[doc.id]
             if doc.id == failed_doc_id:
