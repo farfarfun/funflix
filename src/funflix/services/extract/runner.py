@@ -371,6 +371,11 @@ async def _upsert_resource(
         next_check_at=now if checkable else None,
         first_seen_at=now,
         last_seen_at=now,
+        # 显式给 seen_count 赋初值——同一份分享在同一批里被多处转发时，
+        # 上面的 `existing.seen_count += 1` 会在这个刚建、还没 flush 的对象
+        # 上直接自增，列定义的 `default=1` 只在 flush 时才生效，flush 前
+        # Python 侧读到的是 None，会让 += 直接炸掉（同 Tag.media_count）。
+        seen_count=1,
     )
     session.add(resource)
     # 同 `_upsert_media`：不在这里单独 flush，攒到调用方一次性 flush。

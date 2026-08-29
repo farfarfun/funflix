@@ -445,6 +445,30 @@ class TestRunnerParseBatch:
         assert doc_b.parse_status == ParseStatus.DONE
 
     @pytest.mark.asyncio
+    async def test_two_docs_reposting_the_same_link_dedupe_within_the_batch(self, session) -> None:
+        """同批内两条文档转发同一个分享链接——第二条该复用第一条批内新建、
+        还没 flush 的 resource 并把 `seen_count` 累加，而不是在 `+= 1` 时
+        炸出 `None + int`（新建的 resource 没显式给 `seen_count` 赋初值，
+        flush 前 Python 侧读到的是 None）。
+        """
+        from funflix.services.extract.rule import RuleExtractor
+
+        doc_a = make_doc(1, content="名称：剧集A\n链接：https://pan.quark.cn/s/fakeshared")
+        doc_b = make_doc(2, content="名称：剧集B\n链接：https://pan.quark.cn/s/fakeshared")
+        session.add_all([doc_a, doc_b])
+        await session.commit()
+
+        reports = await parse_batch(session, [doc_a, doc_b], RuleExtractor())
+        await session.commit()
+
+        assert [r.ok for r in reports] == [True, True]
+        resource_rows = list(await session.scalars(select(Resource)))
+        assert len(resource_rows) == 1, "同一个分享在批内被建了不止一次"
+        assert resource_rows[0].seen_count == 2
+        assert doc_a.parse_status == ParseStatus.DONE
+        assert doc_b.parse_status == ParseStatus.DONE
+
+    @pytest.mark.asyncio
     async def test_matches_parse_document_for_independent_titles(self, session) -> None:
         """不同作品的一批文档，`parse_batch` 与逐条 `parse_document` 落库结果一致。"""
         from funflix.services.extract.rule import RuleExtractor
