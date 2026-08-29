@@ -13,7 +13,6 @@ from funflix.models.association import media_resource
 from funflix.models.base import Base, BigIntType, PkType, TimestampMixin, UTCDateTime
 
 if TYPE_CHECKING:
-    from funflix.models.check import LinkCheck
     from funflix.models.media import Media
     from funflix.models.raw import RawDocument
 
@@ -66,9 +65,9 @@ class Resource(TimestampMixin, Base):
         secondary=media_resource, back_populates="resources"
     )
     raw_document: Mapped[RawDocument | None] = relationship(back_populates="resources")
-    checks: Mapped[list[LinkCheck]] = relationship(
-        back_populates="resource", cascade="all, delete-orphan"
-    )
+    #: 校验历史（LinkCheck）跟这张表没有外键，也没有 ORM 关系——它完全独立存储，
+    #: 只认 (provider, share_id)，查历史时按这两列去 link_check 表里查，
+    #: 见 models/check.py 顶部说明与 services/maintenance.py 的 relink_checks。
 
     __table_args__ = (
         sa.UniqueConstraint("provider", "share_id", name="uq_resource_provider_share"),

@@ -98,6 +98,44 @@ def _blank_line_anchors(lines: list[tuple[int, str]]) -> list[_Anchor]:
     return anchors
 
 
+def _line_has_link(offset: int, line: str, links: list[ScannedLink]) -> bool:
+    end = offset + len(line)
+    return any(offset <= link.start < end for link in links)
+
+
+def _title_from_line(line: str) -> str:
+    m = _NUMBERED_ANCHOR_RE.match(line)
+    if m:
+        return strip_title_marker(m.group("title").strip())
+    return strip_title_marker(line.strip())
+
+
+def _adjacent_link_anchors(lines: list[tuple[int, str]], links: list[ScannedLink]) -> list[_Anchor]:
+    """标题另起一行、链接紧跟其后的排版 —— 没有编号/方括号/空行分隔。
+
+    真实语料里常见一条公告混排多种格式：一部分作品用 `【标题】` 独占行，
+    另一部分只是"标题行 + 紧接着的链接行"，中间连空行都没有。只认其中一种
+    格式会让另一种格式的整段内容找不到锚点、连着链接一起被丢进 unattributed。
+    """
+    anchors: list[_Anchor] = []
+    for index, (offset, line) in enumerate(lines):
+        text = line.strip()
+        if not text or _line_has_link(offset, line, links):
+            continue
+        # "夸克：" "年份：oMUsGC" "整理日期：xxx" 这类字段行是给同一个作品打元数据
+        # 标签的，不是标题 —— 真实标题基本不含裸冒号，用这点把两者分开，
+        # 否则会把同一部作品的多个元数据字段行拆成好几个假标题。
+        if ":" in text or "：" in text:
+            continue
+        for next_offset, next_line in lines[index + 1 :]:
+            if not next_line.strip():
+                continue
+            if _line_has_link(next_offset, next_line, links):
+                anchors.append(_Anchor(offset=offset, title=_title_from_line(line)))
+            break
+    return anchors
+
+
 def _build_segments(text: str, anchors: list[_Anchor], links: list[ScannedLink]) -> list[Segment]:
     """按锚点切段，并把链接按字符区间归属到所在段。"""
     segments: list[Segment] = []
@@ -130,7 +168,9 @@ def segment_text(text: str) -> SegmentedText:
     分段策略从强到弱依次尝试，第一个站得住的胜出：
 
     1. `名称：` 等强标记 —— 语义明确，出现一次就够。
-    2. `【标题】` 独占行。
+    2. `【标题】` 独占行 / 标题行紧跟链接行（无编号、无空行分隔）—— 合并成一组
+       一起尝试，因为真实语料常见一条公告里混排这两种排版，只认其中一种会让
+       另一种整段找不到锚点、连着链接一起被丢进 unattributed。
     3. `1. xxx` 编号行。
     4. 空行分隔的段落。
 
@@ -146,8 +186,13 @@ def segment_text(text: str) -> SegmentedText:
         segments = _build_segments(text, strong, links)
     else:
         segments = []
+        # 同一 offset 上两种模式都命中时，标题保留方括号内文本的干净版本
+        by_offset = {a.offset: a for a in _adjacent_link_anchors(lines, links)}
+        by_offset.update({a.offset: a for a in _find_anchors(lines, _HEADING_ANCHOR_RE)})
+        heading_like = sorted(by_offset.values(), key=lambda a: a.offset)
+
         for pattern_anchors in (
-            _find_anchors(lines, _HEADING_ANCHOR_RE),
+            heading_like,
             _find_anchors(lines, _NUMBERED_ANCHOR_RE),
             _blank_line_anchors(lines),
         ):

@@ -189,10 +189,14 @@ async def persist_check_outcome(
 
     now = utcnow()
     # 历史只追加，用于回答"这条链接什么时候挂的"以及
-    # "某网盘最近整体失效率是不是异常"——后者是判断探针本身挂了的关键信号
+    # "某网盘最近整体失效率是不是异常"——后者是判断探针本身挂了的关键信号。
+    # 不写 resource_id——LinkCheck 完全独立存储，只认 (provider, share_id)，
+    # 见 models/check.py 顶部说明。
     session.add(
         LinkCheck(
-            resource_id=resource.id,
+            provider=resource.provider,
+            share_id=resource.share_id,
+            url=resource.url,
             checked_at=now,
             status=outcome.status,
             http_code=outcome.http_code,

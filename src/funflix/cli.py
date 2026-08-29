@@ -421,26 +421,38 @@ def db_reset(
     keep_cursors: Annotated[
         bool, typer.Option("--keep-cursors", help="保留采集水位（清空原始文本时不要用）")
     ] = False,
+    purge_checks: Annotated[
+        bool, typer.Option("--purge-checks", help="连校验历史（link_check）一起清空，默认保留")
+    ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
 ) -> None:
     """清空数据表并重建。采集源配置保留。
 
     默认会把采集水位一起归零 —— 原始文本被清空后若水位还留着，
     采集器会认为"都采过了"，重建后一条都拉不回来。
+
+    校验历史（link_check）默认不清空——它按 (provider, share_id) 锚定身份，
+    不依赖 resource 行；重新解析出同样身份的资源后，用 `funflix db
+    relink-checks` 把历史接回来，不用重新探测一遍。真要连它一起清，加
+    `--purge-checks`。
     """
     from funflix.base.db import session_scope
     from funflix.services.maintenance import data_tables, reset_pipeline_data
 
-    tables = data_tables(keep_documents=keep_documents)
+    tables = data_tables(keep_documents=keep_documents, purge_checks=purge_checks)
     _warn(f"将清空：{', '.join(tables)}")
     _warn("采集源配置保留" + ("，水位保留" if keep_cursors or keep_documents else "，采集水位归零"))
+    _warn("校验历史清空" if purge_checks else "校验历史保留（可用 db relink-checks 重新接回）")
     if not yes and not typer.confirm("确认执行？此操作不可撤销"):
         raise typer.Abort()
 
     async def _do():
         async with session_scope() as session:
             return await reset_pipeline_data(
-                session, keep_documents=keep_documents, keep_cursors=keep_cursors
+                session,
+                keep_documents=keep_documents,
+                keep_cursors=keep_cursors,
+                purge_checks=purge_checks,
             )
 
     report = _run(_do)
@@ -448,6 +460,8 @@ def db_reset(
         [[t, report.before[t], report.after[t]] for t in report.before],
         ["表", "重建前", "重建后"],
     )
+    if keep_documents:
+        _dim(f"已把 {report.documents_requeued} 条原始文本的解析状态重置为待解析")
     _ok("重建完成")
 
 
@@ -512,6 +526,32 @@ def db_requeue(
         _ok(f"已重新排队 {count} 条资源")
     else:
         typer.echo("没有需要重新排队的资源")
+
+
+@db_app.command("relink-checks")
+def db_relink_checks(
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """用已有校验历史恢复重新解析后新建资源的校验状态。
+
+    典型顺序：`db reset --keep-documents` 清空重建 resource → 重新跑一遍
+    `parse` → 这条命令。`link_check` 跟 resource 没有外键，完全独立存储，
+    只按 (provider, share_id) 找回每条链接最新一条历史，把新 resource 的
+    check_status/last_checked_at/next_check_at 恢复回去，不用重新探测。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.maintenance import relink_checks
+
+    if not yes and not typer.confirm("将按 (provider, share_id) 恢复校验状态，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await relink_checks(session)
+
+    report = _run(_do)
+    _table([["恢复状态", report.hydrated]], ["项", "数量"])
+    _ok("校验状态恢复完成")
 
 
 @db_app.command("info")

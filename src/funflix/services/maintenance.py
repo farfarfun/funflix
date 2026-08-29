@@ -11,15 +11,27 @@ from dataclasses import dataclass, field
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus
-from funflix.models import Base, Resource, Source, Tag, TagKind, media_tag, utcnow
+from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus
+from funflix.models import (
+    Base,
+    LinkCheck,
+    RawDocument,
+    Resource,
+    Source,
+    Tag,
+    TagKind,
+    media_tag,
+    utcnow,
+)
 from funflix.services.text.normalize import classify_tag
+from funflix.services.verify.base import CheckOutcome
+from funflix.services.verify.runner import _next_check_at
 
 #: 重建时保留的表。采集源是**配置**，不是采集回来的数据。
 PRESERVED_TABLES = frozenset({"source", "alembic_version"})
 
 
-def data_tables(keep_documents: bool = False) -> list[str]:
+def data_tables(keep_documents: bool = False, purge_checks: bool = False) -> list[str]:
     """列出重建时要清空的表，按外键依赖倒序（先删子表）。
 
     从 ORM 元数据推导，不手工维护清单。曾经这里是一个写死的六元组，
@@ -29,12 +41,19 @@ def data_tables(keep_documents: bool = False) -> list[str]:
 
     表是数据库结构的一部分，让结构自己说清楚有哪些表，比让人记得同步一份
     副本可靠得多。
+
+    `link_check` 默认也排除在外：它跟 `resource` 没有外键，完全独立存储，只按
+    (provider, share_id) 锚定身份（见 models/check.py），`resource` 被清空重建
+    不会碰到它。校验历史是全库成本最高的数据（每条都要真实探测网盘接口），
+    默认不跟着 resource 陪葬；真要连它一起清（比如联调建库），传 `purge_checks=True`。
     """
     names = []
     for table in reversed(Base.metadata.sorted_tables):
         if table.name in PRESERVED_TABLES:
             continue
         if keep_documents and table.name == "raw_document":
+            continue
+        if not purge_checks and table.name == "link_check":
             continue
         names.append(table.name)
     return names
@@ -46,6 +65,8 @@ class ResetReport:
     before: dict[str, int] = field(default_factory=dict)
     after: dict[str, int] = field(default_factory=dict)
     cursors_reset: bool = False
+    checks_purged: bool = False
+    documents_requeued: int = 0
 
 
 async def _counts(session: AsyncSession, tables: list[str]) -> dict[str, int]:
@@ -60,6 +81,7 @@ async def reset_pipeline_data(
     *,
     keep_documents: bool = False,
     keep_cursors: bool = False,
+    purge_checks: bool = False,
 ) -> ResetReport:
     """清空流水线数据，保留采集源配置。
 
@@ -67,15 +89,18 @@ async def reset_pipeline_data(
         keep_documents: 保留原始文本，只重建下游解析结果。
         keep_cursors: 保留采集水位。清空原始文本时**不要**用 ——
             水位还在的话采集器会认为"都采过了"，重建后一条也拉不回来。
+        purge_checks: 连校验历史（`link_check`）一起清空。默认不清 ——
+            见 `data_tables` 里的说明；重解析出新 resource 后可以用
+            `relink_checks` 把历史接回来。
     """
-    tables = data_tables(keep_documents=keep_documents)
+    tables = data_tables(keep_documents=keep_documents, purge_checks=purge_checks)
     if keep_documents and not keep_cursors:
         # 原始文本还在，水位归零只会导致重复采集后被 content_hash 挡掉，无意义
         keep_cursors = True
 
     # 报告覆盖全部数据表，而不只是这次被清空的那些 —— 用了 --keep-documents
     # 的人最想确认的恰恰是"原始文本还在不在"，只报清空的表就看不到它。
-    reported = [*data_tables(), "source"]
+    reported = [*data_tables(purge_checks=True), "source"]
     report = ResetReport(tables=tables, before=await _counts(session, reported))
 
     if session.bind.dialect.name == "postgresql":
@@ -89,10 +114,71 @@ async def reset_pipeline_data(
         for source in await session.scalars(select(Source)):
             source.reset_watermark()
 
+    if keep_documents:
+        # `raw_document` 本身没被清空，但它身上的解析任务状态机字段记录的是
+        # "旧一轮 parse 跑到哪了"——下游 resource/extraction 已经被清空重建，
+        # 这些字段如果不跟着重置，`done`/`skipped`/`failed` 状态的文档会被
+        # 领取查询（`ix_raw_document_parse_queue` 只认 `parse_status == PENDING`）
+        # 永久跳过，绝大多数文档就再也不会被重新解析。
+        result = await session.execute(
+            update(RawDocument).values(
+                parse_status=ParseStatus.PENDING,
+                parse_attempts=0,
+                parse_error=None,
+                lease_until=None,
+                next_parse_at=None,
+                last_parsed_at=None,
+            )
+        )
+        report.documents_requeued = result.rowcount or 0
+
     await session.commit()
     report.after = await _counts(session, reported)
     report.cursors_reset = not keep_cursors
+    report.checks_purged = purge_checks
     return report
+
+
+@dataclass(slots=True)
+class RelinkReport:
+    hydrated: int = 0
+
+
+async def relink_checks(session: AsyncSession) -> RelinkReport:
+    """用已有的校验历史恢复重新解析后新建的 resource 的校验状态。
+
+    `link_check` 跟 `resource` 没有外键，`resource` 被 `reset_pipeline_data`
+    清空重建完全不影响它。重新 parse 会按 (provider, share_id) 幂等 upsert 出
+    同样身份的新 resource，但这些新 resource 的 `check_status` 是默认值
+    `UNCHECKED`——这里按 (provider, share_id) 找回每条链接最新一条历史，把
+    `check_status`/`last_checked_at`/`next_check_at` 恢复回去，这样重解析之后
+    不用把全部资源重新探测一遍。
+
+    `check_attempts` 不做精确复原（新 resource 保持默认值 0）——精确复原要扫完整
+    历史计数，多余；副作用最多是极少数刚确认失效两次的链接会多等一轮 TTL 才停止
+    复查，不影响正确性。
+    """
+    latest_check_ids = select(func.max(LinkCheck.id)).group_by(
+        LinkCheck.provider, LinkCheck.share_id
+    )
+    hydrated = 0
+    for check in await session.scalars(select(LinkCheck).where(LinkCheck.id.in_(latest_check_ids))):
+        resource = await session.scalar(
+            select(Resource).where(
+                Resource.provider == check.provider, Resource.share_id == check.share_id
+            )
+        )
+        if resource is None or resource.check_status is not CheckStatus.UNCHECKED:
+            # 没有对应的新 resource，或者已经不是刚重建出来的默认状态
+            # （已被真实校验过或已恢复），不覆盖。
+            continue
+        resource.check_status = check.status
+        resource.last_checked_at = check.checked_at
+        resource.next_check_at = _next_check_at(resource, CheckOutcome(status=check.status))
+        hydrated += 1
+
+    await session.commit()
+    return RelinkReport(hydrated=hydrated)
 
 
 @dataclass(slots=True)

@@ -9,11 +9,22 @@ from __future__ import annotations
 
 import pytest
 
-from funflix.base.enums import MediaType, Provider, Quality, SourceType
-from funflix.models import Media, RawDocument, Resource, Source, Tag, TagKind, media_tag, utcnow
+from funflix.base.enums import CheckStatus, MediaType, ParseStatus, Provider, Quality, SourceType
+from funflix.models import (
+    LinkCheck,
+    Media,
+    RawDocument,
+    Resource,
+    Source,
+    Tag,
+    TagKind,
+    media_tag,
+    utcnow,
+)
 from funflix.services.maintenance import (
     data_tables,
     recount_tags,
+    relink_checks,
     reset_pipeline_data,
     retag_all,
 )
@@ -77,6 +88,14 @@ class TestDataTables:
     def test_keep_documents_excludes_raw_document(self) -> None:
         assert "raw_document" not in data_tables(keep_documents=True)
         assert "resource" in data_tables(keep_documents=True)
+
+    def test_link_check_excluded_by_default(self) -> None:
+        """校验历史锚定在 (provider, share_id)，默认不该跟 resource 一起被清空。"""
+        assert "link_check" not in data_tables()
+        assert "resource" in data_tables()
+
+    def test_purge_checks_includes_link_check(self) -> None:
+        assert "link_check" in data_tables(purge_checks=True)
 
 
 @pytest.mark.asyncio
@@ -154,6 +173,76 @@ class TestResetPipelineData:
         assert report.after["raw_document"] == 1
         assert source.cursor_message_id == "12345"
         assert report.cursors_reset is False
+
+    async def test_keep_documents_requeues_already_parsed_documents(self, session) -> None:
+        """回归：下游被清空后，`done`/`skipped` 状态的原始文本不重置就再也不会被重新解析。
+
+        领取查询（`ix_raw_document_parse_queue`）只认 `parse_status == PENDING`，
+        `reset_pipeline_data(keep_documents=True)` 从不碰 `raw_document` 表本身，
+        之前解析完的文档会带着旧状态永久跳过下一轮 parse。
+        """
+        done_doc = _doc(1)
+        done_doc.parse_status = ParseStatus.DONE
+        done_doc.parse_attempts = 3
+        done_doc.next_parse_at = utcnow()
+        done_doc.last_parsed_at = utcnow()
+        skipped_doc = _doc(2)
+        skipped_doc.parse_status = ParseStatus.SKIPPED
+        session.add_all([_source(), done_doc, skipped_doc])
+        await session.commit()
+
+        report = await reset_pipeline_data(session, keep_documents=True)
+        await session.refresh(done_doc)
+        await session.refresh(skipped_doc)
+
+        assert report.documents_requeued == 2
+        assert done_doc.parse_status is ParseStatus.PENDING
+        assert done_doc.parse_attempts == 0
+        assert done_doc.next_parse_at is None
+        assert done_doc.last_parsed_at is None
+        assert skipped_doc.parse_status is ParseStatus.PENDING
+
+    async def test_preserves_link_check_by_default(self, session) -> None:
+        """清空 resource 不该带走校验历史——它是全库成本最高的数据。"""
+        resource = _resource()
+        session.add(resource)
+        await session.flush()
+        session.add(
+            LinkCheck(
+                provider=resource.provider,
+                share_id=resource.share_id,
+                url=resource.url,
+                checked_at=utcnow(),
+                status=CheckStatus.VALID,
+            )
+        )
+        await session.commit()
+
+        report = await reset_pipeline_data(session)
+
+        assert report.after["resource"] == 0
+        assert report.after["link_check"] == 1, "校验历史不该被 reset 清空"
+        assert report.checks_purged is False
+
+    async def test_purge_checks_clears_link_check(self, session) -> None:
+        resource = _resource()
+        session.add(resource)
+        await session.flush()
+        session.add(
+            LinkCheck(
+                provider=resource.provider,
+                share_id=resource.share_id,
+                url=resource.url,
+                checked_at=utcnow(),
+                status=CheckStatus.VALID,
+            )
+        )
+        await session.commit()
+
+        report = await reset_pipeline_data(session, purge_checks=True)
+
+        assert report.after["link_check"] == 0
+        assert report.checks_purged is True
 
 
 @pytest.mark.asyncio
@@ -265,3 +354,69 @@ class TestRequeueNowCheckable:
         assert await requeue_now_checkable(session) == 0
         await session.refresh(done)
         assert done.check_status is CheckStatus.VALID
+
+
+@pytest.mark.asyncio
+class TestRelinkChecks:
+    """resource 被清空重建后，独立存储的校验历史要能按 (provider, share_id) 恢复状态。"""
+
+    async def test_hydrates_matching_resource(self, session) -> None:
+        history = LinkCheck(
+            provider=Provider.QUARK,
+            share_id="s000001",
+            url="https://pan.quark.cn/s/s000001",
+            checked_at=utcnow(),
+            status=CheckStatus.VALID,
+            detail="ok",
+        )
+        session.add(history)
+        rebuilt = _resource(1)
+        session.add(rebuilt)
+        await session.commit()
+        assert rebuilt.check_status is CheckStatus.UNCHECKED
+
+        report = await relink_checks(session)
+
+        assert report.hydrated == 1
+        await session.refresh(rebuilt)
+        assert rebuilt.check_status is CheckStatus.VALID
+        assert rebuilt.last_checked_at == history.checked_at
+        assert rebuilt.next_check_at is not None, "恢复后仍要能重新进入复查队列"
+
+    async def test_ignores_history_without_matching_resource(self, session) -> None:
+        session.add(
+            LinkCheck(
+                provider=Provider.QUARK,
+                share_id="s999999",
+                url="https://pan.quark.cn/s/s999999",
+                checked_at=utcnow(),
+                status=CheckStatus.VALID,
+            )
+        )
+        await session.commit()
+
+        report = await relink_checks(session)
+
+        assert report.hydrated == 0
+
+    async def test_does_not_overwrite_already_checked_resource(self, session) -> None:
+        """resource 已经有真实结论（不是重建后的默认 UNCHECKED）时不能被历史覆盖。"""
+        session.add(
+            LinkCheck(
+                provider=Provider.QUARK,
+                share_id="s000002",
+                url="https://pan.quark.cn/s/s000002",
+                checked_at=utcnow(),
+                status=CheckStatus.INVALID,
+            )
+        )
+        already_checked = _resource(2)
+        already_checked.check_status = CheckStatus.VALID
+        session.add(already_checked)
+        await session.commit()
+
+        report = await relink_checks(session)
+
+        assert report.hydrated == 0
+        await session.refresh(already_checked)
+        assert already_checked.check_status is CheckStatus.VALID

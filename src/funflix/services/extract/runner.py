@@ -411,7 +411,10 @@ async def _resolve_tags(
         if tag is None and cache is None:
             tag = await session.scalar(select(Tag).where(Tag.kind == kind, Tag.norm_key == key))
         if tag is None:
-            tag = Tag(kind=TagKind(kind), name=name, norm_key=key)
+            # 显式给 media_count 赋初值——`_link_tags` 会在同一次 flush 之前
+            # 对刚建的这个对象直接 `+= 1`，列定义的 `default=0` 只在 flush
+            # 时才生效，flush 前 Python 侧读到的是 None，会让 += 直接炸掉。
+            tag = Tag(kind=TagKind(kind), name=name, norm_key=key, media_count=0)
             session.add(tag)
             if cache is not None:
                 cache.tag_by_key[tag_key] = tag
