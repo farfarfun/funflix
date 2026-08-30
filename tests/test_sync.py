@@ -255,13 +255,29 @@ class TestSyncTablesFiltering:
         assert len(sync_tables()) > len(JOB_TABLES["collect"])
 
     def test_filters_to_requested_tables_only(self):
+        """`collect` 的两张表之间只有 raw_document → source 这一条外键，
+        且 source 本来就在列表里，所以闭包不引入额外的表。"""
         specs = sync_tables(JOB_TABLES["collect"])
         assert {s.table.name for s in specs} == set(JOB_TABLES["collect"])
 
+    def test_expands_to_foreign_key_closure(self):
+        """回归：GitHub issue #3 的真实成因之一——parse/verify 的 JOB_TABLES
+        没写外键指向的祖先表（`raw_document.source_id` → `source`、
+        `resource.raw_document_id` → `raw_document`），只同步字面写的那几张会
+        导致本地库插入时撞上 FOREIGN KEY constraint，被误判成业务唯一键冲突。
+        `sync_tables` 得自动把这些祖先表补全，不能要求 JOB_TABLES 手写全。"""
+        parse_names = {s.table.name for s in sync_tables(JOB_TABLES["parse"])}
+        assert "source" in parse_names  # raw_document 依赖它
+
+        verify_names = {s.table.name for s in sync_tables(JOB_TABLES["verify"])}
+        assert "raw_document" in verify_names  # resource 依赖它
+        assert "source" in verify_names  # raw_document 又依赖它，闭包要传递
+
     def test_preserves_fk_dependency_order_within_filtered_set(self):
-        """父表在前——收窄表清单不能打乱依赖顺序，否则同步顺序错误。"""
-        names = JOB_TABLES["verify"]
-        filtered_order = [s.table.name for s in sync_tables(names)]
+        """父表在前——收窄表清单（含闭包补全的表）不能打乱依赖顺序。"""
+        specs = sync_tables(JOB_TABLES["verify"])
+        names = {s.table.name for s in specs}
+        filtered_order = [s.table.name for s in specs]
         full_order = [s.table.name for s in sync_tables() if s.table.name in names]
         assert filtered_order == full_order
 
@@ -284,15 +300,20 @@ class TestJobScopedSync:
         assert {t.table for t in report.tables} == {"source"}
         assert (await local_session.execute(select(Source))).scalars().all()
 
-    async def test_push_with_tables_only_touches_requested_tables(
+    async def test_push_expands_to_fk_closure_so_child_rows_are_not_orphaned(
         self, local_session, remote_session
     ):
-        local_session.add(_source())
-        local_session.add(_doc())
+        """`raw_document.source_id` 外键指向 `source`——只请求同步
+        `raw_document` 时，`source` 也得跟着同步，否则远端插入 raw_document
+        会因为 source_id 指向本地都没同步过去的行而失败（或者反过来，pull
+        时在本地插入撞上 FOREIGN KEY constraint，见 GitHub issue #3）。"""
+        source = _source()
+        local_session.add(source)
+        local_session.add(_doc(source_id=source.id))
         await local_session.commit()
 
         report = await push(local_session, remote_session, tables=("raw_document",))
 
-        assert {t.table for t in report.tables} == {"raw_document"}
+        assert {t.table for t in report.tables} == {"raw_document", "source"}
         assert (await remote_session.execute(select(RawDocument))).scalars().all()
-        assert not (await remote_session.execute(select(Source))).scalars().all()
+        assert (await remote_session.execute(select(Source))).scalars().all()
