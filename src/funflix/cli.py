@@ -580,7 +580,21 @@ def _print_sync_report(report: SyncReport) -> None:
         _warn(f"共 {report.total_skipped} 行因业务唯一键冲突被跳过，详见日志")
 
 
-async def _run_sync_direction(direction: Literal["pull", "push"]) -> SyncReport:
+def _resolve_sync_tables(job: str | None) -> tuple[str, ...] | None:
+    """`--job` 给定时按 `JOB_TABLES` 收窄同步范围；不给时同步全部表（人工场景）。"""
+    from funflix.services.sync import JOB_TABLES
+
+    if job is None:
+        return None
+    try:
+        return JOB_TABLES[job]
+    except KeyError:
+        raise typer.BadParameter(f"未知 job: {job!r}，可选值：{', '.join(JOB_TABLES)}") from None
+
+
+async def _run_sync_direction(
+    direction: Literal["pull", "push"], tables: tuple[str, ...] | None
+) -> SyncReport:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from funflix.base.config import Settings
@@ -592,17 +606,24 @@ async def _run_sync_direction(direction: Literal["pull", "push"]) -> SyncReport:
         remote_maker = async_sessionmaker(remote_engine, expire_on_commit=False)
         async with session_scope() as local, remote_maker() as remote:
             action = sync_service.pull if direction == "pull" else sync_service.push
-            return await action(local, remote)
+            return await action(local, remote, tables=tables)
     finally:
         await remote_engine.dispose()
 
 
+_JobOption = Annotated[
+    str | None,
+    typer.Option(help="只同步该 job 需要的表（collect/parse/verify），不给则同步全部表"),
+]
+
+
 @sync_app.command("pull")
-def sync_pull() -> None:
+def sync_pull(job: _JobOption = None) -> None:
     """从远端库拉取变更到本地库（远端为准，last-write-wins）。"""
+    tables = _resolve_sync_tables(job)
 
     async def _do() -> SyncReport:
-        return await _run_sync_direction("pull")
+        return await _run_sync_direction("pull", tables)
 
     report = _run(_do)
     _print_sync_report(report)
@@ -610,11 +631,12 @@ def sync_pull() -> None:
 
 
 @sync_app.command("push")
-def sync_push() -> None:
+def sync_push(job: _JobOption = None) -> None:
     """把本地库的变更推送到远端库（按行 last-write-wins，冲突跳过不中断整批）。"""
+    tables = _resolve_sync_tables(job)
 
     async def _do() -> SyncReport:
-        return await _run_sync_direction("push")
+        return await _run_sync_direction("push", tables)
 
     report = _run(_do)
     _print_sync_report(report)

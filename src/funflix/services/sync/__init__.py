@@ -7,9 +7,10 @@
 """
 
 from funflix.services.sync.runner import SyncReport, TableSyncResult, pull, push
-from funflix.services.sync.tables import SyncTable, sync_tables
+from funflix.services.sync.tables import JOB_TABLES, SyncTable, sync_tables
 
 __all__ = [
+    "JOB_TABLES",
     "SyncReport",
     "SyncTable",
     "TableSyncResult",

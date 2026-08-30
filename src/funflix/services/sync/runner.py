@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -142,9 +143,11 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
     return result
 
 
-async def _sync_direction(source: AsyncSession, target: AsyncSession) -> SyncReport:
+async def _sync_direction(
+    source: AsyncSession, target: AsyncSession, tables: Collection[str] | None
+) -> SyncReport:
     report = SyncReport()
-    for spec in sync_tables():
+    for spec in sync_tables(tables):
         target_max = await _max_watermark(target, spec)
         since = target_max - _WATERMARK_OVERLAP if target_max is not None else None
         rows = await _fetch_rows(source, spec, since)
@@ -163,13 +166,21 @@ async def ensure_local_schema(local: AsyncSession) -> None:
     await conn.run_sync(Base.metadata.create_all)
 
 
-async def pull(local: AsyncSession, remote: AsyncSession) -> SyncReport:
-    """remote → local，remote 为准。按外键依赖顺序（父表先）逐表处理。"""
+async def pull(
+    local: AsyncSession, remote: AsyncSession, tables: Collection[str] | None = None
+) -> SyncReport:
+    """remote → local，remote 为准。按外键依赖顺序（父表先）逐表处理。
+
+    `tables` 不给时同步全部表；给定时只同步这些表（比如某个 job 只需要它
+    自己读写的那几张，见 `tables.JOB_TABLES`）。
+    """
     await ensure_local_schema(local)
-    return await _sync_direction(source=remote, target=local)
+    return await _sync_direction(source=remote, target=local, tables=tables)
 
 
-async def push(local: AsyncSession, remote: AsyncSession) -> SyncReport:
-    """local → remote。按外键依赖顺序（父表先）逐表处理。"""
+async def push(
+    local: AsyncSession, remote: AsyncSession, tables: Collection[str] | None = None
+) -> SyncReport:
+    """local → remote。按外键依赖顺序（父表先）逐表处理。`tables` 语义同 `pull`。"""
     await ensure_local_schema(local)
-    return await _sync_direction(source=local, target=remote)
+    return await _sync_direction(source=local, target=remote, tables=tables)

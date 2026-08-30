@@ -19,7 +19,7 @@ from sqlalchemy.pool import StaticPool
 from funflix.base.enums import SourceType
 from funflix.models import Base, RawDocument, Source, utcnow
 from funflix.models.base import uuid7
-from funflix.services.sync import TableSyncResult, pull, push
+from funflix.services.sync import JOB_TABLES, TableSyncResult, pull, push, sync_tables
 from funflix.services.sync import runner as sync_runner
 
 BASE = utcnow()
@@ -223,3 +223,55 @@ class TestPush:
         assert result.skipped_conflicts == 1
         remote_rows = (await remote_session.execute(select(Source))).scalars().all()
         assert [r.identifier for r in remote_rows] == ["ch1"]
+
+
+class TestSyncTablesFiltering:
+    """`sync_tables(names=...)`：每个 pipeline job 只同步自己需要的表，
+    不用每次都拉全部 9 张——见 JOB_TABLES 的选表逻辑。"""
+
+    def test_returns_all_tables_when_names_is_none(self):
+        assert len(sync_tables(None)) == len(sync_tables())
+        assert len(sync_tables()) > len(JOB_TABLES["collect"])
+
+    def test_filters_to_requested_tables_only(self):
+        specs = sync_tables(JOB_TABLES["collect"])
+        assert {s.table.name for s in specs} == set(JOB_TABLES["collect"])
+
+    def test_preserves_fk_dependency_order_within_filtered_set(self):
+        """父表在前——收窄表清单不能打乱依赖顺序，否则同步顺序错误。"""
+        names = JOB_TABLES["verify"]
+        filtered_order = [s.table.name for s in sync_tables(names)]
+        full_order = [s.table.name for s in sync_tables() if s.table.name in names]
+        assert filtered_order == full_order
+
+    def test_unknown_table_name_raises(self):
+        with pytest.raises(ValueError, match="不存在的表名"):
+            sync_tables(["not_a_real_table"])
+
+
+@pytest.mark.asyncio
+class TestJobScopedSync:
+    async def test_pull_with_tables_only_touches_requested_tables(
+        self, local_session, remote_session
+    ):
+        remote_session.add(_source())
+        remote_session.add(_doc())
+        await remote_session.commit()
+
+        report = await pull(local_session, remote_session, tables=("source",))
+
+        assert {t.table for t in report.tables} == {"source"}
+        assert (await local_session.execute(select(Source))).scalars().all()
+
+    async def test_push_with_tables_only_touches_requested_tables(
+        self, local_session, remote_session
+    ):
+        local_session.add(_source())
+        local_session.add(_doc())
+        await local_session.commit()
+
+        report = await push(local_session, remote_session, tables=("raw_document",))
+
+        assert {t.table for t in report.tables} == {"raw_document"}
+        assert (await remote_session.execute(select(RawDocument))).scalars().all()
+        assert not (await remote_session.execute(select(Source))).scalars().all()

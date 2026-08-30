@@ -67,7 +67,7 @@ jobs:
           echo "FUNFLIX_DATABASE_URL=sqlite+aiosqlite:///$db_dir/funflix.db" >> "$GITHUB_ENV"
 
       - name: Sync pull
-        run: funflix sync pull
+        run: funflix sync pull --job collect
 
       # 每周一（北京时间）先把采集水位归零，核查是否有"水位漂移但没真正
       # 采到"的情况：重新翻旧内容会被 content_hash 唯一约束挡掉，不会
@@ -90,7 +90,7 @@ jobs:
       # 不能让一次失败白白丢掉这一轮已经采到的数据。
       - name: Sync push
         if: always()
-        run: funflix sync push
+        run: funflix sync push --job collect
 
   parse:
     # 说明见 collect job：没配 FUNFLIX_RUNNER_LABEL 仓库变量时落回 ubuntu-latest。
@@ -127,7 +127,7 @@ jobs:
           echo "FUNFLIX_DATABASE_URL=sqlite+aiosqlite:///$db_dir/funflix.db" >> "$GITHUB_ENV"
 
       - name: Sync pull
-        run: funflix sync pull
+        run: funflix sync pull --job parse
 
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
       # 影响范围有限，不会一次把所有待解析的都搭进去。
@@ -136,7 +136,7 @@ jobs:
 
       - name: Sync push
         if: always()
-        run: funflix sync push
+        run: funflix sync push --job parse
 
   verify:
     # 说明见 collect job：没配 FUNFLIX_RUNNER_LABEL 仓库变量时落回 ubuntu-latest。
@@ -173,7 +173,7 @@ jobs:
           echo "FUNFLIX_DATABASE_URL=sqlite+aiosqlite:///$db_dir/funflix.db" >> "$GITHUB_ENV"
 
       - name: Sync pull
-        run: funflix sync pull
+        run: funflix sync pull --job verify
 
       # verify 探测第三方网盘链接，受限于显式的限流（worker_verify_rate，约
       # 3.8~5 条/秒，避免触发对方风控），不是数据库延迟——是三个 job 里的
@@ -183,4 +183,4 @@ jobs:
 
       - name: Sync push
         if: always()
-        run: funflix sync push
+        run: funflix sync push --job verify
