@@ -21,7 +21,7 @@ from datetime import timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.models import Base
@@ -112,9 +112,14 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
                 await session.execute(_upsert_stmt(session, spec, chunk))
             result.applied += len(chunk)
             continue
-        except (IntegrityError, DataError):
-            # DataError：本地 SQLite 不强制 varchar 长度等约束，超长字段能顺利
-            # 落进本地库，直到 push 到远端 Postgres 才会被真正的类型约束挡下。
+        except DBAPIError:
+            # 覆盖唯一键冲突，也覆盖数据不合法（比如超长字段撞上 varchar 长度）——
+            # 本地 SQLite 不强制这些约束，问题字段能顺利落进本地库，直到 push
+            # 到远端 Postgres 才会报错。catch 用基类 DBAPIError 而不是具体的
+            # IntegrityError/DataError：asyncpg 的错误映射表并不完整（见
+            # sqlalchemy.dialects.postgresql.asyncpg._asyncpg_error_translate），
+            # 像 StringDataRightTruncationError 这类真实会遇到的错误最终只会
+            # 被包成通用的 DBAPIError，具体子类反而抓不到。
             logger.warning(
                 "%s: 批量 upsert 撞上业务唯一键冲突或数据不合法，降级为逐行处理（%d 行）",
                 spec.table.name,
@@ -126,7 +131,7 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
                 async with session.begin_nested():
                     await session.execute(_upsert_stmt(session, spec, [row]))
                 result.applied += 1
-            except (IntegrityError, DataError):
+            except DBAPIError:
                 pk_value = {c: row.get(c) for c in pk_cols}
                 logger.warning(
                     "%s: 跳过一行（唯一键冲突或数据不合法），主键=%s", spec.table.name, pk_value

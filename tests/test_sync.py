@@ -12,7 +12,7 @@ from datetime import timedelta
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.exc import DataError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -197,16 +197,17 @@ class TestPush:
         self, local_session, remote_session, monkeypatch
     ):
         """回归：本地 SQLite 不强制 varchar 长度，超长字段能顺利写进本地库，
-        直到 push 到远端 Postgres 才会被真正的类型约束挡下——这是
-        `DataError`，不是 `IntegrityError`，两边都用 SQLite 模拟不出真实的
-        方言差异，所以直接让 `_upsert_stmt` 对指定行抛 `DataError`。"""
+        直到 push 到远端 Postgres 才会被真正的类型约束挡下。asyncpg 的错误
+        映射表不完整，这类错误实际上会被包成通用的 `DBAPIError`，不是更具体
+        的 `DataError`/`IntegrityError`——两边都用 SQLite 也模拟不出真实的
+        方言差异，所以直接让 `_upsert_stmt` 对指定行抛 `DBAPIError`。"""
         original_upsert_stmt = sync_runner._upsert_stmt
 
         def fake_upsert_stmt(session, spec, values):
             if spec.table.name == "source" and any(
                 v["identifier"] == "ch2-too-long" for v in values
             ):
-                raise DataError("INSERT", {}, Exception("value too long for type"))
+                raise DBAPIError("INSERT", {}, Exception("value too long for type"))
             return original_upsert_stmt(session, spec, values)
 
         monkeypatch.setattr(sync_runner, "_upsert_stmt", fake_upsert_stmt)
