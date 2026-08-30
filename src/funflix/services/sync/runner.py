@@ -21,7 +21,7 @@ from datetime import timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.models import Base
@@ -112,9 +112,11 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
                 await session.execute(_upsert_stmt(session, spec, chunk))
             result.applied += len(chunk)
             continue
-        except IntegrityError:
+        except (IntegrityError, DataError):
+            # DataError：本地 SQLite 不强制 varchar 长度等约束，超长字段能顺利
+            # 落进本地库，直到 push 到远端 Postgres 才会被真正的类型约束挡下。
             logger.warning(
-                "%s: 批量 upsert 撞上业务唯一键冲突，降级为逐行处理（%d 行）",
+                "%s: 批量 upsert 撞上业务唯一键冲突或数据不合法，降级为逐行处理（%d 行）",
                 spec.table.name,
                 len(chunk),
             )
@@ -124,9 +126,11 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
                 async with session.begin_nested():
                     await session.execute(_upsert_stmt(session, spec, [row]))
                 result.applied += 1
-            except IntegrityError:
+            except (IntegrityError, DataError):
                 pk_value = {c: row.get(c) for c in pk_cols}
-                logger.warning("%s: 跳过一行业务唯一键冲突，主键=%s", spec.table.name, pk_value)
+                logger.warning(
+                    "%s: 跳过一行（唯一键冲突或数据不合法），主键=%s", spec.table.name, pk_value
+                )
                 result.skipped_conflicts += 1
 
     await session.commit()

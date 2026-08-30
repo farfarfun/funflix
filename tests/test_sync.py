@@ -12,6 +12,7 @@ from datetime import timedelta
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy.exc import DataError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -19,6 +20,7 @@ from funflix.base.enums import SourceType
 from funflix.models import Base, RawDocument, Source, utcnow
 from funflix.models.base import uuid7
 from funflix.services.sync import TableSyncResult, pull, push
+from funflix.services.sync import runner as sync_runner
 
 BASE = utcnow()
 
@@ -190,3 +192,33 @@ class TestPush:
         assert result.skipped_conflicts == 1
         remote_rows = (await remote_session.execute(select(RawDocument))).scalars().all()
         assert {r.content_hash for r in remote_rows} == {shared_hash, "b" * 64}
+
+    async def test_skips_row_that_fails_a_remote_only_data_constraint(
+        self, local_session, remote_session, monkeypatch
+    ):
+        """回归：本地 SQLite 不强制 varchar 长度，超长字段能顺利写进本地库，
+        直到 push 到远端 Postgres 才会被真正的类型约束挡下——这是
+        `DataError`，不是 `IntegrityError`，两边都用 SQLite 模拟不出真实的
+        方言差异，所以直接让 `_upsert_stmt` 对指定行抛 `DataError`。"""
+        original_upsert_stmt = sync_runner._upsert_stmt
+
+        def fake_upsert_stmt(session, spec, values):
+            if spec.table.name == "source" and any(
+                v["identifier"] == "ch2-too-long" for v in values
+            ):
+                raise DataError("INSERT", {}, Exception("value too long for type"))
+            return original_upsert_stmt(session, spec, values)
+
+        monkeypatch.setattr(sync_runner, "_upsert_stmt", fake_upsert_stmt)
+
+        local_session.add_all([_source(1), _source(2, identifier="ch2-too-long")])
+        await local_session.commit()
+
+        report = await push(local_session, remote_session)
+
+        result = _result(report, "source")
+        assert result.fetched == 2
+        assert result.applied == 1
+        assert result.skipped_conflicts == 1
+        remote_rows = (await remote_session.execute(select(Source))).scalars().all()
+        assert [r.identifier for r in remote_rows] == ["ch1"]
