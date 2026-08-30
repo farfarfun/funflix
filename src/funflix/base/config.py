@@ -106,6 +106,13 @@ class Settings(BaseSettings):
     #: 切 PG 只需把 funsecret 里的值改成 postgresql+asyncpg://...，schema 无需变更。
     database_url: str = Field(default_factory=resolve_database_url)
     db_echo: bool = False
+    #: 本地库同步方案（`funflix sync pull/push`）里的远端地址。默认跟
+    #: `database_url` 读同一个 funsecret 键（等于远端 RDS）——这个字段真正
+    #: 有意义是在 self-hosted runner 上：workflow 会用环境变量把
+    #: `FUNFLIX_DATABASE_URL` 明着指向本地库，此时 `remote_database_url` 仍
+    #: 落回 funsecret 拿到远端地址，两个配置互不干扰，不用为此改动共享的
+    #: funsecret 值（那个值还被 `funflix serve` 等其他消费者用着）。
+    remote_database_url: str = Field(default_factory=resolve_database_url)
 
     # --- 搜索 ---
     #: pg_trgm 的相似度阈值，低于它的结果基本是噪声。
@@ -159,7 +166,7 @@ class Settings(BaseSettings):
     #: 单条原始文本的最大长度，超出直接拒绝（避免 LLM 阶段爆 token）
     ingest_max_content_length: int = 100_000
 
-    @field_validator("database_url", mode="after")
+    @field_validator("database_url", "remote_database_url", mode="after")
     @classmethod
     def _ensure_async_driver(cls, value: str) -> str:
         """无论来自环境变量还是密钥库，都规范化成异步驱动。"""

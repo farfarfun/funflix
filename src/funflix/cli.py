@@ -12,7 +12,7 @@ import os
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn
 
 import click
 import questionary
@@ -23,13 +23,18 @@ from tqdm import tqdm
 from funflix.base.config import get_settings
 from funflix.base.enums import CheckStatus, MediaType, ParseStatus, SourceType
 
+if TYPE_CHECKING:
+    from funflix.services.sync import SyncReport
+
 logger = logging.getLogger(__name__)
 
 app = typer.Typer(help="funflix 命令行工具")
 db_app = typer.Typer(help="数据库迁移与检查", no_args_is_help=True)
 source_app = typer.Typer(help="采集源管理与采集", no_args_is_help=True)
+sync_app = typer.Typer(help="本地库与远端库同步（自建 self-hosted runner）", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(source_app, name="source")
+app.add_typer(sync_app, name="sync")
 
 
 @app.callback(invoke_without_command=True)
@@ -561,6 +566,59 @@ def db_info() -> None:
     settings = get_settings()
     typer.echo(f"  方言    {settings.database_url.split('://', 1)[0]}")
     typer.echo(f"  SQLite  {settings.is_sqlite}")
+
+
+# --- sync ----------------------------------------------------------------------
+
+
+def _print_sync_report(report: SyncReport) -> None:
+    _table(
+        [[t.table, t.fetched, t.applied, t.skipped_conflicts] for t in report.tables],
+        ["表", "拉到", "应用", "冲突跳过"],
+    )
+    if report.total_skipped:
+        _warn(f"共 {report.total_skipped} 行因业务唯一键冲突被跳过，详见日志")
+
+
+async def _run_sync_direction(direction: Literal["pull", "push"]) -> SyncReport:
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from funflix.base.config import Settings
+    from funflix.base.db import create_engine, session_scope
+    from funflix.services import sync as sync_service
+
+    remote_engine = create_engine(Settings(database_url=get_settings().remote_database_url))
+    try:
+        remote_maker = async_sessionmaker(remote_engine, expire_on_commit=False)
+        async with session_scope() as local, remote_maker() as remote:
+            action = sync_service.pull if direction == "pull" else sync_service.push
+            return await action(local, remote)
+    finally:
+        await remote_engine.dispose()
+
+
+@sync_app.command("pull")
+def sync_pull() -> None:
+    """从远端库拉取变更到本地库（远端为准，last-write-wins）。"""
+
+    async def _do() -> SyncReport:
+        return await _run_sync_direction("pull")
+
+    report = _run(_do)
+    _print_sync_report(report)
+    _ok(f"拉取完成，共应用 {report.total_applied} 行")
+
+
+@sync_app.command("push")
+def sync_push() -> None:
+    """把本地库的变更推送到远端库（按行 last-write-wins，冲突跳过不中断整批）。"""
+
+    async def _do() -> SyncReport:
+        return await _run_sync_direction("push")
+
+    report = _run(_do)
+    _print_sync_report(report)
+    _ok(f"推送完成，共应用 {report.total_applied} 行")
 
 
 # --- source ------------------------------------------------------------------
