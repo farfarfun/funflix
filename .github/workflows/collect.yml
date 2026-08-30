@@ -18,12 +18,7 @@ jobs:
   # 互不依赖对方产出的结果才能跑，所以拆成三个独立 job 并行执行，而不是
   # 一个 job 里顺序跑三步——一步卡住不该拖着后面两步一起等。
   collect:
-    # 还没注册 self-hosted runner 之前，落回 GitHub 托管的 ubuntu-latest 也能正常跑——
-    # 只是每次 job 都是全新机器，本地库每次从空的开始，等于每轮都做一次全量
-    # pull + 全量 push（仍然比"逐条操作都跨境"快很多）。等 runner 机器就绪后，
-    # 在仓库 Settings → Secrets and variables → Actions → Variables 里加一个
-    # FUNFLIX_RUNNER_LABEL=self-hosted，不用再改这个文件。
-    runs-on: ${{ vars.FUNFLIX_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
       group: pipeline-collect
@@ -53,22 +48,6 @@ jobs:
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
           funsecret load "$url"
 
-      # pipeline 全程改读写 runner 本机的 SQLite，不再每次读改写都跨境打远端 RDS。
-      # 用 SQLite 而不是本机装 Postgres——单文件、零运维，runner 机器不需要额外装数据库。
-      # 路径固定在 runner 账号的 HOME 下（不是 checkout 出来的工作区），
-      # 这样每次 job 复用同一份文件，state 天然在同一台 runner 上的三个 job 之间延续；
-      # 显式设置 FUNFLIX_DATABASE_URL 覆盖 funsecret 里的远端地址（env 优先级更高，
-      # 见 base/config.py 里的说明），FUNFLIX_REMOTE_DATABASE_URL 不设，
-      # 让 remote_database_url 落回 funsecret 拿到远端 RDS。
-      - name: Configure local database
-        run: |
-          db_dir="$HOME/.cache/farfarfun/funflix"
-          mkdir -p "$db_dir"
-          echo "FUNFLIX_DATABASE_URL=sqlite+aiosqlite:///$db_dir/funflix.db" >> "$GITHUB_ENV"
-
-      - name: Sync pull
-        run: funflix sync pull --job collect
-
       # 每周一（北京时间）先把采集水位归零，核查是否有"水位漂移但没真正
       # 采到"的情况：重新翻旧内容会被 content_hash 唯一约束挡掉，不会
       # 重复入库，只有真正漏采的部分才会补进来。原始文本不受影响。
@@ -84,17 +63,10 @@ jobs:
           fi
 
       - name: Collect
-        run: funflix collect --limit 8000
-
-      # 即使 collect 中途失败，已经落进本地库的这部分进度也要推回远端，
-      # 不能让一次失败白白丢掉这一轮已经采到的数据。
-      - name: Sync push
-        if: always()
-        run: funflix sync push --job collect
+        run: funflix collect --limit 5000
 
   parse:
-    # 说明见 collect job：没配 FUNFLIX_RUNNER_LABEL 仓库变量时落回 ubuntu-latest。
-    runs-on: ${{ vars.FUNFLIX_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
       group: pipeline-parse
@@ -120,27 +92,13 @@ jobs:
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
           funsecret load "$url"
 
-      - name: Configure local database
-        run: |
-          db_dir="$HOME/.cache/farfarfun/funflix"
-          mkdir -p "$db_dir"
-          echo "FUNFLIX_DATABASE_URL=sqlite+aiosqlite:///$db_dir/funflix.db" >> "$GITHUB_ENV"
-
-      - name: Sync pull
-        run: funflix sync pull --job parse
-
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
       # 影响范围有限，不会一次把所有待解析的都搭进去。
       - name: Parse
-        run: funflix parse --limit 30000
-
-      - name: Sync push
-        if: always()
-        run: funflix sync push --job parse
+        run: funflix parse --limit 20000
 
   verify:
-    # 说明见 collect job：没配 FUNFLIX_RUNNER_LABEL 仓库变量时落回 ubuntu-latest。
-    runs-on: ${{ vars.FUNFLIX_RUNNER_LABEL || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
       group: pipeline-verify
@@ -166,21 +124,5 @@ jobs:
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
           funsecret load "$url"
 
-      - name: Configure local database
-        run: |
-          db_dir="$HOME/.cache/farfarfun/funflix"
-          mkdir -p "$db_dir"
-          echo "FUNFLIX_DATABASE_URL=sqlite+aiosqlite:///$db_dir/funflix.db" >> "$GITHUB_ENV"
-
-      - name: Sync pull
-        run: funflix sync pull --job verify
-
-      # verify 探测第三方网盘链接，受限于显式的限流（worker_verify_rate，约
-      # 3.8~5 条/秒，避免触发对方风控），不是数据库延迟——是三个 job 里的
-      # 长板。6000 条按实测速率约 26~27 分钟跑完，留出余量控制在 30 分钟内。
       - name: Verify
-        run: funflix verify --limit 6000
-
-      - name: Sync push
-        if: always()
-        run: funflix sync push --job verify
+        run: funflix verify --limit 3000
