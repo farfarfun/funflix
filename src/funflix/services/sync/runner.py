@@ -113,18 +113,22 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
                 await session.execute(_upsert_stmt(session, spec, chunk))
             result.applied += len(chunk)
             continue
-        except DBAPIError:
+        except DBAPIError as err:
             # 覆盖唯一键冲突，也覆盖数据不合法（比如超长字段撞上 varchar 长度）——
             # 本地 SQLite 不强制这些约束，问题字段能顺利落进本地库，直到 push
             # 到远端 Postgres 才会报错。catch 用基类 DBAPIError 而不是具体的
             # IntegrityError/DataError：asyncpg 的错误映射表并不完整（见
             # sqlalchemy.dialects.postgresql.asyncpg._asyncpg_error_translate），
             # 像 StringDataRightTruncationError 这类真实会遇到的错误最终只会
-            # 被包成通用的 DBAPIError，具体子类反而抓不到。
+            # 被包成通用的 DBAPIError，具体子类反而抓不到。这里打的是"批量降级"
+            # 消息，不代表最终一定是唯一键冲突——真实原因看 repr(err)（见
+            # https://github.com/farfarfun/funflix/issues/3：之前没打出真实异常，
+            # 排查一个"结构上不可能冲突"的表被 100% 跳过时无从下手）。
             logger.warning(
-                "%s: 批量 upsert 撞上业务唯一键冲突或数据不合法，降级为逐行处理（%d 行）",
+                "%s: 批量 upsert 失败，降级为逐行处理（%d 行）：%r",
                 spec.table.name,
                 len(chunk),
+                err,
             )
 
         for row in chunk:
@@ -132,14 +136,23 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
                 async with session.begin_nested():
                     await session.execute(_upsert_stmt(session, spec, [row]))
                 result.applied += 1
-            except DBAPIError:
+            except DBAPIError as err:
                 pk_value = {c: row.get(c) for c in pk_cols}
-                logger.warning(
-                    "%s: 跳过一行（唯一键冲突或数据不合法），主键=%s", spec.table.name, pk_value
-                )
+                logger.warning("%s: 跳过一行，主键=%s：%r", spec.table.name, pk_value, err)
                 result.skipped_conflicts += 1
 
     await session.commit()
+
+    if rows and not result.applied:
+        # 真实的业务唯一键冲突只会命中一小撮行，不可能整张表每一行都撞上——
+        # 100% 跳过基本就是把某种不相关的 DBAPIError（见上面的 warning 日志）
+        # 误判成了"冲突"。这种情况下继续往下跑等于用一次"成功"的同步报告
+        # 掩盖一次实质上的完全失败，宁可在这里报错让调用方能感知到。
+        raise RuntimeError(
+            f"{spec.table.name}: 全部 {len(rows)} 行同步失败（非真实唯一键冲突），"
+            "看上面的 warning 日志定位真实异常"
+        )
+
     return result
 
 

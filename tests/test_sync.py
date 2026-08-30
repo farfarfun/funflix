@@ -224,6 +224,27 @@ class TestPush:
         remote_rows = (await remote_session.execute(select(Source))).scalars().all()
         assert [r.identifier for r in remote_rows] == ["ch1"]
 
+    async def test_raises_when_every_row_is_rejected(
+        self, local_session, remote_session, monkeypatch
+    ):
+        """回归 GitHub issue #3：`link_check` 这类除了主键外没有任何唯一约束
+        的表，被误判为"每一行都撞上业务唯一键冲突"而 100% 跳过——本地库
+        `COUNT(*)` 永远是 0，但 `sync push`/`pull` 还报告"成功"，问题被
+        20 万+ 条 warning 日志淹没。真实的业务唯一键冲突只会命中一小撮行，
+        全表 100% 失败基本可以断定是别的 DBAPIError 被误标成了冲突——
+        这种情况应该整体报错，而不是安静地"同步成功但一行都没进去"。"""
+
+        def always_fails(session, spec, values):
+            raise DBAPIError("INSERT", {}, Exception("something unrelated to conflicts"))
+
+        monkeypatch.setattr(sync_runner, "_upsert_stmt", always_fails)
+
+        local_session.add(_source())
+        await local_session.commit()
+
+        with pytest.raises(RuntimeError, match="全部 1 行同步失败"):
+            await push(local_session, remote_session)
+
 
 class TestSyncTablesFiltering:
     """`sync_tables(names=...)`：每个 pipeline job 只同步自己需要的表，
