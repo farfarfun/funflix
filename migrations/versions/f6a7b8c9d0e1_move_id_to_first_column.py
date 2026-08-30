@@ -56,9 +56,12 @@ def _bare_column(col: sa.Column) -> sa.Column:
 
 
 def _capture(bind: sa.engine.Connection, table: str) -> dict:
+    # contype 是 pg_constraint 里的内建 "char" 类型——asyncpg 把它读成 bytes
+    # （如 b'p'），跟字符串字面量 "p" 比较永远是 False，会静默漏判整类约束；
+    # 显式 ::text 转成字符串，不依赖驱动的类型映射。
     constraints = bind.execute(
         sa.text(
-            "SELECT conname, contype, pg_get_constraintdef(oid) "
+            "SELECT conname, contype::text, pg_get_constraintdef(oid) "
             "FROM pg_constraint WHERE conrelid = cast(:t as regclass)"
         ),
         {"t": table},
@@ -108,6 +111,21 @@ def _rebuild(bind: sa.engine.Connection, table: str, *, id_first: bool) -> None:
     )
     bind.execute(sa.text(f'DROP TABLE "{table}" CASCADE'))
     bind.execute(sa.text(f'ALTER TABLE "{tmp_name}" RENAME TO "{table}"'))
+
+    # PG18+ 把列级 NOT NULL 也存成命名约束，建表时自动按当时的表名生成
+    # （如 "{tmp_name}_id_not_null"）；改表名不会跟着改这些约束名，得手动纠正，
+    # 否则会重新制造一遍"名字带着历史包袱"的问题——这正是这次迁移想清理掉的。
+    stale = bind.execute(
+        sa.text(
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = cast(:t as regclass) AND contype = 'n' "
+            "AND conname LIKE :prefix"
+        ),
+        {"t": table, "prefix": f"{tmp_name}\\_%"},
+    ).fetchall()
+    for (conname,) in stale:
+        fixed = table + conname[len(tmp_name) :]
+        bind.execute(sa.text(f'ALTER TABLE "{table}" RENAME CONSTRAINT "{conname}" TO "{fixed}"'))
 
 
 def _restore_constraints(bind: sa.engine.Connection, captured: dict[str, dict]) -> None:
