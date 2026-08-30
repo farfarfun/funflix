@@ -23,14 +23,15 @@ from funflix.services.sync import TableSyncResult, pull, push
 BASE = utcnow()
 
 
-async def _make_session() -> AsyncIterator[AsyncSession]:
+async def _make_session(*, create_schema: bool = True) -> AsyncIterator[AsyncSession]:
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if create_schema:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with maker() as session:
         yield session
@@ -40,6 +41,13 @@ async def _make_session() -> AsyncIterator[AsyncSession]:
 @pytest_asyncio.fixture
 async def local_session() -> AsyncIterator[AsyncSession]:
     async for session in _make_session():
+        yield session
+
+
+@pytest_asyncio.fixture
+async def blank_local_session() -> AsyncIterator[AsyncSession]:
+    """没有预先建表的本地库——模拟 CI runner 上全新的 SQLite 文件。"""
+    async for session in _make_session(create_schema=False):
         yield session
 
 
@@ -79,6 +87,18 @@ def _result(report, table: str) -> TableSyncResult:
 
 @pytest.mark.asyncio
 class TestPull:
+    async def test_creates_local_schema_when_missing(self, blank_local_session, remote_session):
+        """回归：CI runner 每次都是全新机器，本地 SQLite 文件里连表都没有——
+        `pull` 不能假设本地库已经建过表，得自己先建。"""
+        remote_session.add(_source())
+        await remote_session.commit()
+
+        report = await pull(blank_local_session, remote_session)
+
+        assert _result(report, "source").applied == 1
+        rows = (await blank_local_session.execute(select(Source))).scalars().all()
+        assert [r.identifier for r in rows] == ["ch1"]
+
     async def test_bootstraps_empty_local_from_remote(self, local_session, remote_session):
         remote_session.add(_source())
         await remote_session.commit()

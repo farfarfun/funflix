@@ -24,6 +24,7 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.models import Base
 from funflix.services.sync.tables import SyncTable, sync_tables
 
 logger = logging.getLogger(__name__)
@@ -142,11 +143,24 @@ async def _sync_direction(source: AsyncSession, target: AsyncSession) -> SyncRep
     return report
 
 
+async def ensure_local_schema(local: AsyncSession) -> None:
+    """CI runner 上的本地 SQLite 文件可能是全新的、还没有任何表。
+
+    不借道 alembic 建表——迁移脚本里有 Postgres-only 的 DDL（pg_trgm 扩展、
+    列物理重排），本地库既然是 SQLite 就跑不通。直接用 ORM metadata
+    建表：`CREATE TABLE IF NOT EXISTS` 语义，表已存在时是空操作。
+    """
+    conn = await local.connection()
+    await conn.run_sync(Base.metadata.create_all)
+
+
 async def pull(local: AsyncSession, remote: AsyncSession) -> SyncReport:
     """remote → local，remote 为准。按外键依赖顺序（父表先）逐表处理。"""
+    await ensure_local_schema(local)
     return await _sync_direction(source=remote, target=local)
 
 
 async def push(local: AsyncSession, remote: AsyncSession) -> SyncReport:
     """local → remote。按外键依赖顺序（父表先）逐表处理。"""
+    await ensure_local_schema(local)
     return await _sync_direction(source=local, target=remote)
