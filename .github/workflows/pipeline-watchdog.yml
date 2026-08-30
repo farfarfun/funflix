@@ -1,0 +1,68 @@
+name: Pipeline Watchdog
+
+# collect.yml 的 `schedule` 每 2 小时触发一次，但 GitHub 官方就承认：平台负载高
+# 时 schedule 触发会被延迟，严重时直接跳过——跳过的那一轮完全不会留下 run 记录，
+# 没有失败可重试，日志里也看不出任何异常。实测过一天里连续跳了两轮（本该 10:13/
+# 12:13 各跑一次，结果完全没触发，下一轮拖到 14:50 才补上）。
+#
+# 应对思路不是让 collect.yml 自己更"准时"（这是 GitHub 调度器的限制，改 cron
+# 表达式改不了），而是加一层高频（15 分钟一次）巡检：这个频率下同样会被 GitHub
+# 偶尔跳过，但连续多轮都跳过的概率远低于"每 2 小时跳过整轮"，用频率把漏检概率
+# 压下去。巡检发现上一次运行已经超过预期间隔太久，就用 `workflow_dispatch`
+# 手动补一次——不追求跟原定时间分秒不差，只保证"漏了会被较快补上"。
+on:
+  schedule:
+    # 错开整点/半点（GitHub 文档里点名的高负载时段），用 7/22/37/52 分。
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: pipeline-watchdog
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger collect.yml if it's overdue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if gh run list --workflow=collect.yml --status=in_progress --json databaseId -q '.[0].databaseId' | grep -q .; then
+            echo "已经有一轮在跑，不重复触发"
+            exit 0
+          fi
+          if gh run list --workflow=collect.yml --status=queued --json databaseId -q '.[0].databaseId' | grep -q .; then
+            echo "已经有一轮排队中，不重复触发"
+            exit 0
+          fi
+
+          last_created="$(gh run list --workflow=collect.yml --limit 1 --json createdAt -q '.[0].createdAt')"
+          if [ -z "$last_created" ]; then
+            echo "查不到 collect.yml 的历史 run，跳过（不该发生，保守起见不触发）"
+            exit 0
+          fi
+
+          last_epoch=$(date -d "$last_created" +%s)
+          now_epoch=$(date -u +%s)
+          elapsed_min=$(( (now_epoch - last_epoch) / 60 ))
+
+          # 阈值给 2 小时 15 分：比正常的 2 小时间隔多留 15 分钟余量，避免跟本来
+          # 就要准时触发的那一轮撞车、白白多跑一次。
+          threshold_min=135
+
+          echo "距上次运行 ${elapsed_min} 分钟（阈值 ${threshold_min} 分钟）"
+          if [ "$elapsed_min" -ge "$threshold_min" ]; then
+            echo "超过阈值，判定为上一轮 schedule 被 GitHub 跳过，手动补触发一次"
+            gh workflow run collect.yml
+          else
+            echo "还在正常间隔内，不用补"
+          fi
