@@ -54,7 +54,6 @@ email = "niuliangtao@qq.com"
 name = "farfarfun"
 email = "farfarfun@qq.com"
 [project.optional-dependencies]
-pg = ["asyncpg>=0.29"]
 llm = ["anthropic>=0.40"]
 drives = ["fundrive>=2.0.85"]
 zh = ["opencc-python-reimplemented>=0.1.7"]
