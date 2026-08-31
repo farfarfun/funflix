@@ -31,7 +31,7 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 ## 快速开始
 
 ```bash
-pip install -e .
+funbuild install   # 本地构建并安装，清理旧构建、反映当前代码（生产发布用 funbuild build）
 
 # 建库
 alembic upgrade head
@@ -41,9 +41,15 @@ funflix source add https://t.me/s/<频道名>
 funflix source collect
 funflix source list
 
-# 起服务
-funflix serve --reload
-# 接口文档 http://127.0.0.1:8000/docs
+# 起服务（前台，开发用；默认端口 18810）
+funflix server run --reload
+# 接口文档 http://127.0.0.1:18810/docs
+
+# 后台常驻、状态查询、停止、重启（生产用，本地一样适用）
+funflix server start
+funflix server status
+funflix server stop
+funflix server restart
 ```
 
 ## 命令行
@@ -55,7 +61,7 @@ funflix serve --reload
 | `funflix verify` | 校验，默认处理到清空为止，可用 `--limit` 显式设上限 |
 | `funflix run` | 采集 → 解析（`--skip-collect` 时只解析，均不含校验），解析默认处理到清空为止 |
 | `funflix worker --once` | 采集 → 解析 → 校验，各推进到队列清空后退出 |
-| `funflix worker` / `funflix serve`（`FUNFLIX_WORKER_ENABLED=true`） | 循环反复：采集 → 解析 → 校验，各推进到队列清空，直到停止（某一队列大量积压时会在这一轮里暂时独占，属预期行为） |
+| `funflix worker` / `funflix server start`/`run`（`FUNFLIX_WORKER_ENABLED=true`） | 循环反复：采集 → 解析 → 校验，各推进到队列清空，直到停止（某一队列大量积压时会在这一轮里暂时独占，属预期行为） |
 
 `parse`/`verify` 内部按 `--batch-size`（默认 500）分批拉取执行，不会一次性把全部
 待处理行读进内存；进度条从一开始就按总量显示，过程中持续推进。每批内部再按
@@ -90,7 +96,16 @@ funflix serve --reload
 | `funflix verify` | 校验：探测网盘链接现在还能不能用 |
 | `funflix run` | 一条龙：采集全部启用的源，再解析待处理文本 |
 | `funflix worker` | 常驻后台 worker：周期性地采集、解析、校验（`--once` 只跑一轮就退出） |
-| `funflix serve` | 启动 API 服务 |
+| `funflix server run` | 前台启动 API 服务，Ctrl-C 停止；`--reload` 开发用 |
+| `funflix server start` | 后台启动 API 服务：拉一个子进程跑 `server run` |
+| `funflix server stop` | 停止后台服务（`SIGTERM` 优雅退出） |
+| `funflix server restart` | 先 `stop` 再 `start` |
+| `funflix server status` | 查看后台服务是否在跑、PID、安装的版本号 |
+
+`server` 各命令默认监听 `127.0.0.1:18810`，`--host`/`--port`/`--config` 可覆盖；
+`--config` 缺省时读 `${XDG_CONFIG_HOME:-~/.config}/farfarfun/funflix/config.toml`
+（不存在就用默认值，不算错误）。`start` 写的 PID 文件（`server.pid`）和日志
+（`server.log`）都放在同一个配置目录下，跟 `--config` 默认路径统一管理。
 | `funflix probes` | 列出可用的网盘校验探针 |
 | `funflix extractors` | 列出可用的抽取器 |
 | `funflix search <keyword>` | 按剧名搜索作品及其资源 |

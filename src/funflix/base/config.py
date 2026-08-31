@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     #: 有意义是在 self-hosted runner 上：workflow 会用环境变量把
     #: `FUNFLIX_DATABASE_URL` 明着指向本地库，此时 `remote_database_url` 仍
     #: 落回 funsecret 拿到远端地址，两个配置互不干扰，不用为此改动共享的
-    #: funsecret 值（那个值还被 `funflix serve` 等其他消费者用着）。
+    #: funsecret 值（那个值还被 `funflix server start` 等其他消费者用着）。
     remote_database_url: str = Field(default_factory=resolve_database_url)
 
     # --- 搜索 ---
@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     # --- 后台 worker（见 docs/DESIGN.md §5）---
     #: API 进程内是否顺带跑后台 worker。
     #:
-    #: 默认**关闭**，与设计文档不同，理由是两个：一是开着的话 `funflix serve`
+    #: 默认**关闭**，与设计文档不同，理由是两个：一是开着的话 `funflix server start`
     #: 会自己开始调 LLM 和探网盘，一条会真实花钱的副作用不该由"起个 API"隐式触发；
     #: 二是 uvicorn 多 worker 部署时每个进程都会起一份，租约虽然能防重复处理，
     #: 但白白多出几倍的空转轮询。生产建议用独立的 `funflix worker` 进程。

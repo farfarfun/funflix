@@ -6,7 +6,7 @@
 `ON CONFLICT` 只保护主键；六张表在主键之外还各自有一个业务唯一键
 （`resource.(provider, share_id)`、`source.(source_type, identifier)`、
 `raw_document.content_hash` 等）。如果推送的行主键在对端是新的、但业务键已经
-存在（比如 `funflix serve` 直连远端摄入的内容和本地 collect 刚采到的一样，走
+存在（比如 `funflix server start` 直连远端摄入的内容和本地 collect 刚采到的一样，走
 的是两条独立路径生成了不同的 uuid7），批量 upsert 会在业务唯一键上报
 `IntegrityError`——这时降级为逐行处理，单行冲突就跳过并记录警告，不拖累整批
 里其余没问题的行。这一行会留在"未同步"状态，下一轮 pull 会看到对端的权威版

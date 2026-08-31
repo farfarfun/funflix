@@ -283,7 +283,7 @@ LLM 出错代价最高的是链接，所以链接走**双轨**：
 6. **逃生舱**：`funflix worker` CLI 跑同一套 claim 逻辑，脱离 API 进程独立消费；
    `--once` 只跑一轮。想上 Celery/arq 时只需替换轮询循环，模型层不动。
 
-进程内 worker（`FUNFLIX_WORKER_ENABLED`）**默认关闭**：一是开着的话 `funflix serve`
+进程内 worker（`FUNFLIX_WORKER_ENABLED`）**默认关闭**：一是开着的话 `funflix server start`
 会自己开始调 LLM、探网盘，一条真实花钱的副作用不该由"起个 API"隐式触发；
 二是 uvicorn 多 worker 部署时每个进程都会起一份，租约虽能防重复处理，但白白多出几倍空转。
 生产建议用独立的 `funflix worker` 进程。
