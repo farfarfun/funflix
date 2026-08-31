@@ -142,7 +142,7 @@ async def update_source(
     return SourceOut.model_validate(source)
 
 
-@router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_source(source_id: uuid.UUID, session: SessionDep, _: AdminDep) -> None:
     """删除采集源。已采集的原始文本会保留（source_id 置空）。"""
     source = await _get_or_404(session, source_id)
