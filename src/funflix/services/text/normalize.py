@@ -234,6 +234,16 @@ _TITLE_EPISODE_PATTERNS = (
 #: 「能不能识别出来」和「要不要从标题里剥掉」是两件事。
 _EPISODE_PATTERNS = (*_TITLE_EPISODE_PATTERNS, _SEASON_EPISODE_RE, _BARE_SEASON_RE)
 
+_CN_SEASON_EPISODE_RE = re.compile(
+    r"第\s*[一二三四五六七八九十百零\d]+\s*季"
+    r"(?:\s*第?\s*[一二三四五六七八九十百零\d]+(?:\s*[-~－]\s*\d+)?\s*集)?"
+)
+
+_SIZE_RE = re.compile(
+    r"(?<![\w.])(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT](?:I?B)?)\b",
+    re.IGNORECASE,
+)
+
 #: 作品类型的判定关键词。命中越靠前的越优先。
 _MEDIA_TYPE_KEYWORDS: tuple[tuple[MediaType, tuple[str, ...]], ...] = (
     (MediaType.VARIETY, ("综艺", "真人秀", "脱口秀", "访谈")),
@@ -573,11 +583,20 @@ def extract_episode_info(text: str) -> str | None:
     """提取集数描述，如 `全40集` / `S01E01-E12`。取最先出现的一个。"""
     normalized = unicodedata.normalize("NFKC", text)
     best: tuple[int, str] | None = None
-    for pattern in _EPISODE_PATTERNS:
+    for pattern in (*_EPISODE_PATTERNS, _CN_SEASON_EPISODE_RE):
         m = pattern.search(normalized)
         if m and (best is None or m.start() < best[0]):
             best = (m.start(), m.group(0).strip())
     return best[1] if best else None
+
+
+def extract_size_bytes(text: str) -> int | None:
+    """提取文件大小，支持 ``440.41MB`` / ``7.49G`` 等常见写法。"""
+    match = _SIZE_RE.search(unicodedata.normalize("NFKC", text))
+    if match is None:
+        return None
+    power = {"K": 1, "M": 2, "G": 3, "T": 4}[match.group("unit")[0].upper()]
+    return int(float(match.group("value")) * 1024**power)
 
 
 def guess_media_type(text: str, title: str | None = None) -> MediaType:

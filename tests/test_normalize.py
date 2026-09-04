@@ -7,6 +7,7 @@ from funflix.services.text.normalize import (
     clean_title,
     extract_episode_info,
     extract_quality,
+    extract_size_bytes,
     extract_year,
     guess_media_type,
     norm_key,
@@ -157,6 +158,7 @@ class TestExtractEpisodeInfo:
             ("测试剧集 更新至20集", "更新至20集"),
             ("Title S01E01-E12", "S01E01-E12"),
             ("Title EP01-EP12", "EP01-EP12"),
+            ("季集：第2季 第3集", "第2季 第3集"),
         ],
     )
     def test_extracts_episode_info(self, text: str, expected: str) -> None:
@@ -164,6 +166,14 @@ class TestExtractEpisodeInfo:
 
     def test_returns_none_for_movie(self) -> None:
         assert extract_episode_info("测试电影 1080p") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("大小：440.41MB", 461_803_356), ("7.49G", 8_042_326_261), ("未知", None)],
+)
+def test_extracts_size_bytes(text: str, expected: int | None) -> None:
+    assert extract_size_bytes(text) == expected
 
 
 class TestGuessMediaType:

@@ -355,6 +355,8 @@ async def _upsert_resource(
             existing.passcode = link.passcode
         if existing.title_raw is None and item is not None:
             existing.title_raw = item.title
+        if existing.size_bytes is None and item is not None:
+            existing.size_bytes = item.size_bytes
         return existing, False
 
     checkable = link.provider in CHECKABLE_PROVIDERS
@@ -368,6 +370,7 @@ async def _upsert_resource(
         # quality 非空列，未归属的链接要给默认值而不是 None
         quality=item.quality if item else Quality.UNKNOWN,
         episode_info=item.episode_info if item else None,
+        size_bytes=item.size_bytes if item else None,
         check_status=CheckStatus.UNCHECKED if checkable else CheckStatus.UNSUPPORTED,
         next_check_at=now if checkable else None,
         first_seen_at=now,

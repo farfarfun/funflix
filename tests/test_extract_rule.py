@@ -80,7 +80,7 @@ class TestRuleExtractor:
 
     async def test_reports_identity_for_cache_key(self) -> None:
         outcome = await RuleExtractor().extract("名称：剧集甲")
-        assert (outcome.extractor_name, outcome.extractor_version) == ("rule", "v1")
+        assert (outcome.extractor_name, outcome.extractor_version) == ("rule", "v2")
 
     async def test_rehydrate_matches_fresh_extraction(self) -> None:
         text = "名称：剧集甲\n夸克：https://pan.quark.cn/s/a1"

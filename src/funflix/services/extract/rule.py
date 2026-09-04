@@ -16,6 +16,7 @@ from funflix.services.text.normalize import (
     clean_title,
     extract_episode_info,
     extract_quality,
+    extract_size_bytes,
     extract_tags,
     extract_year,
     guess_media_type,
@@ -24,7 +25,7 @@ from funflix.services.text.normalize import (
 )
 from funflix.services.text.segment import segment_text
 
-VERSION = "v1"
+VERSION = "v2"
 
 
 def _looks_like_catalog(title: str, segment_count: int, link_count: int) -> bool:
@@ -83,6 +84,7 @@ class RuleExtractor:
                     media_type=guess_media_type(segment.text, raw_title),
                     episode_info=extract_episode_info(segment.text),
                     quality=extract_quality(segment.text),
+                    size_bytes=extract_size_bytes(segment.text),
                     tags=extract_tags(segment.text),
                     links=list(segment.links),
                 )

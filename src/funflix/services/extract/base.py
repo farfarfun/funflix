@@ -25,6 +25,7 @@ class ExtractedItem:
     media_type: MediaType = MediaType.UNKNOWN
     episode_info: str | None = None
     quality: Quality = Quality.UNKNOWN
+    size_bytes: int | None = None
     links: list[ScannedLink] = field(default_factory=list)
     #: 分类标签，形如 [("genre", "悬疑"), ("region", "国产")]
     tags: list[tuple[str, str]] = field(default_factory=list)
