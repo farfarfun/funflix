@@ -26,6 +26,11 @@ class TestIdentifyProvider:
                 Provider.MAGNET,
                 "0123456789abcdef0123456789abcdef01234567",
             ),
+            (
+                "ed2k://|file|Show.S01E01.mkv|12345|ABCDEF0123456789ABCDEF0123456789|/",
+                Provider.ED2K,
+                "abcdef0123456789abcdef0123456789",
+            ),
         ],
     )
     def test_recognizes_each_provider(self, url: str, provider: Provider, share_id: str) -> None:
@@ -85,6 +90,12 @@ class TestScanLinks:
 
     def test_returns_empty_for_text_without_links(self) -> None:
         assert scan_links("就是一段没有链接的文字") == []
+
+    def test_preserves_spaces_in_ed2k_filename(self) -> None:
+        url = "ed2k://|file|Show S01E01 1080p.mkv|12345|ABCDEF0123456789ABCDEF0123456789|/"
+        link = scan_links(f"电驴：{url}\n下一行")[0]
+        assert link.provider is Provider.ED2K
+        assert link.url == url
 
 
 class TestTrailingPunctuation:

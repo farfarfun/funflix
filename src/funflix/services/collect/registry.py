@@ -8,12 +8,14 @@ from funflix.services.collect.rss import RSSCollector
 from funflix.services.collect.telegram import TelegramChannelCollector
 from funflix.services.collect.tencent_sheet import TencentSheetCollector
 from funflix.services.collect.tencent_text import TencentTextCollector
+from funflix.services.collect.yyets import YYeTsCollector
 
 _REGISTRY: dict[SourceType, type[Collector]] = {
     SourceType.TELEGRAM: TelegramChannelCollector,
     SourceType.TENCENT_DOCS: TencentSheetCollector,
     SourceType.TENCENT_DOC: TencentTextCollector,
     SourceType.RSS: RSSCollector,
+    SourceType.API: YYeTsCollector,
 }
 
 

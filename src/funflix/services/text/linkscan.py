@@ -17,7 +17,9 @@ from funflix.base.enums import Provider
 
 #: 从文本里粗提 URL。刻意不含中文标点与空白，避免把后面的中文吞进来。
 _URL_RE = re.compile(
-    r"(?:https?://[^\s<>\"'，。、；：！？（）【】《》「」『』]+|magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s]*)",
+    r"(?:https?://[^\s<>\"'，。、；：！？（）【】《》「」『』]+"
+    r"|magnet:\?xt=urn:btih:[A-Za-z0-9]+[^\s]*"
+    r"|ed2k://\|file\|[^\r\n<>\"']+?\|/)",
     re.IGNORECASE,
 )
 
@@ -55,6 +57,10 @@ _PROVIDER_PATTERNS: tuple[tuple[Provider, re.Pattern[str]], ...] = (
         re.compile(r"^https?://(?:[a-z0-9\-]+\.)?lanzou[a-z]*\.com/(?P<sid>[A-Za-z0-9_\-]+)", re.I),
     ),
     (Provider.MAGNET, re.compile(r"^magnet:\?xt=urn:btih:(?P<sid>[A-Za-z0-9]+)", re.I)),
+    (
+        Provider.ED2K,
+        re.compile(r"^ed2k://\|file\|.*?\|\d+\|(?P<sid>[A-Fa-f0-9]{32})\|", re.I),
+    ),
 )
 
 #: URL 自带的提取码参数
@@ -113,7 +119,7 @@ def identify_provider(url: str) -> tuple[Provider, str] | None:
             groups = m.groupdict()
             sid = groups.get("sid") or groups.get("sid2")
             if sid:
-                return provider, sid
+                return provider, sid.lower() if provider is Provider.ED2K else sid
     return None
 
 
@@ -160,11 +166,7 @@ def scan_links(text: str, *, include_unknown: bool = True) -> list[ScannedLink]:
             provider, share_id = identified
 
         end = match.start() + len(matched_url)
-        url = (
-            f"magnet:?xt=urn:btih:{share_id}"
-            if provider is Provider.MAGNET
-            else matched_url
-        )
+        url = f"magnet:?xt=urn:btih:{share_id}" if provider is Provider.MAGNET else matched_url
         if len(url) > _MAX_URL_LENGTH:
             continue
 

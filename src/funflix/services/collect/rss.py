@@ -81,11 +81,7 @@ def _first_text(node: ET.Element, names: set[str]) -> str:
 def _entry_links(node: ET.Element) -> list[str]:
     links: list[str] = []
     for child in _children(node, {"link", "enclosure", "content", "magneturi"}):
-        href = (
-            child.attrib.get("href")
-            or child.attrib.get("url")
-            or (child.text or "").strip()
-        )
+        href = child.attrib.get("href") or child.attrib.get("url") or (child.text or "").strip()
         if href and href.lower().startswith(("http://", "https://", "magnet:")):
             links.append(href)
     return list(dict.fromkeys(links))

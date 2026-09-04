@@ -74,6 +74,7 @@ class Provider(StrEnum):
     TIANYI = "tianyi"
     XUNLEI = "xunlei"
     MAGNET = "magnet"
+    ED2K = "ed2k"
     OTHER = "other"
 
 
