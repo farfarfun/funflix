@@ -27,6 +27,7 @@ from funflix.services.collect.base import CollectedMessage, FetchResult
 from funflix.services.collect.concurrent_runner import (
     BackfillPageTotals,
     _CollectProducer,
+    _detached_copy,
     _TelegramPageJob,
     run_collect_pipeline,
 )
@@ -118,6 +119,10 @@ def _stub_registry(monkeypatch):
 
 @pytest.mark.asyncio
 class TestOpaqueSources:
+    async def test_source_snapshot_keeps_url(self) -> None:
+        source = _source("s1")
+        assert _detached_copy(source).url == source.url
+
     async def test_matches_sequential_collect_source_for_single_source(self, db_url) -> None:
         async with open_session(db_url) as session:
             source = _source("s1")

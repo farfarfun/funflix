@@ -19,7 +19,7 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 
 | 阶段 | 状态 |
 | --- | --- |
-| M0 采集源 + Telegram 采集器 + 水位 | ✅ 已完成 |
+| M0 采集源 + Telegram / RSS 采集器 + 水位 | ✅ 已完成 |
 | M1 数据模型 + 迁移 + 原始文本接口 | ✅ 已完成 |
 | M2 链接扫描 + 文本分段 + 剧名归一 | ✅ 已完成 |
 | M3 LLM 抽取 | ✅ 已完成 |
@@ -27,6 +27,17 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 | M5 worker 租约 + 常驻调度 | ✅ 已完成 |
 | M6 查询接口 | ✅ 已完成（SQLite 走 LIKE，FTS5 后端待补） |
 | M7 其余网盘探针（百度 / 蓝奏 / 天翼等） | 待开发 |
+
+### 当前采集源
+
+| 类型 | 当前实现 | 增量依据 | 适合接入 |
+| --- | --- | --- | --- |
+| `telegram` | Telegram 公开 Web 预览页 | 消息 ID，可追新/补历史 | 频道分享文本 |
+| `tencent_docs` | 腾讯智能表格接口 | sheet 版本与行偏移 | 结构化资源表 |
+| `tencent_doc` | 腾讯文本文档接口 | 文档 revision | 文本型资源清单 |
+| `rss` | 通用 RSS 2.0 / Atom | 条目 `guid` / `id` | 公开影视、动漫、种子 feed |
+
+`weibo`、`forum`、`api` 等枚举值目前只是预留，尚未注册采集器；登记时会被拒绝。
 
 ## 快速开始
 
@@ -111,6 +122,15 @@ funflix server restart
 | `funflix search <keyword>` | 按剧名搜索作品及其资源 |
 | `funflix doc <doc_id>` | 查看一条原始文本及其解析状态 |
 | `funflix ingest <path>` | 从文件导入原始文本（`.txt` / `.jsonl`） |
+
+采集源除 Telegram 频道和腾讯文档外，还支持公开 RSS/Atom feed。RSS 条目标题、
+描述、真实链接、Atom enclosure，以及 Nyaa 的 `infoHash` 都会转成原始文本，按
+feed 的 `guid`/`id` 增量去重。示例：
+
+```bash
+funflix source add 'https://nyaa.si/?page=rss&c=1_2&f=0'
+funflix source collect
+```
 
 `funflix db` 子命令：
 

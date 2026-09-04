@@ -118,6 +118,7 @@ class TestNormalizeIdentifier:
             SourceType.TELEGRAM,
             SourceType.TENCENT_DOCS,
             SourceType.TENCENT_DOC,
+            SourceType.RSS,
         }
 
     def test_doc_url_does_not_route_to_sheet_collector(self) -> None:

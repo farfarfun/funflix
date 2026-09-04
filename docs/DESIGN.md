@@ -69,15 +69,15 @@
 
 ### 3.0 `source` — 采集源
 
-一个 Source 是一个可持续拉取的消息流（如一个 Telegram 频道）。它持有**水位**，
+一个 Source 是一个可持续拉取的消息流（如一个 Telegram 频道或公开 RSS/Atom feed）。它持有**水位**，
 每次采集只取水位之后的新消息，把正文写成 RawDocument 后即结束职责。
 
 | 字段 | 说明 |
 | --- | --- |
 | `id` | |
 | `source_type` | 复用 `SourceType`，采集器注册表按它分发 |
-| `url` | 采集源地址，如 `https://t.me/s/<频道名>` |
-| `identifier` | 规范化标识（Telegram 即频道名）。同一频道有 `t.me/x`、`t.me/s/x`、`@x` 多种写法，唯一性判定必须基于它而非 url |
+| `url` | 采集源地址，如 `https://t.me/s/<频道名>` 或公开 RSS/Atom feed |
+| `identifier` | 规范化标识（Telegram 为频道名，RSS 为去掉 fragment 的 feed URL）。同一源的多种写法必须归一后再做唯一性判定 |
 | `title` | 展示名，首次采集时自动回填 |
 | `enabled` / `fetch_interval_seconds` / `max_pages_per_fetch` | 调度配置 |
 | `cursor_message_id` | **主水位**：已采集到的最大消息 ID |
@@ -105,7 +105,7 @@
 | `id` | BigInt PK | |
 | `content` | Text | 原始文本全文，不做任何加工 |
 | `content_hash` | String(64) **UNIQUE** | `sha256(normalize_ws(content))`，入口去重 |
-| `source_type` | Enum | `telegram` / `weibo` / `forum` / `manual` / `api` |
+| `source_type` | Enum | `telegram` / `tencent_docs` / `tencent_doc` / `rss` / `manual` / `api` |
 | `source_name` | String(128) | 频道名 / 站点名 |
 | `source_url` | String(1024) | 可空，原帖链接 |
 | `source_msg_id` | String(128) | 可空，来源侧消息 ID |

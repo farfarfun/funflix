@@ -105,6 +105,7 @@ _TELEGRAM_PAGES_PER_VISIT = _MAX_BACKFILL_PAGES_PER_RUN
 _SOURCE_SNAPSHOT_FIELDS = (
     "id",
     "source_type",
+    "url",
     "identifier",
     "title",
     "extra",
