@@ -60,6 +60,9 @@ class TestCleanTitle:
     def test_keeps_numeric_sequel_marker(self) -> None:
         assert clean_title("测试剧集2 4K") == "测试剧集2"
 
+    def test_limits_title_to_database_column_length(self) -> None:
+        assert clean_title("a" * 600) == "a" * 500
+
 
 class TestRealCorpusRegressions:
     """以下每条都对应一个在真实语料上暴露、而合成用例全绿时未能发现的缺陷。"""

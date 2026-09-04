@@ -11,6 +11,8 @@ import unicodedata
 
 from funflix.base.enums import MediaType, Quality
 
+MAX_TITLE_LENGTH = 500
+
 # --- 噪声词表 ---------------------------------------------------------------
 
 #: 画质 / 片源 / 编码 / 音轨。这些描述的是"这一份文件"，不是"这部作品"。
@@ -344,7 +346,7 @@ def clean_title(raw: str) -> str:
 
     text = _YEAR_RE.sub(" ", text)
     text = re.sub(r"[\s\-—–_]+", " ", text).strip(" -—–_、,，.。|/\\")
-    return text.strip()
+    return text.strip()[:MAX_TITLE_LENGTH].rstrip()
 
 
 def norm_key(title: str) -> str:
