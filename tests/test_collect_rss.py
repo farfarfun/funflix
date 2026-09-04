@@ -7,13 +7,18 @@ from funflix.base.enums import SourceType
 from funflix.models import Source
 from funflix.services.collect.registry import detect_source
 from funflix.services.collect.rss import RSSCollector, parse_feed
+from funflix.services.text.linkscan import scan_links
 
 RSS = """<?xml version="1.0"?><rss version="2.0"><channel>
 <title>测试资源</title><item><guid>a</guid><title>剧集甲</title>
 <description><![CDATA[链接：<a href="https://pan.quark.cn/s/abc123">点击</a>]]></description>
+<enclosure url="https://example.test/a.torrent" type="application/x-bittorrent" />
 <pubDate>Fri, 04 Sep 2026 04:21:27 +0000</pubDate></item>
 <item><guid>b</guid><title>动漫乙</title><nyaa:infoHash
-xmlns:nyaa="https://nyaa.si/xmlns/nyaa">ABCDEF0123456789ABCDEF0123456789ABCDEF01</nyaa:infoHash></item>
+xmlns:nyaa="https://nyaa.si/xmlns/nyaa">ABCDEF0123456789ABCDEF0123456789ABCDEF01</nyaa:infoHash>
+<torrent:magnetURI xmlns:torrent="http://xmlns.ezrss.it/0.1/"><![CDATA[
+magnet:?xt=urn:btih:1234567890ABCDEF1234567890ABCDEF12345678
+]]></torrent:magnetURI></item>
 </channel></rss>"""
 
 ATOM = """<feed xmlns="http://www.w3.org/2005/Atom"><title>Atom</title>
@@ -42,8 +47,10 @@ def test_parse_rss_keeps_links_and_builds_magnet() -> None:
     messages, title = parse_feed(RSS)
     assert title == "测试资源"
     assert {message.message_id for message in messages} == {"a", "b"}
-    assert "https://pan.quark.cn/s/abc123" in messages[0].text
+    assert scan_links(messages[0].text)[0].url == "https://pan.quark.cn/s/abc123"
+    assert "https://example.test/a.torrent" in messages[0].text
     assert "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01" in messages[1].text
+    assert "magnet:?xt=urn:btih:1234567890ABCDEF1234567890ABCDEF12345678" in messages[1].text
 
 
 def test_parse_atom() -> None:

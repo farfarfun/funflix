@@ -75,6 +75,14 @@ class TestScanLinks:
         text = "https://pan.quark.cn/s/one1 https://pan.quark.cn/s/two2"
         assert len(scan_links(text)) == 2
 
+    def test_canonicalizes_magnet_without_trackers(self) -> None:
+        base = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+        raw = f"{base}&dn=Title&tr=https%3A%2F%2Ftracker.example%2Fannounce"
+        link = scan_links(raw)[0]
+        assert link.url == base
+        assert link.raw_url == raw
+        assert raw[link.start : link.end] == raw
+
     def test_returns_empty_for_text_without_links(self) -> None:
         assert scan_links("就是一段没有链接的文字") == []
 
@@ -141,3 +149,13 @@ class TestUnknownProviders:
         links = scan_known_links(text)
         assert len(links) == 1
         assert links[0].provider is Provider.QUARK
+
+    def test_hashes_long_unknown_share_id(self) -> None:
+        url = "https://example.com/" + "x" * 300
+        link = scan_links(url)[0]
+        assert link.url == url
+        assert link.share_id.startswith("sha256:")
+        assert len(link.share_id) == 71
+
+    def test_drops_unknown_url_too_long_for_storage(self) -> None:
+        assert scan_links("https://example.com/" + "x" * 2048) == []

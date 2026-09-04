@@ -9,6 +9,7 @@ LLM 负责判断"这个链接属于哪部作品"，但"原文里到底有哪些�
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -67,6 +68,8 @@ _PWD_NEAR_RE = re.compile(
 
 #: 在链接后多远的范围内找提取码。跨一行足够，跨太多会串到下一条资源上。
 _PWD_LOOKAHEAD = 60
+_MAX_SHARE_ID_LENGTH = 255
+_MAX_URL_LENGTH = 2048
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,31 +142,44 @@ def scan_links(text: str, *, include_unknown: bool = True) -> list[ScannedLink]:
 
     for match in _URL_RE.finditer(text):
         raw_url = match.group(0)
-        url = _trim_url(raw_url)
-        if not url:
+        matched_url = _trim_url(raw_url)
+        if not matched_url:
             continue
 
-        identified = identify_provider(url)
+        identified = identify_provider(matched_url)
         if identified is None:
             if not include_unknown:
                 continue
-            provider, share_id = Provider.OTHER, url
+            provider = Provider.OTHER
+            share_id = (
+                matched_url
+                if len(matched_url) <= _MAX_SHARE_ID_LENGTH
+                else "sha256:" + hashlib.sha256(matched_url.encode()).hexdigest()
+            )
         else:
             provider, share_id = identified
+
+        end = match.start() + len(matched_url)
+        url = (
+            f"magnet:?xt=urn:btih:{share_id}"
+            if provider is Provider.MAGNET
+            else matched_url
+        )
+        if len(url) > _MAX_URL_LENGTH:
+            continue
 
         key = (provider, share_id)
         if key in seen:
             continue
         seen.add(key)
 
-        end = match.start() + len(url)
         results.append(
             ScannedLink(
                 provider=provider,
                 share_id=share_id,
                 url=url,
                 raw_url=raw_url,
-                passcode=_find_passcode(text, end, url),
+                passcode=_find_passcode(text, end, matched_url),
                 start=match.start(),
                 end=end,
             )
