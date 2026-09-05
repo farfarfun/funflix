@@ -70,6 +70,8 @@ class Provider(StrEnum):
     ALIPAN = "alipan"
     BAIDU = "baidu"
     PAN115 = "pan115"
+    PAN123 = "pan123"
+    MOBILE139 = "mobile139"
     LANZOU = "lanzou"
     TIANYI = "tianyi"
     XUNLEI = "xunlei"

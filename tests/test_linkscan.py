@@ -18,6 +18,13 @@ class TestIdentifyProvider:
             ("https://pan.baidu.com/s/1AbCdEf-gh", Provider.BAIDU, "AbCdEf-gh"),
             ("https://pan.baidu.com/share/init?surl=AbCdEf", Provider.BAIDU, "AbCdEf"),
             ("https://115.com/s/sw1234abc", Provider.PAN115, "sw1234abc"),
+            ("https://www.123pan.com/s/7Tx1jv-yOMtv", Provider.PAN123, "7Tx1jv-yOMtv"),
+            ("https://www.123865.com/s/u9izjv-GF3Kv", Provider.PAN123, "u9izjv-GF3Kv"),
+            (
+                "https://yun.139.com/shareweb/#/w/i/2xop3Kh97fRxo",
+                Provider.MOBILE139,
+                "2xop3Kh97fRxo",
+            ),
             ("https://cloud.189.cn/t/QqQq22", Provider.TIANYI, "QqQq22"),
             ("https://pan.xunlei.com/s/VN_abc-123", Provider.XUNLEI, "VN_abc-123"),
             ("https://www.lanzoux.com/iAbCd12", Provider.LANZOU, "iAbCd12"),
