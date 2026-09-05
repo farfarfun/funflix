@@ -951,13 +951,13 @@ def source_list() -> None:
                 s.source_type.value,
                 s.identifier,
                 s.cursor_message_id or "-",
-                s.total_collected,
+                s.total_collected + s.total_backfilled,
                 "启用" if s.enabled else "停用",
                 f"失败{s.consecutive_failures}" if s.consecutive_failures else "",
             ]
             for s in rows
         ],
-        ["ID", "类型", "标识", "水位", "已采集", "状态", "异常"],
+        ["ID", "类型", "标识", "水位", "累计产出", "状态", "异常"],
     )
 
 
@@ -983,7 +983,9 @@ def source_show(source_id: uuid.UUID) -> None:
         ("最后采集", s.last_fetched_at or "-"),
         ("最后成功", s.last_success_at or "-"),
         ("下次采集", s.next_fetch_at or "-"),
-        ("累计产出", s.total_collected),
+        ("累计产出", s.total_collected + s.total_backfilled),
+        ("追新产出", s.total_collected),
+        ("回灌产出", s.total_backfilled),
         ("连续失败", s.consecutive_failures),
         ("最后错误", s.last_error or "-"),
         ("自定义状态", s.extra or "-"),
