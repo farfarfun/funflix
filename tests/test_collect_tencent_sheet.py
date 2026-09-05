@@ -311,32 +311,109 @@ class TestFetch:
         result = await collector.fetch(_source(extra={"tencent_sheet_versions": {"tiAAAA": 100}}))
         assert len(result.messages) == 1
 
-    async def test_paginates_through_chunks(self) -> None:
+    async def test_fetch_initializes_every_sheet_before_backfill(self) -> None:
+        collector = _collector(
+            {
+                (None, 0): build_payload(sheet_ids=("tiAAAA", "tiBBBB")),
+                ("tiAAAA", 0): build_payload(
+                    sheet_id="tiAAAA",
+                    ver=1,
+                    total_row=39_724,
+                    rows={"rA": text_row("剧A", "https://pan.quark.cn/s/a")},
+                ),
+                ("tiBBBB", 0): build_payload(
+                    sheet_id="tiBBBB",
+                    ver=2,
+                    total_row=22_161,
+                    rows={"rB": text_row("剧B", "https://pan.quark.cn/s/b")},
+                ),
+            }
+        )
+        result = await collector.fetch(_source(max_pages=1))
+
+        assert collector.requests == [(None, 0), ("tiAAAA", 0), ("tiBBBB", 0)]  # type: ignore[attr-defined]
+        assert result.state["tencent_sheet_totals"] == {
+            "tiAAAA": 39_724,
+            "tiBBBB": 22_161,
+        }
+        assert result.backfill_pending is True
+
+    async def test_backfill_returns_one_checkpointed_block(self) -> None:
+        collector = _collector(
+            {
+                ("tiAAAA", 0): build_payload(sheet_id="tiAAAA", total_row=180),
+                ("tiAAAA", 60): build_payload(
+                    sheet_id="tiAAAA",
+                    ver=7,
+                    total_row=180,
+                    rows={"r60": text_row("剧60", "https://pan.quark.cn/s/x60")},
+                ),
+            }
+        )
+        source = _source(
+            extra={
+                "tencent_sheet_offsets": {"tiAAAA": 60},
+                "tencent_sheet_totals": {"tiAAAA": 180},
+            },
+            max_pages=1,
+        )
+
+        result = await collector.backfill(source)
+
+        assert [m.message_id for m in result.messages] == ["tiAAAA:r60"]
+        assert result.state["tencent_sheet_offsets"] == {"tiAAAA": 120}
+        assert result.backfill_done is False
+
+    async def test_backfill_records_version_after_last_block(self) -> None:
+        collector = _collector(
+            {
+                ("tiAAAA", 0): build_payload(sheet_id="tiAAAA", total_row=180),
+                ("tiAAAA", 120): build_payload(
+                    sheet_id="tiAAAA",
+                    ver=7,
+                    total_row=180,
+                    rows={"r120": text_row("剧120", "https://pan.quark.cn/s/x120")},
+                ),
+            }
+        )
+        source = _source(
+            extra={
+                "tencent_sheet_offsets": {"tiAAAA": 120},
+                "tencent_sheet_totals": {"tiAAAA": 180},
+            },
+            max_pages=1,
+        )
+
+        result = await collector.backfill(source)
+
+        assert result.state["tencent_sheet_versions"] == {"tiAAAA": 7}
+        assert result.backfill_done is True
+
+    async def test_changed_completed_version_restarts_from_first_chunk(self) -> None:
         collector = _collector(
             {
                 (None, 0): build_payload(sheet_ids=("tiAAAA",)),
                 ("tiAAAA", 0): build_payload(
                     sheet_id="tiAAAA",
-                    ver=1,
-                    total_row=120,
-                    rows={
-                        f"r{i}": text_row(f"剧{i}", f"https://pan.quark.cn/s/x{i}")
-                        for i in range(61)
-                    },
-                ),
-                ("tiAAAA", 60): build_payload(
-                    sheet_id="tiAAAA",
-                    ver=1,
-                    total_row=120,
-                    rows={
-                        f"r{i}": text_row(f"剧{i}", f"https://pan.quark.cn/s/x{i}")
-                        for i in range(61, 120)
-                    },
+                    ver=101,
+                    total_row=180,
+                    rows={"r0": text_row("新剧", "https://pan.quark.cn/s/new")},
                 ),
             }
         )
-        result = await collector.fetch(_source())
-        assert len(result.messages) == 120
+        source = _source(
+            extra={
+                "tencent_sheet_versions": {"tiAAAA": 100},
+                "tencent_sheet_offsets": {"tiAAAA": 180},
+                "tencent_sheet_totals": {"tiAAAA": 180},
+            }
+        )
+
+        result = await collector.fetch(source)
+
+        assert result.state["tencent_sheet_versions"] == {}
+        assert result.state["tencent_sheet_offsets"] == {"tiAAAA": 60}
+        assert result.backfill_pending is True
 
     async def test_version_not_advanced_when_truncated(self) -> None:
         """没取完就推进版本号，下轮会误以为已同步、永久丢掉剩余的行。"""

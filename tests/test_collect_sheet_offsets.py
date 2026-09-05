@@ -122,13 +122,16 @@ class TestBackfillResolvesColumnNames:
             return {
                 "clientVars": {
                     "collab_client_vars": {
-                        "initialAttributedText": {"text": [{"smartsheet": blob}]}
+                        "initialAttributedText": {"text": [{"smartsheet": blob}]},
+                        "smartsheetConfig": json.dumps(
+                            {"pageCtx": json.dumps({"ver": 1, "total_row": 600})}
+                        ),
                     }
                 }
             }
 
         def handler(request: httpx.Request) -> httpx.Response:
-            start = int(request.url.params.get("startRow", 0))
+            start = int(request.url.params.get("startrow", 0))
             seen_offsets.append(start)
             return httpx.Response(200, json=_payload(start))
 
@@ -174,13 +177,16 @@ class TestBackfillResolvesColumnNames:
             return {
                 "clientVars": {
                     "collab_client_vars": {
-                        "initialAttributedText": {"text": [{"smartsheet": blob}]}
+                        "initialAttributedText": {"text": [{"smartsheet": blob}]},
+                        "smartsheetConfig": json.dumps(
+                            {"pageCtx": json.dumps({"ver": 1, "total_row": 600})}
+                        ),
                     }
                 }
             }
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=_payload(int(request.url.params.get("startRow", 0))))
+            return httpx.Response(200, json=_payload(int(request.url.params.get("startrow", 0))))
 
         collector = TencentSheetCollector(
             client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), chunk_delay=0

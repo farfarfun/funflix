@@ -223,6 +223,7 @@ class TencentSheetCollector(SupportsProgress):
         self._client = client
         self._owns_client = client is None
         self._chunk_delay = chunk_delay
+        self._columns: dict[str, dict[str, str]] = {}
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
@@ -267,16 +268,14 @@ class TencentSheetCollector(SupportsProgress):
         return response.json()
 
     async def backfill(self, source: Source) -> FetchResult:
-        """继续扫剩下的行。
+        """继续扫下一个有界分片块。
 
         语义与 Telegram 相反：表格不是「往更早翻」而是「往更后面的行推」。
         `total_row` 已知，低水位就是每个 sheet 已扫到的行偏移，
         推到 `>= total_row` 即该 sheet 补完，全部补完则 `backfill_done`。
 
-        一次性把所有 pending sheet 扫到底，不再分轮限速。扫描途中请求失败
-        （网络抖动、被限流）就地收工，把已经扫到的行和新偏移一起返回、
-        `backfill_done` 留 False —— 下次 collect 从这里接着扫，而不是让
-        一次抖动扔掉这一整轮已经扫到的内容。
+        每次最多返回 `max_pages_per_fetch` 个分片，让 runner 在五分钟预算内
+        分块落库、提交偏移。任务中断时只需重取最后一小块。
         """
         doc_id = source.identifier
         offsets: dict[str, int] = dict(source.extra.get(_OFFSET_KEY) or {})
@@ -290,58 +289,71 @@ class TencentSheetCollector(SupportsProgress):
         if not pending:
             return FetchResult(backfill_done=True)
 
+        sheet_id = pending[0]
+        start = offsets[sheet_id]
+        target = totals[sheet_id]
         client = self._client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        messages: list[CollectedMessage] = []
         pages = 0
-        aborted = False
+        chunks = 0
+        messages: list[CollectedMessage] = []
+        latest_version: Any = None
 
         try:
-            for sheet_id in pending:
-                start = offsets[sheet_id]
-                target = totals.get(sheet_id, 0)
-                # 列定义**只随第 0 片下发**，后面每一片都是空的。
-                # 不先取一次的话，补历史渲染出来的每一行都是
-                # `fn99gF：https://...` 这种原始字段 ID —— 抽取器认不出标题列，
-                # 链接全部变成「未归属」。实测线上 482 条未归属资源全部出自这里。
+            # 列定义只随第 0 片下发；同一轮后续分片复用内存缓存。
+            columns = self._columns.get(sheet_id)
+            if columns is None:
                 columns = await self._sheet_columns(client, doc_id, sheet_id)
-                if columns:
-                    pages += 1
+                self._columns[sheet_id] = columns
+                pages += 1
 
-                while start < target:
-                    try:
-                        payload = await self._get(client, doc_id, sheet_id, start)
-                    except httpx.HTTPError as exc:
-                        logger.warning(
-                            "sheet %s 补历史请求失败：%s，先收工这一轮已拿到的", sheet_id, exc
-                        )
-                        aborted = True
-                        break
-                    pages += 1
-                    chunk_columns, rows = parse_sheet_chunk(_decode_smartsheet(payload))
-                    # 后续片偶尔也会带列定义（比如中途加了列），合并进来
-                    columns = {**columns, **chunk_columns}
-                    if not rows:
-                        # 空片：可能是接口抖动，也可能 total_row 不准。
-                        # 不当成补完，下轮从同一偏移重试。
-                        logger.warning(
-                            "sheet %s 在第 %d 行处返回空片（共 %s 行）", sheet_id, start, target
-                        )
-                        break
-                    messages.extend(self._to_messages(doc_id, sheet_id, columns, rows))
-                    start += _CHUNK_SIZE
-                    offsets[sheet_id] = start
-                    self._report(
-                        "backfill",
-                        pages,
-                        0,
-                        len(messages),
-                        position=f"{start}/{target}",
-                        detail=f"sheet {sheet_id}",
-                    )
-                    if start < target:
-                        await asyncio.sleep(self._chunk_delay)
-                if aborted:
+            budget = max(1, source.max_pages_per_fetch)
+            while chunks < budget and start < target:
+                await asyncio.sleep(self._chunk_delay)
+                try:
+                    payload = await self._get(client, doc_id, sheet_id, start)
+                except httpx.HTTPError as exc:
+                    logger.warning("sheet %s 补历史请求失败：%s", sheet_id, exc)
+                    if not messages:
+                        pages = 0
                     break
+
+                pages += 1
+                context = parse_page_context(payload)
+                latest_version = context.get("ver")
+                current_total = context.get("total_row")
+                if isinstance(current_total, int) and current_total >= 0:
+                    totals[sheet_id] = target = current_total
+
+                chunk_columns, rows = parse_sheet_chunk(_decode_smartsheet(payload))
+                columns.update(chunk_columns)
+                if not rows:
+                    if start < target:
+                        logger.warning(
+                            "sheet %s 在第 %d 行处返回空片（共 %s 行）",
+                            sheet_id,
+                            start,
+                            target,
+                        )
+                        if not messages:
+                            pages = 0
+                    break
+
+                messages.extend(self._to_messages(doc_id, sheet_id, columns, rows))
+                start += _CHUNK_SIZE
+                offsets[sheet_id] = start
+                chunks += 1
+                self._report(
+                    "backfill",
+                    pages,
+                    budget,
+                    len(messages),
+                    position=f"{start}/{target}",
+                    detail=f"sheet {sheet_id}",
+                )
+
+            versions: dict[str, Any] = dict(source.extra.get(_STATE_KEY) or {})
+            if offsets[sheet_id] >= target and latest_version is not None:
+                versions[sheet_id] = latest_version
         finally:
             if self._owns_client:
                 await client.aclose()
@@ -350,7 +362,7 @@ class TencentSheetCollector(SupportsProgress):
         return FetchResult(
             messages=messages,
             pages_fetched=pages,
-            state={_OFFSET_KEY: offsets},
+            state={_STATE_KEY: versions, _OFFSET_KEY: offsets, _TOTAL_KEY: totals},
             backfill_cursor=str(sum(offsets.values())),
             backfill_done=not remaining,
         )
@@ -397,9 +409,8 @@ class TencentSheetCollector(SupportsProgress):
     def _merge_offset(existing: int | None, consumed: int) -> int:
         """行偏移只能往前，不能倒退。
 
-        backfill 一轮扫到底，但文档一旦追加新行、`ver` 变化，fetch 就会重扫该
-        sheet —— 它只读得起最前面几片，直接覆盖就会把 backfill 的进度打回原点，
-        之后重扫的内容全被 content_hash 去重、白跑，期间新追加的行一直取不到。
+        backfill 已推进到后段时，文档若再次变化，fetch 只能先读第一片；直接覆盖
+        会把尚未完成的首次回灌打回原点，之后大量内容被重复读取。
         """
         return max(existing or 0, consumed)
 
@@ -416,7 +427,7 @@ class TencentSheetCollector(SupportsProgress):
         return any(off < totals.get(sheet_id, 0) for sheet_id, off in offsets.items())
 
     async def fetch(self, source: Source) -> FetchResult:
-        """枚举文档下所有 sheet，拉取版本号变化的那些。"""
+        """枚举全部 sheet，并为变化的 sheet 建立分片回灌水位。"""
         doc_id = source.identifier
         known_versions: dict[str, Any] = dict(source.extra.get(_STATE_KEY) or {})
 
@@ -426,7 +437,6 @@ class TencentSheetCollector(SupportsProgress):
         offsets: dict[str, int] = dict(source.extra.get(_OFFSET_KEY) or {})
         totals: dict[str, int] = dict(source.extra.get(_TOTAL_KEY) or {})
         pages = 0
-        truncated = False
         title: str | None = None
 
         try:
@@ -437,12 +447,7 @@ class TencentSheetCollector(SupportsProgress):
             title = (first.get("clientVars") or {}).get("title") or None
             logger.info("腾讯文档 %s 共 %d 个 sheet", doc_id, len(sheet_ids))
 
-            budget = max(1, source.max_pages_per_fetch)
             for sheet_id in sheet_ids:
-                if pages >= budget:
-                    truncated = True
-                    break
-
                 payload = await self._get(client, doc_id, sheet_id, 0)
                 pages += 1
                 context = parse_page_context(payload)
@@ -454,23 +459,27 @@ class TencentSheetCollector(SupportsProgress):
                     logger.debug("sheet %s 版本未变（%s），跳过", sheet_id, version)
                     continue
 
-                if isinstance(total_row, int) and total_row > 0:
+                if isinstance(total_row, int) and total_row >= 0:
                     totals[sheet_id] = total_row
 
-                collected, sheet_pages, sheet_truncated, consumed = await self._collect_sheet(
-                    client, doc_id, sheet_id, payload, total_row, budget - pages
-                )
-                messages.extend(collected)
-                pages += sheet_pages
-                truncated = truncated or sheet_truncated
-                # 记下扫到哪一行，backfill 从这里接着往下扫。
-                # 取较大值：backfill 可能已经推得比这一轮远得多，
-                # 直接覆盖会把它几百次请求的进度打回原点。
-                offsets[sheet_id] = self._merge_offset(offsets.get(sheet_id), consumed)
+                columns, rows = parse_sheet_chunk(_decode_smartsheet(payload))
+                self._columns[sheet_id] = columns
+                messages.extend(self._to_messages(doc_id, sheet_id, columns, rows))
 
-                # 只有整个 sheet 都取完了才推进版本号，
-                # 否则下轮会误以为已同步、跳过剩下的行
-                if version is not None and not sheet_truncated:
+                consumed = _CHUNK_SIZE if rows else 0
+                # 已完成版本发生变化时从头重扫；首次回灌被中断时保留已提交偏移。
+                if sheet_id in known_versions:
+                    offsets[sheet_id] = consumed
+                    versions.pop(sheet_id, None)
+                else:
+                    offsets[sheet_id] = self._merge_offset(offsets.get(sheet_id), consumed)
+
+                # 小表首片已完整取完，可以直接推进版本；大表由 backfill 在末片推进。
+                if (
+                    version is not None
+                    and isinstance(total_row, int)
+                    and offsets[sheet_id] >= total_row
+                ):
                     versions[sheet_id] = version
         finally:
             if self._owns_client:
@@ -484,68 +493,14 @@ class TencentSheetCollector(SupportsProgress):
         if totals:
             state[_TOTAL_KEY] = totals
 
+        pending = self._has_pending_rows(offsets, totals)
         return FetchResult(
             messages=messages,
             pages_fetched=pages,
-            truncated=truncated,
+            truncated=pending,
             title=title,
             state=state,
             # 还有没扫到的行就要求把补历史重新打开 —— 文档追加新行后，
             # backfill_done 若还停在 True，那批新行永远采不到。
-            backfill_pending=self._has_pending_rows(offsets, totals),
+            backfill_pending=pending,
         )
-
-    async def _collect_sheet(
-        self,
-        client: httpx.AsyncClient,
-        doc_id: str,
-        sheet_id: str,
-        first_payload: dict[str, Any],
-        total_row: int | None,
-        page_budget: int,
-    ) -> tuple[list[CollectedMessage], int, bool]:
-        columns, rows = parse_sheet_chunk(_decode_smartsheet(first_payload))
-        collected: dict[str, dict[str, Any]] = dict(rows)
-        pages = 0
-        truncated = False
-
-        target = total_row if isinstance(total_row, int) and total_row > 0 else len(rows)
-        start = _CHUNK_SIZE
-        while len(collected) < target and start < target:
-            if pages >= page_budget:
-                truncated = True
-                break
-            await asyncio.sleep(self._chunk_delay)
-            payload = await self._get(client, doc_id, sheet_id, start)
-            pages += 1
-            chunk_columns, chunk_rows = parse_sheet_chunk(_decode_smartsheet(payload))
-            columns.update(chunk_columns)
-            if not chunk_rows:
-                # 还没取到 total_row 就返回了空片：可能是接口抖动，也可能是
-                # total_row 不准。无论哪种都**不能**当成"取完了"——
-                # 那会推进版本号并永久丢掉剩余的行。标记未完成，下轮重来。
-                logger.warning(
-                    "sheet %s 在第 %d 行处返回空片（预期共 %s 行），本轮视为未取完",
-                    sheet_id,
-                    start,
-                    target,
-                )
-                truncated = True
-                break
-            collected.update(chunk_rows)
-            start += _CHUNK_SIZE
-
-        now = datetime.now(UTC)
-        messages = [
-            CollectedMessage(
-                # 行 ID 在文档内唯一但不单调，带上 sheet 前缀以免跨 sheet 撞号
-                message_id=f"{sheet_id}:{row_id}",
-                text=render_row(columns, cells),
-                published_at=now,
-                url=f"https://docs.qq.com/smartsheet/{doc_id}?tab={sheet_id}",
-            )
-            for row_id, cells in collected.items()
-        ]
-        # 返回**实际扫到的行偏移**而不是页数：空片会让 pages 加一但 start 不动，
-        # 拿页数反推偏移就会一次多跳一整片（60 行），那批行再也扫不到。
-        return messages, pages, truncated, start
