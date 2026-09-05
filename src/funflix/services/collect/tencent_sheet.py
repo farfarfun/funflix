@@ -467,12 +467,9 @@ class TencentSheetCollector(SupportsProgress):
                 messages.extend(self._to_messages(doc_id, sheet_id, columns, rows))
 
                 consumed = _CHUNK_SIZE if rows else 0
-                # 已完成版本发生变化时从头重扫；首次回灌被中断时保留已提交偏移。
-                if sheet_id in known_versions:
-                    offsets[sheet_id] = consumed
-                    versions.pop(sheet_id, None)
-                else:
-                    offsets[sheet_id] = self._merge_offset(offsets.get(sheet_id), consumed)
+                # 持续更新的大表只从已提交偏移补新增行；每周水位重置会全量核查
+                # 历史修改。每次版本变化都从头扫会让数万行表永远无法追平。
+                offsets[sheet_id] = self._merge_offset(offsets.get(sheet_id), consumed)
 
                 # 小表首片已完整取完，可以直接推进版本；大表由 backfill 在末片推进。
                 if (

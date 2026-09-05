@@ -389,7 +389,7 @@ class TestFetch:
         assert result.state["tencent_sheet_versions"] == {"tiAAAA": 7}
         assert result.backfill_done is True
 
-    async def test_changed_completed_version_restarts_from_first_chunk(self) -> None:
+    async def test_changed_completed_version_keeps_finished_offset(self) -> None:
         collector = _collector(
             {
                 (None, 0): build_payload(sheet_ids=("tiAAAA",)),
@@ -411,9 +411,9 @@ class TestFetch:
 
         result = await collector.fetch(source)
 
-        assert result.state["tencent_sheet_versions"] == {}
-        assert result.state["tencent_sheet_offsets"] == {"tiAAAA": 60}
-        assert result.backfill_pending is True
+        assert result.state["tencent_sheet_versions"] == {"tiAAAA": 101}
+        assert result.state["tencent_sheet_offsets"] == {"tiAAAA": 180}
+        assert result.backfill_pending is False
 
     async def test_version_not_advanced_when_truncated(self) -> None:
         """没取完就推进版本号，下轮会误以为已同步、永久丢掉剩余的行。"""
