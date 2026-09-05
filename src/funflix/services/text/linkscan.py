@@ -58,6 +58,10 @@ _PROVIDER_PATTERNS: tuple[tuple[Provider, re.Pattern[str]], ...] = (
         Provider.MOBILE139,
         re.compile(r"^https?://yun\.139\.com/shareweb/#/w/i/(?P<sid>[A-Za-z0-9_-]+)", re.I),
     ),
+    (
+        Provider.GUANGYA,
+        re.compile(r"^https?://(?:www\.)?guangyapan\.com/s/(?P<sid>[A-Za-z0-9_-]+)", re.I),
+    ),
     (Provider.TIANYI, re.compile(r"^https?://cloud\.189\.cn/t/(?P<sid>[A-Za-z0-9]+)", re.I)),
     (Provider.XUNLEI, re.compile(r"^https?://pan\.xunlei\.com/s/(?P<sid>[A-Za-z0-9_\-]+)", re.I)),
     (

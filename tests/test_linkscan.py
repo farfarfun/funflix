@@ -25,6 +25,11 @@ class TestIdentifyProvider:
                 Provider.MOBILE139,
                 "2xop3Kh97fRxo",
             ),
+            (
+                "https://www.guangyapan.com/s/1942762757558784044_aeWVVxu726g3waa-",
+                Provider.GUANGYA,
+                "1942762757558784044_aeWVVxu726g3waa-",
+            ),
             ("https://cloud.189.cn/t/QqQq22", Provider.TIANYI, "QqQq22"),
             ("https://pan.xunlei.com/s/VN_abc-123", Provider.XUNLEI, "VN_abc-123"),
             ("https://www.lanzoux.com/iAbCd12", Provider.LANZOU, "iAbCd12"),

@@ -72,6 +72,7 @@ class Provider(StrEnum):
     PAN115 = "pan115"
     PAN123 = "pan123"
     MOBILE139 = "mobile139"
+    GUANGYA = "guangya"
     LANZOU = "lanzou"
     TIANYI = "tianyi"
     XUNLEI = "xunlei"
