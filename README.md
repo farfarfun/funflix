@@ -38,6 +38,7 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 | `kdocs` | 金山多维表格接口 | sheet 偏移 | 结构化资源表 |
 | `rss` | 通用 RSS 2.0 / Atom | 条目 `guid` / `id` | 公开影视、动漫、种子 feed |
 | `forum` | 电影云集 Flarum 合集 | 帖子 ID，可追新/补历史 | `bbs.dyyjv.com` 日更合集 |
+| `web` | 公开影视网站与论坛 | 详情页 URL，可持续追新 | 网盘、磁力与 torrent 附件 |
 | `api` | 人人影视快照与评论接口 | 快照校验和 / 评论 ID | 历史资源与网友分享 |
 
 `weibo` 等枚举值目前只是预留，尚未注册采集器；登记时会被拒绝。

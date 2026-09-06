@@ -121,6 +121,7 @@ class TestNormalizeIdentifier:
             SourceType.KDOCS,
             SourceType.RSS,
             SourceType.FORUM,
+            SourceType.WEB,
             SourceType.API,
         }
 

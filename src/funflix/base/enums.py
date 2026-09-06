@@ -29,6 +29,7 @@ class SourceType(StrEnum):
     KDOCS = "kdocs"  # 金山文档 - 多维表格
     WEIBO = "weibo"
     FORUM = "forum"
+    WEB = "web"
     RSS = "rss"
     MANUAL = "manual"
     API = "api"
