@@ -53,7 +53,11 @@ _PROVIDER_PATTERNS: tuple[tuple[Provider, re.Pattern[str]], ...] = (
     ),
     (
         Provider.PAN123,
-        re.compile(r"^https?://(?:www\.)?123(?:pan|\d+)\.com/s/(?P<sid>[A-Za-z0-9_-]+)", re.I),
+        re.compile(
+            r"^https?://(?:(?:www\.)?123(?:pan|\d+)\.com|"
+            r"(?:[a-z0-9-]+\.)*123pan\.cn)/(?:s|123pan)/(?P<sid>[A-Za-z0-9_-]+)",
+            re.I,
+        ),
     ),
     (
         Provider.MOBILE139,
@@ -68,7 +72,7 @@ _PROVIDER_PATTERNS: tuple[tuple[Provider, re.Pattern[str]], ...] = (
         re.compile(
             r"^https?://(?:[a-z0-9-]+\.)?(?:ctfile\.(?:com|net)|pipipan\.com|400gb\.com|"
             r"t00y\.com|72k\.us|colafile\.com|n459\.com|sn9\.us|545c\.com|590m\.com)/"
-            r"(?P<sid>(?:file|fs|dir)/[A-Za-z0-9_-]+)",
+            r"(?P<sid>(?:file|fs|dir|f|d)/[A-Za-z0-9_-]+)",
             re.I,
         ),
     ),

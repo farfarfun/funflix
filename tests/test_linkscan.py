@@ -21,6 +21,11 @@ class TestIdentifyProvider:
             ("https://www.123pan.com/s/7Tx1jv-yOMtv", Provider.PAN123, "7Tx1jv-yOMtv"),
             ("https://www.123865.com/s/u9izjv-GF3Kv", Provider.PAN123, "u9izjv-GF3Kv"),
             (
+                "https://1820645299.share.123pan.cn/123pan/7Tx1jv-yOMtv",
+                Provider.PAN123,
+                "7Tx1jv-yOMtv",
+            ),
+            (
                 "https://yun.139.com/shareweb/#/w/i/2xop3Kh97fRxo",
                 Provider.MOBILE139,
                 "2xop3Kh97fRxo",
@@ -35,6 +40,16 @@ class TestIdentifyProvider:
                 "https://zimuzuustv.ctfile.com/fs/1939455-232902456",
                 Provider.CTFILE,
                 "fs/1939455-232902456",
+            ),
+            (
+                "https://url01.ctfile.com/f/8067059-687855402-65ca36",
+                Provider.CTFILE,
+                "f/8067059-687855402-65ca36",
+            ),
+            (
+                "https://url01.ctfile.com/d/11449240-33792850-725200",
+                Provider.CTFILE,
+                "d/11449240-33792850-725200",
             ),
             ("https://cloud.189.cn/t/QqQq22", Provider.TIANYI, "QqQq22"),
             ("https://pan.xunlei.com/s/VN_abc-123", Provider.XUNLEI, "VN_abc-123"),

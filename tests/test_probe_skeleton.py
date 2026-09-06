@@ -98,6 +98,11 @@ class TestUnknownResponseBecomesError:
         outcome = await _Probe(client).check(REF)
         assert outcome.status is CheckStatus.ERROR
 
+    async def test_http_429_is_rate_limited_even_when_response_is_html(self) -> None:
+        client = _client(lambda r: httpx.Response(429, text="<html>Too Many Requests</html>"))
+        outcome = await _Probe(client).check(REF)
+        assert outcome.status is CheckStatus.RATE_LIMITED
+
 
 @pytest.mark.asyncio
 class TestConclusiveResultsStillWork:

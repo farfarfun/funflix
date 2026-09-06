@@ -126,9 +126,15 @@ class AnonymousHttpProbe:
             await self._client.aclose()
             self._client = None
 
+    def build_url(self, ref: LinkRef) -> str:
+        return self.endpoint
+
+    def build_params(self, ref: LinkRef) -> dict[str, str] | None:
+        return self.params
+
     def build_payload(self, ref: LinkRef) -> dict[str, Any]:
-        """请求体。子类必须实现。"""
-        raise NotImplementedError
+        """POST 请求体。GET 探针无需实现。"""
+        return {}
 
     def classify(self, payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
         """把响应翻译成结论；**看不懂就返回 None**，不要自己造 INVALID。
@@ -146,29 +152,36 @@ class AnonymousHttpProbe:
         try:
             response = await client.request(
                 self.method,
-                self.endpoint,
-                params=self.params,
-                json=self.build_payload(ref),
+                self.build_url(ref),
+                params=self.build_params(ref),
+                json=None if self.method.upper() == "GET" else self.build_payload(ref),
                 headers=json_headers(self.referer),
             )
-            try:
-                payload = response.json()
-            except ValueError:
-                # 返回的不是 JSON —— 多半是错误页或验证码页，不是关于链接的结论
+            if response.status_code == 429:
                 outcome = CheckOutcome(
-                    status=CheckStatus.ERROR,
+                    status=CheckStatus.RATE_LIMITED,
                     http_code=response.status_code,
-                    detail=f"响应不是 JSON：{response.text[:120]!r}",
+                    detail=response.text[:120] or "HTTP 429",
                 )
             else:
-                if not isinstance(payload, dict):
+                try:
+                    payload = response.json()
+                except ValueError:
+                    # 返回的不是 JSON —— 多半是错误页或验证码页，不是关于链接的结论
                     outcome = CheckOutcome(
                         status=CheckStatus.ERROR,
                         http_code=response.status_code,
-                        detail=f"响应不是 JSON 对象：{type(payload).__name__}",
+                        detail=f"响应不是 JSON：{response.text[:120]!r}",
                     )
                 else:
-                    outcome = self._classify_safely(payload, response.status_code)
+                    if not isinstance(payload, dict):
+                        outcome = CheckOutcome(
+                            status=CheckStatus.ERROR,
+                            http_code=response.status_code,
+                            detail=f"响应不是 JSON 对象：{type(payload).__name__}",
+                        )
+                    else:
+                        outcome = self._classify_safely(payload, response.status_code)
         except httpx.HTTPError as exc:
             # 网络问题不是关于链接的结论
             outcome = CheckOutcome(status=CheckStatus.ERROR, detail=f"{type(exc).__name__}: {exc}")

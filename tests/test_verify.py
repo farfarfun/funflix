@@ -7,6 +7,10 @@ from funflix.base.enums import CheckStatus, Provider
 from funflix.models import LinkCheck, Resource, utcnow
 from funflix.services.verify.alipan import classify as alipan_classify
 from funflix.services.verify.base import CheckOutcome, LinkRef
+from funflix.services.verify.ctfile import CTFileProbe
+from funflix.services.verify.ctfile import classify as ctfile_classify
+from funflix.services.verify.pan123 import Pan123Probe
+from funflix.services.verify.pan123 import classify as pan123_classify
 from funflix.services.verify.quark import QuarkProbe
 from funflix.services.verify.quark import classify as quark_classify
 from funflix.services.verify.registry import (
@@ -23,7 +27,13 @@ class TestRegistry:
         assert_registry_matches_enum()
 
     def test_supported_providers(self) -> None:
-        assert supported_providers() == [Provider.ALIPAN, Provider.QUARK, Provider.UC]
+        assert supported_providers() == [
+            Provider.ALIPAN,
+            Provider.CTFILE,
+            Provider.PAN123,
+            Provider.QUARK,
+            Provider.UC,
+        ]
 
     def test_unsupported_provider_has_no_probe(self) -> None:
         assert get_probe(Provider.BAIDU) is None
@@ -56,9 +66,7 @@ class TestQuarkClassify:
         assert outcome.status is CheckStatus.INVALID
 
     def test_banned_sharer_is_invalid(self) -> None:
-        outcome = quark_classify(
-            {"code": 41031, "message": "分享者用户封禁链接查看受限"}, 403
-        )
+        outcome = quark_classify({"code": 41031, "message": "分享者用户封禁链接查看受限"}, 403)
         assert outcome.status is CheckStatus.INVALID
 
     def test_message_hint_without_known_code(self) -> None:
@@ -112,6 +120,58 @@ class TestAlipanClassify:
         assert alipan_classify({"code": "SomeNewError"}, 400) is None
 
 
+class TestPan123Classify:
+    def test_valid_share(self) -> None:
+        outcome = pan123_classify(
+            {
+                "code": 0,
+                "data": {
+                    "Len": 1,
+                    "Expired": False,
+                    "InfoList": [{"FileName": "示例", "Size": 123}],
+                },
+            },
+            200,
+        )
+        assert outcome.status is CheckStatus.VALID
+        assert (outcome.title, outcome.size_bytes) == ("示例", 123)
+
+    def test_password_and_missing_share(self) -> None:
+        password = pan123_classify({"code": 5103, "message": "提取码错误"}, 200)
+        missing = pan123_classify({"code": 5103, "message": "此分享不存在"}, 200)
+        assert password.status is CheckStatus.NEED_PASSWORD
+        assert missing.status is CheckStatus.INVALID
+
+
+class TestCTFileClassify:
+    def test_valid_share_with_sharer(self) -> None:
+        outcome = ctfile_classify(
+            {
+                "code": 200,
+                "file": {
+                    "file_id": 2,
+                    "file_name": "示例",
+                    "file_size": "844.13 MB",
+                    "userid": 1,
+                    "username": "分享者",
+                },
+            },
+            200,
+        )
+        assert outcome.status is CheckStatus.VALID
+        assert (outcome.title, outcome.sharer_id, outcome.sharer_name) == ("示例", "1", "分享者")
+        assert outcome.size_bytes == int(844.13 * 1024**2)
+
+    def test_password_and_missing_share(self) -> None:
+        password = ctfile_classify({"code": 423, "file": {}}, 200)
+        missing = ctfile_classify({"code": 404, "file": {"message": "已失效"}}, 200)
+        assert password.status is CheckStatus.NEED_PASSWORD
+        assert missing.status is CheckStatus.INVALID
+
+    def test_unknown_response_returns_none(self) -> None:
+        assert ctfile_classify({"code": 403, "file": {"message": "Forbidden"}}, 200) is None
+
+
 class TestCheckOutcome:
     @pytest.mark.parametrize(
         ("status", "conclusive"),
@@ -161,6 +221,39 @@ class TestProbeTransport:
         outcome = await _probe(handler).check(LinkRef(Provider.QUARK, "abc", "u"))
         assert outcome.status is CheckStatus.ERROR
         assert "ConnectError" in outcome.detail
+
+    async def test_pan123_get_params_and_owner_id(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "GET"
+            assert request.url.params["shareKey"] == "7Tx1jv-yrDiv"
+            assert request.url.params["SharePwd"] == "xoxo"
+            assert request.content == b""
+            return httpx.Response(200, json={"code": 0, "data": {"InfoList": []}})
+
+        probe = Pan123Probe(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        outcome = await probe.check(
+            LinkRef(Provider.PAN123, "7Tx1jv-yrDiv", "https://www.123pan.com/s/x", "xoxo")
+        )
+        assert outcome.status is CheckStatus.VALID
+        assert outcome.sharer_id == "1820645299"
+
+    async def test_ctfile_get_params_include_url_password(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/getfile.php"
+            assert request.url.params["path"] == "file"
+            assert request.url.params["f"] == "123-456"
+            assert request.url.params["passcode"] == "abcd"
+            return httpx.Response(200, json={"code": 200, "file": {"file_id": 456}})
+
+        probe = CTFileProbe(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        outcome = await probe.check(
+            LinkRef(
+                Provider.CTFILE,
+                "file/123-456",
+                "https://www.400gb.com/file/123-456?p=abcd",
+            )
+        )
+        assert outcome.status is CheckStatus.VALID
 
 
 class StubProbe:
@@ -256,10 +349,13 @@ class TestCheckResource:
     async def test_backfills_title_from_netdisk(self, session) -> None:
         resource = await _make_resource(session)
         await check_resource(
-            session, resource, StubProbe(CheckOutcome(CheckStatus.VALID, title="网盘侧标题"))
+            session,
+            resource,
+            StubProbe(CheckOutcome(CheckStatus.VALID, title="网盘侧标题", size_bytes=123)),
         )
         await session.commit()
         assert resource.title_raw == "网盘侧标题"
+        assert resource.size_bytes == 123
 
     async def test_backfills_sharer_from_netdisk(self, session) -> None:
         resource = await _make_resource(session)

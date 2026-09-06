@@ -84,7 +84,9 @@ class Provider(StrEnum):
 
 
 #: 当前实现了匿名探针、会真正发起校验的网盘。其余 provider 直接置 unsupported。
-CHECKABLE_PROVIDERS: frozenset[Provider] = frozenset({Provider.QUARK, Provider.ALIPAN, Provider.UC})
+CHECKABLE_PROVIDERS: frozenset[Provider] = frozenset(
+    {Provider.QUARK, Provider.ALIPAN, Provider.UC, Provider.PAN123, Provider.CTFILE}
+)
 
 
 class CheckStatus(StrEnum):

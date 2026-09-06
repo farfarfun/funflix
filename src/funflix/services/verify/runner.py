@@ -223,6 +223,8 @@ async def persist_check_outcome(
     resource.next_check_at = _next_check_at(resource, outcome)
     if outcome.title and not resource.title_raw:
         resource.title_raw = outcome.title[:512]
+    if outcome.size_bytes is not None and resource.size_bytes is None:
+        resource.size_bytes = outcome.size_bytes
     if outcome.sharer_id:
         resource.sharer_id = outcome.sharer_id[:128]
     if outcome.sharer_name:

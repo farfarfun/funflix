@@ -5,7 +5,7 @@
 - `collect/`  采集：telegram（已实现）、csv/rss（待扩展）
 - `extract/`  抽取：rule（规则）、llm（大模型）
 - `text/`     文本原语：链接扫描、分段、剧名归一（跨环节共用）
-- `verify/`   校验：夸克、阿里云盘（M4）
+- `verify/`   校验：夸克、UC、阿里、123、城通网盘
 """
 
 from funflix.services.ingest import (
