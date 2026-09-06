@@ -29,6 +29,8 @@ from funflix.services.ingest import ingest_many
 
 logger = logging.getLogger(__name__)
 
+_INGEST_CHUNK_SIZE = 5_000
+
 #: 一个源可能要翻几千上万页才能补完历史，总页数本身不是问题——
 #: `CommitBatcher` 保证水位按块持续落盘，中途中断也不会丢已完成的部分。
 #: 真正的约束是墙钟时间：CI 一个 job 有固定超时，且 collect/parse/verify
@@ -257,7 +259,9 @@ async def _ingest_messages(
     # 否则这类消息会卡住水位，每轮都被重新拉取。
     skipped = len(messages) - len(payloads)
 
-    outcomes = await ingest_many(session, payloads)
+    outcomes = []
+    for start in range(0, len(payloads), _INGEST_CHUNK_SIZE):
+        outcomes.extend(await ingest_many(session, payloads[start : start + _INGEST_CHUNK_SIZE]))
     duplicated = sum(1 for o in outcomes if o.duplicated)
     created = len(outcomes) - duplicated
     return created, duplicated, skipped

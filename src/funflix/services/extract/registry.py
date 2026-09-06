@@ -44,6 +44,7 @@ def supported_extractors() -> list[str]:
 #: 用错抽取器不会报错，只会静默地大批归属失败 —— 所以默认值必须按源类型分开。
 _DEFAULT_BY_SOURCE: dict[SourceType, str] = {
     SourceType.TENCENT_DOCS: "sheet",
+    SourceType.KDOCS: "sheet",
 }
 
 #: 自由文本源的默认抽取器

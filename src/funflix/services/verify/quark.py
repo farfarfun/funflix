@@ -18,7 +18,7 @@ from funflix.base.enums import CheckStatus, Provider
 from funflix.services.verify.base import AnonymousHttpProbe, CheckOutcome, LinkRef
 
 #: 明确表示"这个分享没了"的业务码
-_GONE_CODES = {41006, 41007, 41008}
+_GONE_CODES = {41006, 41007, 41008, 41031}
 #: 明确表示"要提取码"的业务码
 _NEED_PASSWORD_CODES = {41005}
 #: 被限流 / 风控
@@ -41,11 +41,14 @@ def classify(payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
 
     if code == 0:
         data = payload.get("data") or {}
+        author = data.get("author") if isinstance(data.get("author"), dict) else {}
         return CheckOutcome(
             status=CheckStatus.VALID,
             http_code=http_code,
             title=data.get("title") or None,
             detail=f"expired_type={data.get('expired_type')}",
+            sharer_name=author.get("nick_name") or None,
+            sharer_avatar_url=author.get("avatar_url") or None,
         )
 
     if code in _NEED_PASSWORD_CODES or any(h in message for h in _PASSWORD_HINTS):

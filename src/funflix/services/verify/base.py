@@ -39,6 +39,9 @@ class CheckOutcome:
     #: 网盘侧返回的资源名，可用于回填校正标题
     title: str | None = None
     size_bytes: int | None = None
+    sharer_id: str | None = None
+    sharer_name: str | None = None
+    sharer_avatar_url: str | None = None
     latency_ms: int | None = None
 
     @property

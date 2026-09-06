@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from funflix.base.enums import SourceType
 from funflix.services.collect.base import Collector
+from funflix.services.collect.kdocs import KDocsCollector
 from funflix.services.collect.rss import RSSCollector
 from funflix.services.collect.telegram import TelegramChannelCollector
 from funflix.services.collect.tencent_sheet import TencentSheetCollector
@@ -14,6 +15,7 @@ _REGISTRY: dict[SourceType, type[Collector]] = {
     SourceType.TELEGRAM: TelegramChannelCollector,
     SourceType.TENCENT_DOCS: TencentSheetCollector,
     SourceType.TENCENT_DOC: TencentTextCollector,
+    SourceType.KDOCS: KDocsCollector,
     SourceType.RSS: RSSCollector,
     SourceType.API: YYeTsCollector,
 }

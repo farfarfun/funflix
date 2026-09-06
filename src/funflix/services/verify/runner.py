@@ -223,6 +223,12 @@ async def persist_check_outcome(
     resource.next_check_at = _next_check_at(resource, outcome)
     if outcome.title and not resource.title_raw:
         resource.title_raw = outcome.title[:512]
+    if outcome.sharer_id:
+        resource.sharer_id = outcome.sharer_id[:128]
+    if outcome.sharer_name:
+        resource.sharer_name = outcome.sharer_name[:128]
+    if outcome.sharer_avatar_url:
+        resource.sharer_avatar_url = outcome.sharer_avatar_url[:2048]
 
     # 链接的「可用性」变了，挂着它的作品的 valid_resource_count 就得跟着变。
     # 一条链接可能属于多部作品（合集），所以按 resource 反查全部关联作品。

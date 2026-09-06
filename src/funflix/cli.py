@@ -761,6 +761,36 @@ def db_requeue(
         typer.echo("没有需要重新排队的资源")
 
 
+@db_app.command("cleanup-resources")
+def db_cleanup_resources(
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """重分类城通链接，并清除频道自宣、短链、资料页和播放页。"""
+    from funflix.base.db import session_scope
+    from funflix.services.maintenance import cleanup_resources
+
+    if not yes and not typer.confirm("将合并重复城通资源并删除黑名单链接，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await cleanup_resources(session)
+
+    report = _run(_do)
+    _table(
+        [
+            ["扫描 other", report.other_scanned],
+            ["识别城通", report.ctfile_found],
+            ["重分类城通", report.ctfile_reclassified],
+            ["合并重复", report.duplicates_merged],
+            ["删除黑名单", report.blacklisted_deleted],
+            ["重算作品", report.media_recounted],
+        ],
+        ["项", "数量"],
+    )
+    _ok("资源清理完成")
+
+
 @db_app.command("relink-checks")
 def db_relink_checks(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,

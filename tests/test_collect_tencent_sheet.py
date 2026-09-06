@@ -118,6 +118,7 @@ class TestNormalizeIdentifier:
             SourceType.TELEGRAM,
             SourceType.TENCENT_DOCS,
             SourceType.TENCENT_DOC,
+            SourceType.KDOCS,
             SourceType.RSS,
             SourceType.API,
         }

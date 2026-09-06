@@ -30,6 +30,12 @@ class TestIdentifyProvider:
                 Provider.GUANGYA,
                 "1942762757558784044_aeWVVxu726g3waa-",
             ),
+            ("https://www.400gb.com/file/73864951", Provider.CTFILE, "file/73864951"),
+            (
+                "https://zimuzuustv.ctfile.com/fs/1939455-232902456",
+                Provider.CTFILE,
+                "fs/1939455-232902456",
+            ),
             ("https://cloud.189.cn/t/QqQq22", Provider.TIANYI, "QqQq22"),
             ("https://pan.xunlei.com/s/VN_abc-123", Provider.XUNLEI, "VN_abc-123"),
             ("https://www.lanzoux.com/iAbCd12", Provider.LANZOU, "iAbCd12"),
@@ -182,3 +188,19 @@ class TestUnknownProviders:
 
     def test_drops_unknown_url_too_long_for_storage(self) -> None:
         assert scan_links("https://example.com/" + "x" * 2048) == []
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://t.me/example_channel",
+            "https://t.cn/A6short",
+            "https://movie.douban.com/subject/1292052/",
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+        ],
+    )
+    def test_drops_known_non_resource_links(self, url: str) -> None:
+        assert scan_links(url) == []
+
+    def test_does_not_treat_345_content_pages_as_ctfile(self) -> None:
+        link = scan_links("https://www.345.cool/17089.html")[0]
+        assert link.provider is Provider.OTHER

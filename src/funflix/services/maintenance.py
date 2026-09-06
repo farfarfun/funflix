@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus
+from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus, Provider
 from funflix.models import (
     Base,
     LinkCheck,
@@ -20,9 +20,12 @@ from funflix.models import (
     Source,
     Tag,
     TagKind,
+    media_resource,
     media_tag,
     utcnow,
 )
+from funflix.services.counters import refresh_media_counters
+from funflix.services.text.linkscan import identify_provider, is_non_resource_url
 from funflix.services.text.normalize import classify_tag
 from funflix.services.verify.base import CheckOutcome
 from funflix.services.verify.runner import _next_check_at
@@ -254,6 +257,130 @@ async def requeue_now_checkable(session: AsyncSession) -> int:
     )
     await session.commit()
     return result.rowcount or 0
+
+
+@dataclass(slots=True)
+class CleanupResourcesReport:
+    other_scanned: int = 0
+    ctfile_found: int = 0
+    ctfile_reclassified: int = 0
+    duplicates_merged: int = 0
+    blacklisted_deleted: int = 0
+    media_recounted: int = 0
+
+
+def _chunks[T](items: list[T], size: int = 500) -> list[list[T]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+async def cleanup_resources(session: AsyncSession) -> CleanupResourcesReport:
+    """重分类城通链接，合并身份冲突，并删除明确不是资源的网页链接。"""
+    report = CleanupResourcesReport()
+    ctfile: dict[str, list] = {}
+    blacklisted: list = []
+    rows = await session.stream(
+        select(Resource.id, Resource.url).where(Resource.provider == Provider.OTHER)
+    )
+    async for resource_id, url in rows:
+        report.other_scanned += 1
+        identified = identify_provider(url)
+        if identified and identified[0] is Provider.CTFILE:
+            ctfile.setdefault(identified[1], []).append(resource_id)
+        elif is_non_resource_url(url):
+            blacklisted.append(resource_id)
+
+    report.ctfile_found = sum(map(len, ctfile.values()))
+    existing_ctfile = dict(
+        (
+            await session.execute(
+                select(Resource.share_id, Resource.id).where(Resource.provider == Provider.CTFILE)
+            )
+        ).all()
+    )
+    duplicate_to_target: dict = {}
+    updates: list[dict] = []
+    for share_id, resource_ids in ctfile.items():
+        target_id = existing_ctfile.get(share_id)
+        if target_id is None:
+            target_id = resource_ids.pop(0)
+            updates.append(
+                {"id": target_id, "provider": Provider.CTFILE, "share_id": share_id}
+            )
+        duplicate_to_target.update({resource_id: target_id for resource_id in resource_ids})
+
+    duplicate_ids = list(duplicate_to_target)
+    affected_media_ids: set = set()
+    if duplicate_ids:
+        involved = set(duplicate_ids) | set(duplicate_to_target.values())
+        resources = {
+            resource.id: resource
+            for resource in await session.scalars(select(Resource).where(Resource.id.in_(involved)))
+        }
+        for source_id, target_id in duplicate_to_target.items():
+            source = resources[source_id]
+            target = resources[target_id]
+            target.seen_count += source.seen_count
+            target.first_seen_at = min(target.first_seen_at, source.first_seen_at)
+            target.last_seen_at = max(target.last_seen_at, source.last_seen_at)
+            for field in (
+                "passcode",
+                "title_raw",
+                "episode_info",
+                "size_bytes",
+                "sharer_id",
+                "sharer_name",
+                "sharer_avatar_url",
+            ):
+                if getattr(target, field) is None:
+                    setattr(target, field, getattr(source, field))
+
+        pairs = (
+            await session.execute(
+                select(
+                    media_resource.c.media_id,
+                    media_resource.c.resource_id,
+                    media_resource.c.created_at,
+                ).where(media_resource.c.resource_id.in_(involved))
+            )
+        ).all()
+        existing_pairs = {(media_id, resource_id) for media_id, resource_id, _ in pairs}
+        inserts = []
+        for media_id, source_id, created_at in pairs:
+            target_id = duplicate_to_target.get(source_id)
+            if target_id is None or (media_id, target_id) in existing_pairs:
+                continue
+            inserts.append(
+                {"media_id": media_id, "resource_id": target_id, "created_at": created_at}
+            )
+            existing_pairs.add((media_id, target_id))
+        affected_media_ids.update(media_id for media_id, _, _ in pairs)
+        if inserts:
+            await session.execute(media_resource.insert(), inserts)
+        await session.execute(
+            delete(media_resource).where(media_resource.c.resource_id.in_(duplicate_ids))
+        )
+        await session.execute(delete(Resource).where(Resource.id.in_(duplicate_ids)))
+        report.duplicates_merged = len(duplicate_ids)
+
+    for chunk in _chunks(updates):
+        await session.execute(update(Resource), chunk)
+    report.ctfile_reclassified = len(updates)
+
+    for chunk in _chunks(blacklisted):
+        affected_media_ids.update(
+            await session.scalars(
+                select(media_resource.c.media_id).where(
+                    media_resource.c.resource_id.in_(chunk)
+                )
+            )
+        )
+        await session.execute(delete(Resource).where(Resource.id.in_(chunk)))
+    report.blacklisted_deleted = len(blacklisted)
+
+    for chunk in _chunks(list(affected_media_ids)):
+        report.media_recounted += await refresh_media_counters(session, chunk)
+    await session.commit()
+    return report
 
 
 async def recount_tags(session: AsyncSession) -> int:

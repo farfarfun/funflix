@@ -29,6 +29,7 @@ class TestDispatch:
             (f"https://docs.qq.com/smartsheet/{SHEET_ID}", SourceType.TENCENT_DOCS),
             (f"https://docs.qq.com/sheet/{SHEET_ID}", SourceType.TENCENT_DOCS),
             (f"https://docs.qq.com/doc/{SHEET_ID}", SourceType.TENCENT_DOC),
+            ("https://kdocs.cn/l/ck4zloFnPg8f?R=L1MvMQ==", SourceType.KDOCS),
             ("https://t.me/s/SomeChannel", SourceType.TELEGRAM),
         ],
     )

@@ -35,12 +35,30 @@ class TestRegistry:
 
 class TestQuarkClassify:
     def test_valid_share(self) -> None:
-        outcome = quark_classify({"code": 0, "data": {"title": "示例", "expired_type": 1}}, 200)
+        outcome = quark_classify(
+            {
+                "code": 0,
+                "data": {
+                    "title": "示例",
+                    "expired_type": 1,
+                    "author": {"nick_name": "分享者", "avatar_url": "https://img.example/a"},
+                },
+            },
+            200,
+        )
         assert outcome.status is CheckStatus.VALID
         assert outcome.title == "示例"
+        assert outcome.sharer_name == "分享者"
+        assert outcome.sharer_avatar_url == "https://img.example/a"
 
     def test_missing_share_is_invalid(self) -> None:
         outcome = quark_classify({"code": 41006, "message": "分享不存在"}, 404)
+        assert outcome.status is CheckStatus.INVALID
+
+    def test_banned_sharer_is_invalid(self) -> None:
+        outcome = quark_classify(
+            {"code": 41031, "message": "分享者用户封禁链接查看受限"}, 403
+        )
         assert outcome.status is CheckStatus.INVALID
 
     def test_message_hint_without_known_code(self) -> None:
@@ -67,9 +85,20 @@ class TestQuarkClassify:
 
 class TestAlipanClassify:
     def test_valid_share(self) -> None:
-        outcome = alipan_classify({"share_name": "示例", "expiration": None}, 200)
+        outcome = alipan_classify(
+            {
+                "share_name": "示例",
+                "expiration": None,
+                "creator_id": "123",
+                "creator_name": "分享者",
+                "avatar": "https://img.example/a",
+            },
+            200,
+        )
         assert outcome.status is CheckStatus.VALID
         assert outcome.title == "示例"
+        assert outcome.sharer_id == "123"
+        assert outcome.sharer_name == "分享者"
 
     def test_missing_share_is_invalid(self) -> None:
         outcome = alipan_classify({"code": "NotFound.ShareLink"}, 404)
@@ -231,6 +260,27 @@ class TestCheckResource:
         )
         await session.commit()
         assert resource.title_raw == "网盘侧标题"
+
+    async def test_backfills_sharer_from_netdisk(self, session) -> None:
+        resource = await _make_resource(session)
+        await check_resource(
+            session,
+            resource,
+            StubProbe(
+                CheckOutcome(
+                    CheckStatus.VALID,
+                    sharer_id="123",
+                    sharer_name="分享者",
+                    sharer_avatar_url="https://img.example/a",
+                )
+            ),
+        )
+        await session.commit()
+        assert (resource.sharer_id, resource.sharer_name, resource.sharer_avatar_url) == (
+            "123",
+            "分享者",
+            "https://img.example/a",
+        )
 
 
 @pytest.mark.asyncio

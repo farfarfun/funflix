@@ -37,6 +37,9 @@ class ResourceOut(BaseModel):
     quality: Quality
     episode_info: str | None
     size_bytes: int | None
+    sharer_id: str | None
+    sharer_name: str | None
+    sharer_avatar_url: str | None
     check_status: CheckStatus
     last_checked_at: datetime | None
     first_seen_at: datetime

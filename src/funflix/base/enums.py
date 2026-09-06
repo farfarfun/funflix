@@ -26,6 +26,7 @@ class SourceType(StrEnum):
     TELEGRAM = "telegram"
     TENCENT_DOCS = "tencent_docs"  # 腾讯文档 - 智能表格
     TENCENT_DOC = "tencent_doc"  # 腾讯文档 - 文本文档
+    KDOCS = "kdocs"  # 金山文档 - 多维表格
     WEIBO = "weibo"
     FORUM = "forum"
     RSS = "rss"
@@ -73,6 +74,7 @@ class Provider(StrEnum):
     PAN123 = "pan123"
     MOBILE139 = "mobile139"
     GUANGYA = "guangya"
+    CTFILE = "ctfile"
     LANZOU = "lanzou"
     TIANYI = "tianyi"
     XUNLEI = "xunlei"

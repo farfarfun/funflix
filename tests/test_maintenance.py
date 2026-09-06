@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from funflix.base.enums import CheckStatus, MediaType, ParseStatus, Provider, Quality, SourceType
 from funflix.models import (
@@ -18,10 +19,12 @@ from funflix.models import (
     Source,
     Tag,
     TagKind,
+    media_resource,
     media_tag,
     utcnow,
 )
 from funflix.services.maintenance import (
+    cleanup_resources,
     data_tables,
     recount_tags,
     relink_checks,
@@ -243,6 +246,104 @@ class TestResetPipelineData:
 
         assert report.after["link_check"] == 0
         assert report.checks_purged is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_resources_reclassifies_merges_and_deletes(session) -> None:
+    now = utcnow()
+    media_a = _media("剧集A")
+    media_b = _media("剧集B")
+    target = Resource(
+        provider=Provider.CTFILE,
+        share_id="file/123",
+        url="https://www.400gb.com/file/123",
+        quality=Quality.UNKNOWN,
+        first_seen_at=now,
+        last_seen_at=now,
+        seen_count=1,
+    )
+    duplicate_a = Resource(
+        provider=Provider.OTHER,
+        share_id="https://a.ctfile.com/file/123",
+        url="https://a.ctfile.com/file/123",
+        quality=Quality.UNKNOWN,
+        first_seen_at=now,
+        last_seen_at=now,
+        seen_count=2,
+    )
+    duplicate_b = Resource(
+        provider=Provider.OTHER,
+        share_id="https://www.pipipan.com/file/123",
+        url="https://www.pipipan.com/file/123",
+        quality=Quality.UNKNOWN,
+        first_seen_at=now,
+        last_seen_at=now,
+        seen_count=3,
+    )
+    unique_ctfile = Resource(
+        provider=Provider.OTHER,
+        share_id="https://www.400gb.com/fs/9-8",
+        url="https://www.400gb.com/fs/9-8",
+        quality=Quality.UNKNOWN,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    blacklisted = Resource(
+        provider=Provider.OTHER,
+        share_id="https://t.me/channel",
+        url="https://t.me/channel",
+        quality=Quality.UNKNOWN,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    legitimate_other = Resource(
+        provider=Provider.OTHER,
+        share_id="https://example.com/resource/1",
+        url="https://example.com/resource/1",
+        quality=Quality.UNKNOWN,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    session.add_all(
+        [
+            media_a,
+            media_b,
+            target,
+            duplicate_a,
+            duplicate_b,
+            unique_ctfile,
+            blacklisted,
+            legitimate_other,
+        ]
+    )
+    await session.flush()
+    await session.execute(
+        media_resource.insert(),
+        [
+            {"media_id": media_a.id, "resource_id": target.id, "created_at": now},
+            {"media_id": media_a.id, "resource_id": duplicate_a.id, "created_at": now},
+            {"media_id": media_b.id, "resource_id": duplicate_b.id, "created_at": now},
+            {"media_id": media_a.id, "resource_id": blacklisted.id, "created_at": now},
+        ],
+    )
+    await session.commit()
+
+    report = await cleanup_resources(session)
+
+    assert report.ctfile_found == 3
+    assert report.ctfile_reclassified == 1
+    assert report.duplicates_merged == 2
+    assert report.blacklisted_deleted == 1
+    kept = await session.scalar(
+        select(Resource).where(
+            Resource.provider == Provider.CTFILE, Resource.share_id == "file/123"
+        )
+    )
+    assert kept is not None and kept.seen_count == 6
+    assert await session.get(Resource, legitimate_other.id) is not None
+    await session.refresh(media_a)
+    await session.refresh(media_b)
+    assert (media_a.resource_count, media_b.resource_count) == (1, 1)
 
 
 @pytest.mark.asyncio

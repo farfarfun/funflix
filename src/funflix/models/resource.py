@@ -45,6 +45,10 @@ class Resource(TimestampMixin, Base):
     #: 如 "S01E01-E12" / "全40集"，格式不强约束
     episode_info: Mapped[str | None] = mapped_column(sa.String(64))
     size_bytes: Mapped[int | None] = mapped_column(BigIntType)
+    #: 网盘匿名校验响应里顺带返回的分享者信息；接口不提供的字段保持空。
+    sharer_id: Mapped[str | None] = mapped_column(sa.String(128))
+    sharer_name: Mapped[str | None] = mapped_column(sa.String(128))
+    sharer_avatar_url: Mapped[str | None] = mapped_column(sa.String(2048))
 
     # --- 校验任务状态机 ---
     check_status: Mapped[CheckStatus] = mapped_column(

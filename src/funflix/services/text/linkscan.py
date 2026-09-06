@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from funflix.base.enums import Provider
 
@@ -62,6 +63,15 @@ _PROVIDER_PATTERNS: tuple[tuple[Provider, re.Pattern[str]], ...] = (
         Provider.GUANGYA,
         re.compile(r"^https?://(?:www\.)?guangyapan\.com/s/(?P<sid>[A-Za-z0-9_-]+)", re.I),
     ),
+    (
+        Provider.CTFILE,
+        re.compile(
+            r"^https?://(?:[a-z0-9-]+\.)?(?:ctfile\.(?:com|net)|pipipan\.com|400gb\.com|"
+            r"t00y\.com|72k\.us|colafile\.com|n459\.com|sn9\.us|545c\.com|590m\.com)/"
+            r"(?P<sid>(?:file|fs|dir)/[A-Za-z0-9_-]+)",
+            re.I,
+        ),
+    ),
     (Provider.TIANYI, re.compile(r"^https?://cloud\.189\.cn/t/(?P<sid>[A-Za-z0-9]+)", re.I)),
     (Provider.XUNLEI, re.compile(r"^https?://pan\.xunlei\.com/s/(?P<sid>[A-Za-z0-9_\-]+)", re.I)),
     (
@@ -88,6 +98,61 @@ _PWD_NEAR_RE = re.compile(
 _PWD_LOOKAHEAD = 60
 _MAX_SHARE_ID_LENGTH = 255
 _MAX_URL_LENGTH = 2048
+
+# 明确不是资源本体的链接：频道自宣/邀请、短链、影视资料页和在线播放页。
+# 内容入口仍可单独登记成采集源，但不应伪装成网盘资源进入 resource 表。
+_NON_RESOURCE_HOSTS = frozenset(
+    {
+        "0kv.cn",
+        "bangumi.bilibili.com",
+        "book.douban.com",
+        "discord.gg",
+        "douc.cc",
+        "douban.com",
+        "dwz.cn",
+        "dwz.tax",
+        "f.srl",
+        "film.qq.com",
+        "film.sohu.com",
+        "imdb.com",
+        "j.srl",
+        "jq.qq.com",
+        "link3.cc",
+        "m.srl",
+        "manga.bilibili.com",
+        "movie.douban.com",
+        "my.tv.sohu.com",
+        "pd.qq.com",
+        "q.srl",
+        "qm.qq.com",
+        "qun.qq.com",
+        "re0.me",
+        "shorturl.fm",
+        "site.douban.com",
+        "space.bilibili.com",
+        "t.cn",
+        "t.me",
+        "telegra.ph",
+        "telegram.me",
+        "tv.sohu.com",
+        "u3v.cn",
+        "url.cn",
+        "urlxf.qq.com",
+        "v.qq.com",
+        "v.youku.com",
+        "www.acfun.cn",
+        "www.acfun.tv",
+        "www.bilibili.com",
+        "www.douban.com",
+        "www.imdb.com",
+        "www.le.com",
+        "www.letv.com",
+        "www.link3.cc",
+        "www.themoviedb.org",
+        "www.youtube.com",
+        "youtu.be",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +200,15 @@ def identify_provider(url: str) -> tuple[Provider, str] | None:
     return None
 
 
+def is_non_resource_url(url: str) -> bool:
+    """是否属于明确不该落入 resource 表的网页链接。"""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return True
+    return any(host == blocked or host.endswith(f".{blocked}") for blocked in _NON_RESOURCE_HOSTS)
+
+
 def _find_passcode(text: str, link_end: int, url: str) -> str | None:
     """先看 URL 自带参数，再看链接后方文案。"""
     in_url = _PWD_IN_URL_RE.search(url)
@@ -166,7 +240,7 @@ def scan_links(text: str, *, include_unknown: bool = True) -> list[ScannedLink]:
 
         identified = identify_provider(matched_url)
         if identified is None:
-            if not include_unknown:
+            if not include_unknown or is_non_resource_url(matched_url):
                 continue
             provider = Provider.OTHER
             share_id = (

@@ -37,12 +37,18 @@ def classify(payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
                 http_code=http_code,
                 title=payload.get("share_name") or None,
                 detail="分享需要提取码",
+                sharer_id=payload.get("creator_id") or None,
+                sharer_name=payload.get("creator_name") or None,
+                sharer_avatar_url=payload.get("avatar") or None,
             )
         return CheckOutcome(
             status=CheckStatus.VALID,
             http_code=http_code,
             title=payload.get("share_name") or None,
             detail=f"expiration={payload.get('expiration')}",
+            sharer_id=payload.get("creator_id") or None,
+            sharer_name=payload.get("creator_name") or None,
+            sharer_avatar_url=payload.get("avatar") or None,
         )
 
     if code in _GONE_CODES:
