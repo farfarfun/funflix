@@ -303,9 +303,7 @@ async def cleanup_resources(session: AsyncSession) -> CleanupResourcesReport:
         target_id = existing_ctfile.get(share_id)
         if target_id is None:
             target_id = resource_ids.pop(0)
-            updates.append(
-                {"id": target_id, "provider": Provider.CTFILE, "share_id": share_id}
-            )
+            updates.append({"id": target_id, "provider": Provider.CTFILE, "share_id": share_id})
         duplicate_to_target.update({resource_id: target_id for resource_id in resource_ids})
 
     duplicate_ids = list(duplicate_to_target)
@@ -369,9 +367,7 @@ async def cleanup_resources(session: AsyncSession) -> CleanupResourcesReport:
     for chunk in _chunks(blacklisted):
         affected_media_ids.update(
             await session.scalars(
-                select(media_resource.c.media_id).where(
-                    media_resource.c.resource_id.in_(chunk)
-                )
+                select(media_resource.c.media_id).where(media_resource.c.resource_id.in_(chunk))
             )
         )
         await session.execute(delete(Resource).where(Resource.id.in_(chunk)))

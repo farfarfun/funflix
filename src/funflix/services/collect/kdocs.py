@@ -105,9 +105,7 @@ class KDocsCollector(SupportsProgress):
             raise KDocsError(f"KDocs 接口失败：{payload.get('error') or payload.get('result')}")
         return payload["detail"]
 
-    async def _list_sheets(
-        self, client: httpx.AsyncClient, source: Source
-    ) -> list[dict[str, Any]]:
+    async def _list_sheets(self, client: httpx.AsyncClient, source: Source) -> list[dict[str, Any]]:
         detail = await self._execute(
             client, source, "http.db.listSheets", {"showVeryhidden": False}
         )
