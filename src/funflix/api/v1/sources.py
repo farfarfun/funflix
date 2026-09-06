@@ -17,14 +17,52 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
 from funflix.api.deps import AdminDep, PageDep, SessionDep
-from funflix.base.enums import SourceType
-from funflix.models import Source
+from funflix.base.enums import ParseStatus, SourceType
+from funflix.models import RawDocument, Resource, Source
 from funflix.schemas.raw import Page
 from funflix.schemas.source import CollectReportOut, SourceCreate, SourceOut, SourceUpdate
 from funflix.services.collect.registry import detect_source, get_collector, supported_source_types
 from funflix.services.collect.runner import collect_source
 
 router = APIRouter(prefix="/sources", tags=["sources"])
+
+_ZERO_STATS = {"raw_total": 0, "raw_parsed": 0, "resource_total": 0}
+
+
+async def _source_stats(
+    session: SessionDep, source_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, dict[str, int]]:
+    """按源批量算「原始文本数 / 已解析数 / 解析出资源数」，避免逐源查询（N+1）。"""
+    stats = {sid: dict(_ZERO_STATS) for sid in source_ids}
+    if not source_ids:
+        return stats
+
+    raw_rows = await session.execute(
+        select(RawDocument.source_id, RawDocument.parse_status, func.count())
+        .where(RawDocument.source_id.in_(source_ids))
+        .group_by(RawDocument.source_id, RawDocument.parse_status)
+    )
+    for source_id, parse_status, count in raw_rows.all():
+        row = stats[source_id]
+        row["raw_total"] += count
+        if parse_status == ParseStatus.DONE:
+            row["raw_parsed"] += count
+
+    resource_rows = await session.execute(
+        select(RawDocument.source_id, func.count(Resource.id))
+        .select_from(Resource)
+        .join(RawDocument, RawDocument.id == Resource.raw_document_id)
+        .where(RawDocument.source_id.in_(source_ids))
+        .group_by(RawDocument.source_id)
+    )
+    for source_id, count in resource_rows.all():
+        stats[source_id]["resource_total"] = count
+
+    return stats
+
+
+def _with_stats(source: Source, stats: dict[str, int]) -> SourceOut:
+    return SourceOut.model_validate(source).model_copy(update=stats)
 
 
 @router.get("/supported", response_model=list[SourceType])
@@ -85,6 +123,8 @@ async def create_source(payload: SourceCreate, session: SessionDep, _: AdminDep)
     session.add(source)
     await session.commit()
     await session.refresh(source)
+    # 刚登记的源不可能有任何原始文本/资源，SourceOut 的统计字段默认值就是 0，
+    # 跳过统计查询
     return SourceOut.model_validate(source)
 
 
@@ -102,15 +142,18 @@ async def list_sources(
         conditions.append(Source.source_type == source_type)
 
     total = await session.scalar(select(func.count()).select_from(Source).where(*conditions))
-    rows = await session.scalars(
-        select(Source)
-        .where(*conditions)
-        .order_by(Source.id.desc())
-        .offset(paging.offset)
-        .limit(paging.size)
+    rows = list(
+        await session.scalars(
+            select(Source)
+            .where(*conditions)
+            .order_by(Source.id.desc())
+            .offset(paging.offset)
+            .limit(paging.size)
+        )
     )
+    stats = await _source_stats(session, [r.id for r in rows])
     return Page[SourceOut](
-        items=[SourceOut.model_validate(r) for r in rows],
+        items=[_with_stats(r, stats[r.id]) for r in rows],
         total=total or 0,
         page=paging.page,
         size=paging.size,
@@ -126,7 +169,9 @@ async def _get_or_404(session: SessionDep, source_id: uuid.UUID) -> Source:
 
 @router.get("/{source_id}", response_model=SourceOut)
 async def get_source(source_id: uuid.UUID, session: SessionDep) -> SourceOut:
-    return SourceOut.model_validate(await _get_or_404(session, source_id))
+    source = await _get_or_404(session, source_id)
+    stats = await _source_stats(session, [source.id])
+    return _with_stats(source, stats[source.id])
 
 
 @router.patch("/{source_id}", response_model=SourceOut)
@@ -139,7 +184,8 @@ async def update_source(
         setattr(source, field, value)
     await session.commit()
     await session.refresh(source)
-    return SourceOut.model_validate(source)
+    stats = await _source_stats(session, [source.id])
+    return _with_stats(source, stats[source.id])
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)

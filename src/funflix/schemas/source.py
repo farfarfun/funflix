@@ -55,6 +55,12 @@ class SourceOut(BaseModel):
     consecutive_failures: int
     last_error: str | None
     total_collected: int
+    # 不是 ORM 列，只在 API 层拼装（见 api/v1/sources.py::_with_stats）——
+    # 默认值 0 只是让 from_attributes 校验时（ORM 对象上没这几个属性）不报
+    # missing，实际值总是由 _with_stats 通过 model_copy 覆盖。
+    raw_total: int = Field(default=0, description="该源产出的原始文本数")
+    raw_parsed: int = Field(default=0, description="其中已完成解析（parse_status=done）的数量")
+    resource_total: int = Field(default=0, description="从这些原始文本里解析出的网盘资源数")
     created_at: datetime
     updated_at: datetime
 

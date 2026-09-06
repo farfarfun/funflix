@@ -80,4 +80,6 @@ class Resource(TimestampMixin, Base):
         sa.Index("ix_resource_check_queue", "check_status", "next_check_at"),
         # 校验队列之外，按状态筛资源
         sa.Index("ix_resource_status", "check_status"),
+        # 按采集源回溯其解析出的资源数（见 api/v1/sources.py::_source_stats）
+        sa.Index("ix_resource_raw_document", "raw_document_id"),
     )
