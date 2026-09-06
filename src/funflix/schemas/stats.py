@@ -24,6 +24,7 @@ class PipelineStatsOut(BaseModel):
     resource_total: int
     resource_by_check: dict[str, int]
     resource_by_provider: dict[str, int]
+    resource_by_provider_check: dict[str, dict[str, int]]
     resource_orphan: int = Field(description="没有关联到任何作品的资源")
     media_resource_total: int
 

@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.enums import CheckStatus
 from funflix.models import (
     Extraction,
     LinkCheck,
@@ -46,6 +47,8 @@ class PipelineStats:
     resource_total: int = 0
     resource_by_check: dict[str, int] = field(default_factory=dict)
     resource_by_provider: dict[str, int] = field(default_factory=dict)
+    #: 按网盘细分校验状态：{provider: {total/valid/unchecked/invalid/other: 数量}}
+    resource_by_provider_check: dict[str, dict[str, int]] = field(default_factory=dict)
     #: 在关联表里没有任何作品指向它的资源数
     resource_orphan: int = 0
     media_resource_total: int = 0
@@ -58,6 +61,16 @@ def _label(key: Any) -> str:
     return str(getattr(key, "value", key))
 
 
+#: resource_by_provider_check 把 8 种 check_status 折叠成 4 个展示桶，
+#: 未列出的（need_password/rate_limited/unsupported/error）一律落 "other"。
+_CHECK_BUCKET = {
+    CheckStatus.VALID: "valid",
+    CheckStatus.UNCHECKED: "unchecked",
+    CheckStatus.CHECKING: "unchecked",
+    CheckStatus.INVALID: "invalid",
+}
+
+
 async def collect_stats(session: AsyncSession) -> PipelineStats:
     """把整条流水线的计数聚合成一个对象。
 
@@ -68,7 +81,9 @@ async def collect_stats(session: AsyncSession) -> PipelineStats:
     否则 NULL 那一组不进分组结果，总数会少算。
 
     这样每张表只扫一遍而不是两遍：resource 表原本要被扫四次
-    （总数、按状态、按网盘、孤儿反连接），现在三次。
+    （总数、按状态、按网盘、孤儿反连接），现在三次 —— `resource_by_provider`
+    和 `resource_by_provider_check` 共用同一次 `GROUP BY provider, check_status`，
+    不再为 provider 单独分组。
     """
 
     async def count(model: Any, *conditions: Any) -> int:
@@ -98,7 +113,23 @@ async def collect_stats(session: AsyncSession) -> PipelineStats:
     extraction_by_model = await group(Extraction, Extraction.model)
     media_by_type = await group(Media, Media.media_type)
     resource_by_check = await group(Resource, Resource.check_status)
-    resource_by_provider = await group(Resource, Resource.provider)
+
+    provider_check_rows = await session.execute(
+        select(Resource.provider, Resource.check_status, func.count())
+        .select_from(Resource)
+        .group_by(Resource.provider, Resource.check_status)
+    )
+    resource_by_provider: dict[str, int] = {}
+    resource_by_provider_check: dict[str, dict[str, int]] = {}
+    for provider, check_status, cnt in provider_check_rows.all():
+        p = _label(provider)
+        bucket = _CHECK_BUCKET.get(check_status, "other")
+        row = resource_by_provider_check.setdefault(
+            p, {"total": 0, "valid": 0, "unchecked": 0, "invalid": 0, "other": 0}
+        )
+        row[bucket] += cnt
+        row["total"] += cnt
+        resource_by_provider[p] = resource_by_provider.get(p, 0) + cnt
 
     return PipelineStats(
         sources_total=source_row[0] or 0,
@@ -113,6 +144,7 @@ async def collect_stats(session: AsyncSession) -> PipelineStats:
         resource_total=sum(resource_by_check.values()),
         resource_by_check=resource_by_check,
         resource_by_provider=resource_by_provider,
+        resource_by_provider_check=resource_by_provider_check,
         resource_orphan=await count(
             Resource,
             ~select(media_resource.c.resource_id)

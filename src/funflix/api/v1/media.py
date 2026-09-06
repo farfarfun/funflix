@@ -14,7 +14,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 
 from funflix.api.deps import PageDep, SessionDep
-from funflix.base.enums import CheckStatus, MediaType
+from funflix.base.enums import CheckStatus, MediaType, Provider
 from funflix.models import Media, Resource, media_resource
 from funflix.models.media import UNKNOWN_YEAR
 from funflix.schemas.common import Page
@@ -42,6 +42,7 @@ async def list_media(
         description=f"年份；传 {UNKNOWN_YEAR} 查年份未知的作品（出参里这些作品的 year 是 null）",
     ),
     valid_only: bool = Query(default=False, description="只要至少有一条校验通过资源的作品"),
+    provider: Provider | None = Query(default=None, description="只要至少有一条该网盘资源的作品"),
 ) -> Page[MediaSummary]:
     """搜索 / 浏览作品。"""
     query = SearchQuery(
@@ -49,6 +50,7 @@ async def list_media(
         media_type=media_type,
         year=year,
         valid_only=valid_only,
+        provider=provider,
         limit=paging.size,
         offset=paging.offset,
     )

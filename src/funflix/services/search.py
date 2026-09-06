@@ -16,7 +16,7 @@ from typing import Any, Protocol, runtime_checkable
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from funflix.base.enums import CheckStatus, MediaType
+from funflix.base.enums import CheckStatus, MediaType, Provider
 from funflix.models import Media, Resource, media_resource
 from funflix.services.text.normalize import norm_key
 
@@ -38,6 +38,8 @@ class SearchQuery:
     year: int | None = None
     #: 只返回至少有一条可用资源的作品
     valid_only: bool = False
+    #: 只返回至少有一条该网盘资源的作品
+    provider: Provider | None = None
     limit: int = 20
     offset: int = 0
 
@@ -66,6 +68,18 @@ def _apply_filters(stmt: Select, query: SearchQuery) -> Select:
             .where(
                 media_resource.c.media_id == Media.id,
                 Resource.check_status == CheckStatus.VALID,
+            )
+            .exists()
+        )
+    if query.provider is not None:
+        # 与 valid_only 是两个独立条件，不要求同一条资源既 valid 又是该网盘 ——
+        # 这样两个筛选可以自由组合，语义更符合直觉。
+        stmt = stmt.where(
+            select(media_resource.c.media_id)
+            .join(Resource, Resource.id == media_resource.c.resource_id)
+            .where(
+                media_resource.c.media_id == Media.id,
+                Resource.provider == query.provider,
             )
             .exists()
         )
