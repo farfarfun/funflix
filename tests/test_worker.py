@@ -18,7 +18,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from funflix.base.backoff import BASE_BACKOFF, MAX_BACKOFF, backoff
 from funflix.base.config import Settings
 from funflix.base.enums import CheckStatus, ParseStatus, Provider, Quality, SourceType
-from funflix.models import Base, LinkCheck, Media, RawDocument, Resource, Source, Tag, utcnow
+from funflix.models import (
+    Base,
+    LinkCheck,
+    Media,
+    RawDocument,
+    Resource,
+    Source,
+    Tag,
+    media_resource,
+    utcnow,
+)
 from funflix.services.extract.runner import (
     MAX_PARSE_ATTEMPTS,
     SAVEPOINT_BATCH_SIZE,
@@ -413,6 +423,31 @@ class TestParseDocumentIntegrityRace:
 
 class TestRunnerParseBatch:
     """`runner.parse_batch` 的批量预读不该改变结果，只该改变往返次数。"""
+
+    @pytest.mark.asyncio
+    async def test_one_document_shares_one_resource_across_titles(self, session) -> None:
+        from funflix.services.extract.rule import RuleExtractor
+
+        doc = make_doc(
+            1,
+            content=(
+                "名称：剧集A\n类型：短剧\n"
+                "名称：剧集B\n类型：短剧\n"
+                "合集资源：\n夸克：https://pan.quark.cn/s/fakeshared"
+            ),
+        )
+        session.add(doc)
+        await session.commit()
+
+        report = await parse_document(session, doc, RuleExtractor())
+        await session.commit()
+
+        resources = list(await session.scalars(select(Resource)))
+        links = (await session.execute(select(media_resource))).all()
+        assert report.ok is True
+        assert len(resources) == 1
+        assert resources[0].seen_count == 1
+        assert len(links) == 2
 
     @pytest.mark.asyncio
     async def test_two_docs_sharing_a_title_dedupe_within_the_batch(self, session) -> None:

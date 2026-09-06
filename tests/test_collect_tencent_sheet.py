@@ -120,6 +120,7 @@ class TestNormalizeIdentifier:
             SourceType.TENCENT_DOC,
             SourceType.KDOCS,
             SourceType.RSS,
+            SourceType.FORUM,
             SourceType.API,
         }
 

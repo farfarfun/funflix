@@ -35,9 +35,12 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 | `telegram` | Telegram 公开 Web 预览页 | 消息 ID，可追新/补历史 | 频道分享文本 |
 | `tencent_docs` | 腾讯智能表格接口 | sheet 版本与行偏移 | 结构化资源表 |
 | `tencent_doc` | 腾讯文本文档接口 | 文档 revision | 文本型资源清单 |
+| `kdocs` | 金山多维表格接口 | sheet 偏移 | 结构化资源表 |
 | `rss` | 通用 RSS 2.0 / Atom | 条目 `guid` / `id` | 公开影视、动漫、种子 feed |
+| `forum` | 电影云集 Flarum 合集 | 帖子 ID，可追新/补历史 | `bbs.dyyjv.com` 日更合集 |
+| `api` | 人人影视快照与评论接口 | 快照校验和 / 评论 ID | 历史资源与网友分享 |
 
-`weibo`、`forum`、`api` 等枚举值目前只是预留，尚未注册采集器；登记时会被拒绝。
+`weibo` 等枚举值目前只是预留，尚未注册采集器；登记时会被拒绝。
 
 ## 快速开始
 

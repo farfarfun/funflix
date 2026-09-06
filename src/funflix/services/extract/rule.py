@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -26,6 +27,7 @@ from funflix.services.text.normalize import (
 from funflix.services.text.segment import segment_text
 
 VERSION = "v2"
+_SHARED_LINK_RE = re.compile(r"(?m)^\s*合集资源\s*[:：]")
 
 
 def _looks_like_catalog(title: str, segment_count: int, link_count: int) -> bool:
@@ -61,6 +63,7 @@ class RuleExtractor:
     def _build(self, content: str) -> ExtractionOutcome:
         started = time.monotonic()
         segmented = segment_text(content)
+        shared_links = segmented.all_links if _SHARED_LINK_RE.search(content) else None
 
         items: list[ExtractedItem] = []
         catalog_votes = 0
@@ -72,7 +75,9 @@ class RuleExtractor:
             if not title or not key:
                 continue
 
-            if _looks_like_catalog(raw_title, len(segmented.segments), len(segmented.all_links)):
+            if not shared_links and _looks_like_catalog(
+                raw_title, len(segmented.segments), len(segmented.all_links)
+            ):
                 catalog_votes += 1
                 continue
 
@@ -86,7 +91,7 @@ class RuleExtractor:
                     quality=extract_quality(segment.text),
                     size_bytes=extract_size_bytes(segment.text),
                     tags=extract_tags(segment.text),
-                    links=list(segment.links),
+                    links=list(shared_links or segment.links),
                 )
             )
 

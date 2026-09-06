@@ -529,6 +529,7 @@ async def _persist_phase1(
     """
     media_by_item: list[tuple[Media, list[Tag]]] = []
     resource_by_link: list[tuple[Media, Resource]] = []
+    resources: dict[tuple, Resource] = {}
 
     for item in outcome.items:
         media, created = await _upsert_media(session, item, cache)
@@ -537,11 +538,14 @@ async def _persist_phase1(
         tags = await _resolve_tags(session, item, cache)
         media_by_item.append((media, tags))
         for link in item.links:
-            resource, is_new = await _upsert_resource(
-                session, link, doc=doc, item=item, cache=cache
-            )
-            report.resources_created += int(is_new)
-            report.resources_updated += int(not is_new)
+            resource = resources.get(link.key)
+            if resource is None:
+                resource, is_new = await _upsert_resource(
+                    session, link, doc=doc, item=item, cache=cache
+                )
+                resources[link.key] = resource
+                report.resources_created += int(is_new)
+                report.resources_updated += int(not is_new)
             resource_by_link.append((media, resource))
 
     # 没归属到作品的链接照样入库（无任何关联），进人工/二次归属队列，绝不丢弃
