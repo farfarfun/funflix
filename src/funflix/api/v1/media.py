@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import case, select
@@ -42,7 +43,9 @@ async def list_media(
         description=f"年份；传 {UNKNOWN_YEAR} 查年份未知的作品（出参里这些作品的 year 是 null）",
     ),
     valid_only: bool = Query(default=False, description="只要至少有一条校验通过资源的作品"),
-    provider: Provider | None = Query(default=None, description="只要至少有一条该网盘资源的作品"),
+    provider: Annotated[
+        Provider | None, Query(description="只要至少有一条该网盘资源的作品")
+    ] = None,
 ) -> Page[MediaSummary]:
     """搜索 / 浏览作品。"""
     query = SearchQuery(
