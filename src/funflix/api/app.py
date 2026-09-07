@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from sqlalchemy import text
+from starlette.middleware.sessions import SessionMiddleware
 
 from funflix.api.v1 import api_router
 from funflix.base.config import get_settings
@@ -64,6 +65,13 @@ def create_app() -> FastAPI:
         description="影视资源分享文本的结构化采集、解析与网盘链接校验",
         lifespan=lifespan,
         debug=settings.debug,
+    )
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.session_secret,
+        max_age=settings.session_max_age,
+        same_site="lax",
+        https_only=settings.session_cookie_secure,
     )
     app.include_router(api_router, prefix=settings.api_prefix)
 

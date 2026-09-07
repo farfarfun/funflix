@@ -236,10 +236,10 @@ class TestGetMedia:
 
 @pytest.mark.asyncio
 class TestListResources:
-    """列表接口要管理员 key —— 它能成页吐出整库的链接与提取码。"""
+    """列表接口要求登录 —— 它能成页吐出整库的链接与提取码。"""
 
-    async def test_requires_admin_key(self, client, seeded) -> None:
-        assert (await client.get("/api/v1/resources")).status_code == 403
+    async def test_requires_login(self, client, seeded) -> None:
+        assert (await client.get("/api/v1/resources")).status_code == 401
 
     async def test_lists_resources(self, admin_client, seeded) -> None:
         body = (await admin_client.get("/api/v1/resources")).json()
@@ -260,15 +260,15 @@ class TestListResources:
             await admin_client.get("/api/v1/resources/00000000-0000-0000-0000-000000000000")
         ).status_code == 404
 
-    async def test_single_lookup_requires_key(self, client, seeded) -> None:
+    async def test_single_lookup_requires_login(self, client, seeded) -> None:
         """issue #2：id 是自增整数，单条不上锁等于列表那把锁白加。"""
-        assert (await client.get("/api/v1/resources/1")).status_code == 403
+        assert (await client.get("/api/v1/resources/1")).status_code == 401
 
 
 @pytest.mark.asyncio
 class TestStats:
-    async def test_reports_pipeline_counts(self, client, seeded) -> None:
-        body = (await client.get("/api/v1/stats")).json()
+    async def test_reports_pipeline_counts(self, admin_client, seeded) -> None:
+        body = (await admin_client.get("/api/v1/stats")).json()
         assert body["media_total"] == 3
         assert body["resource_total"] == 1
         assert body["media_by_type"]["movie"] == 2
@@ -277,26 +277,29 @@ class TestStats:
         assert body["resource_by_provider"]["quark"] == 1
         assert body["media_resource_total"] == 1
 
-    async def test_counts_orphan_resources(self, client, session, seeded) -> None:
+    async def test_counts_orphan_resources(self, admin_client, session, seeded) -> None:
         """没挂到任何作品上的资源要被单独统计出来，否则数据丢失是无声的。"""
         session.add(_resource("orphan1"))
         await session.commit()
-        body = (await client.get("/api/v1/stats")).json()
+        body = (await admin_client.get("/api/v1/stats")).json()
         assert body["resource_orphan"] == 1
         assert body["resource_total"] == 2
 
-    async def test_empty_db_returns_zeros(self, client) -> None:
-        body = (await client.get("/api/v1/stats")).json()
+    async def test_empty_db_returns_zeros(self, admin_client) -> None:
+        body = (await admin_client.get("/api/v1/stats")).json()
         assert body["media_total"] == 0
         assert body["raw_by_status"] == {}
 
-    async def test_totals_agree_with_breakdowns(self, client, seeded) -> None:
+    async def test_requires_login(self, client, seeded) -> None:
+        assert (await client.get("/api/v1/stats")).status_code == 401
+
+    async def test_totals_agree_with_breakdowns(self, admin_client, seeded) -> None:
         """总数是从分组求和得来的，必须与分组对得上。
 
         分组列都是 NOT NULL，所以求和等价于 COUNT(*)。哪天某列变成可空，
         NULL 那一组不会进分组结果，这条断言就会先炸 —— 这正是它的用处。
         """
-        body = (await client.get("/api/v1/stats")).json()
+        body = (await admin_client.get("/api/v1/stats")).json()
         assert body["media_total"] == sum(body["media_by_type"].values())
         assert body["resource_total"] == sum(body["resource_by_check"].values())
         assert body["resource_total"] == sum(body["resource_by_provider"].values())

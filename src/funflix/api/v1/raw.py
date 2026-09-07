@@ -1,4 +1,4 @@
-"""原始文本的摄入与查询接口。"""
+"""原始文本的摄入与查询接口。整个模块都要求登录。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
-from funflix.api.deps import PageDep, SessionDep, SettingsDep
+from funflix.api.deps import CurrentUserDep, PageDep, SessionDep, SettingsDep
 from funflix.base.enums import ParseStatus, SourceType
 from funflix.models import RawDocument
 from funflix.schemas.raw import (
@@ -49,6 +49,7 @@ async def create_raw_document(
     payload: RawDocumentCreate,
     session: SessionDep,
     settings: SettingsDep,
+    _: CurrentUserDep,
 ) -> IngestResult:
     """提交一条原始分享文本。
 
@@ -65,6 +66,7 @@ async def create_raw_documents(
     payload: RawDocumentBatchCreate,
     session: SessionDep,
     settings: SettingsDep,
+    _: CurrentUserDep,
 ) -> BatchIngestResult:
     """批量提交。整批在一个事务里，要么全成要么全滚。"""
     if len(payload.items) > settings.ingest_max_batch:
@@ -92,6 +94,7 @@ async def create_raw_documents(
 async def list_raw_documents(
     session: SessionDep,
     paging: PageDep,
+    _: CurrentUserDep,
     parse_status: ParseStatus | None = None,
     source_type: SourceType | None = None,
     source_name: str | None = None,
@@ -122,7 +125,9 @@ async def list_raw_documents(
 
 
 @router.get("/{doc_id}", response_model=RawDocumentOut)
-async def get_raw_document(doc_id: uuid.UUID, session: SessionDep) -> RawDocumentOut:
+async def get_raw_document(
+    doc_id: uuid.UUID, session: SessionDep, _: CurrentUserDep
+) -> RawDocumentOut:
     doc = await session.get(RawDocument, doc_id)
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="原始文本不存在")

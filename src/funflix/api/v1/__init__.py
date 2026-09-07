@@ -2,9 +2,10 @@
 
 from fastapi import APIRouter
 
-from funflix.api.v1 import media, raw, resources, sources, stats
+from funflix.api.v1 import auth, media, raw, resources, sources, stats
 
 api_router = APIRouter()
+api_router.include_router(auth.router)
 api_router.include_router(sources.router)
 api_router.include_router(raw.router)
 api_router.include_router(media.router)

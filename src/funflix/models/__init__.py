@@ -13,6 +13,7 @@ from funflix.models.raw import RawDocument
 from funflix.models.resource import Resource
 from funflix.models.source import Source
 from funflix.models.tag import Tag, TagKind, media_tag
+from funflix.models.user import User
 
 __all__ = [
     "UNKNOWN_YEAR",
@@ -25,6 +26,7 @@ __all__ = [
     "Source",
     "Tag",
     "TagKind",
+    "User",
     "media_resource",
     "media_tag",
     "TimestampMixin",

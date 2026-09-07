@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import secrets
+import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any
 
-from fastapi import Depends, Header, HTTPException, Query, status
+from fastapi import Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.config import Settings, get_settings
 from funflix.base.db import get_session
+from funflix.models import User
 from funflix.schemas.common import MAX_PAGE_NUMBER, MAX_PAGE_SIZE
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -52,21 +53,18 @@ async def get_or_404(session: AsyncSession, model: type[Any], pk: Any, detail: s
     return row
 
 
-async def require_admin(
-    settings: SettingsDep,
-    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
-) -> None:
-    """管理类接口的鉴权。
-
-    未配置 `FUNFLIX_ADMIN_API_KEY` 时直接拒绝 —— 默认关闭比默认放行安全。
-    """
-    if not settings.admin_api_key:
+async def get_current_user(request: Request, session: SessionDep) -> User:
+    """「运维」区接口的鉴权：要求已登录会话。"""
+    user_id = request.session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
+    user = await session.get(User, uuid.UUID(user_id))
+    if user is None or not user.is_active:
+        request.session.clear()
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="管理接口未启用：请配置 FUNFLIX_ADMIN_API_KEY",
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录"
         )
-    if not x_api_key or not secrets.compare_digest(x_api_key, settings.admin_api_key):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的 API Key")
+    return user
 
 
-AdminDep = Annotated[None, Depends(require_admin)]
+CurrentUserDep = Annotated[User, Depends(get_current_user)]

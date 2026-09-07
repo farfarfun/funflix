@@ -39,10 +39,12 @@ db_app = typer.Typer(help="数据库迁移与检查", no_args_is_help=True)
 source_app = typer.Typer(help="采集源管理与采集", no_args_is_help=True)
 sync_app = typer.Typer(help="本地库与远端库同步（自建 self-hosted runner）", no_args_is_help=True)
 server_app = typer.Typer(help="API 服务生命周期", no_args_is_help=True)
+user_app = typer.Typer(help="登录账号管理", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(source_app, name="source")
 app.add_typer(sync_app, name="sync")
 app.add_typer(server_app, name="server")
+app.add_typer(user_app, name="user")
 
 
 def _version_callback(value: bool) -> None:
@@ -823,6 +825,124 @@ def db_info() -> None:
     settings = get_settings()
     typer.echo(f"  方言    {settings.database_url.split('://', 1)[0]}")
     typer.echo(f"  SQLite  {settings.is_sqlite}")
+
+
+# --- user ----------------------------------------------------------------------
+
+
+@user_app.command("create")
+def user_create(
+    username: Annotated[str, typer.Argument(help="登录用户名")],
+    password: Annotated[
+        str | None,
+        typer.Option("--password", help="不给的话会交互式输入（不回显）"),
+    ] = None,
+) -> None:
+    """创建一个「运维」区登录账号。"""
+    from sqlalchemy import select
+
+    from funflix.base.db import session_scope
+    from funflix.models import User
+    from funflix.security import hash_password
+
+    if password is None:
+        password = typer.prompt("密码", hide_input=True, confirmation_prompt=True)
+
+    async def _do() -> bool:
+        async with session_scope() as session:
+            existing = await session.scalar(select(User).where(User.username == username))
+            if existing is not None:
+                return False
+            session.add(User(username=username, password_hash=hash_password(password)))
+            return True
+
+    if not _run(_do):
+        _fail(f"用户名已存在：{username}")
+    _ok(f"已创建用户 {username}")
+
+
+@user_app.command("set-password")
+def user_set_password(
+    username: Annotated[str, typer.Argument(help="登录用户名")],
+    password: Annotated[
+        str | None,
+        typer.Option("--password", help="不给的话会交互式输入（不回显）"),
+    ] = None,
+) -> None:
+    """重置某个账号的密码。"""
+    from sqlalchemy import select
+
+    from funflix.base.db import session_scope
+    from funflix.models import User
+    from funflix.security import hash_password
+
+    if password is None:
+        password = typer.prompt("新密码", hide_input=True, confirmation_prompt=True)
+
+    async def _do() -> bool:
+        async with session_scope() as session:
+            user = await session.scalar(select(User).where(User.username == username))
+            if user is None:
+                return False
+            user.password_hash = hash_password(password)
+            return True
+
+    if not _run(_do):
+        _fail(f"用户不存在：{username}")
+    _ok(f"已重置 {username} 的密码")
+
+
+@user_app.command("list")
+def user_list() -> None:
+    """列出全部账号。"""
+    from sqlalchemy import select
+
+    from funflix.base.db import session_scope
+    from funflix.models import User
+
+    async def _do() -> list[User]:
+        async with session_scope() as session:
+            return list(await session.scalars(select(User).order_by(User.username)))
+
+    users = _run(_do)
+    if not users:
+        typer.echo("暂无账号")
+        return
+    _table(
+        [[u.username, "启用" if u.is_active else "已停用", u.created_at] for u in users],
+        ["用户名", "状态", "创建时间"],
+    )
+
+
+def _set_active(username: str, *, active: bool) -> None:
+    from sqlalchemy import select
+
+    from funflix.base.db import session_scope
+    from funflix.models import User
+
+    async def _do() -> bool:
+        async with session_scope() as session:
+            user = await session.scalar(select(User).where(User.username == username))
+            if user is None:
+                return False
+            user.is_active = active
+            return True
+
+    if not _run(_do):
+        _fail(f"用户不存在：{username}")
+    _ok(f"已{'启用' if active else '停用'} {username}")
+
+
+@user_app.command("enable")
+def user_enable(username: Annotated[str, typer.Argument(help="登录用户名")]) -> None:
+    """重新启用一个被停用的账号。"""
+    _set_active(username, active=True)
+
+
+@user_app.command("disable")
+def user_disable(username: Annotated[str, typer.Argument(help="登录用户名")]) -> None:
+    """停用一个账号（保留记录，只是不能再登录）。"""
+    _set_active(username, active=False)
 
 
 # --- sync ----------------------------------------------------------------------

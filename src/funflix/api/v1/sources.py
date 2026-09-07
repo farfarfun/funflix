@@ -1,12 +1,8 @@
 """采集源的登记、管理与触发采集。
 
-写接口（POST / PATCH / DELETE / collect）要 `X-API-Key`，查询接口开放。
-删掉一个源会连带丢掉它的水位游标，重建后要么从头重采、要么漏掉中间的消息，
-这不该是匿名调用者能做到的事。
-
-`require_admin` 在未配置 `FUNFLIX_ADMIN_API_KEY` 时一律 403 —— 默认关闭比
-默认放行安全。用 HTTP 管理采集源前必须先配这个环境变量；CLI 不走这条路径，
-不受影响。
+整个模块都要求登录（`CurrentUserDep`）。删掉一个源会连带丢掉它的水位游标，
+重建后要么从头重采、要么漏掉中间的消息，这不该是匿名调用者能做到的事；
+查询接口同样收进登录态之后，避免匿名枚举采集源列表。
 """
 
 from __future__ import annotations
@@ -16,7 +12,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
-from funflix.api.deps import AdminDep, PageDep, SessionDep
+from funflix.api.deps import CurrentUserDep, PageDep, SessionDep
 from funflix.base.enums import ParseStatus, SourceType
 from funflix.models import RawDocument, Resource, Source
 from funflix.schemas.raw import Page
@@ -77,13 +73,13 @@ def _with_stats(source: Source, stats: dict[str, int]) -> SourceOut:
 
 
 @router.get("/supported", response_model=list[SourceType])
-async def list_supported() -> list[SourceType]:
+async def list_supported(_: CurrentUserDep) -> list[SourceType]:
     """当前实现了采集器的源类型。"""
     return supported_source_types()
 
 
 @router.post("", response_model=SourceOut, status_code=status.HTTP_201_CREATED)
-async def create_source(payload: SourceCreate, session: SessionDep, _: AdminDep) -> SourceOut:
+async def create_source(payload: SourceCreate, session: SessionDep, _: CurrentUserDep) -> SourceOut:
     """登记一个采集源。
 
     同一个源（source_type + identifier）重复登记会返回 409 而不是建重复行 ——
@@ -143,6 +139,7 @@ async def create_source(payload: SourceCreate, session: SessionDep, _: AdminDep)
 async def list_sources(
     session: SessionDep,
     paging: PageDep,
+    _: CurrentUserDep,
     enabled: bool | None = None,
     source_type: SourceType | None = None,
 ) -> Page[SourceOut]:
@@ -179,7 +176,7 @@ async def _get_or_404(session: SessionDep, source_id: uuid.UUID) -> Source:
 
 
 @router.get("/{source_id}", response_model=SourceOut)
-async def get_source(source_id: uuid.UUID, session: SessionDep) -> SourceOut:
+async def get_source(source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep) -> SourceOut:
     source = await _get_or_404(session, source_id)
     stats = await _source_stats(session, [source.id])
     return _with_stats(source, stats[source.id])
@@ -187,7 +184,7 @@ async def get_source(source_id: uuid.UUID, session: SessionDep) -> SourceOut:
 
 @router.patch("/{source_id}", response_model=SourceOut)
 async def update_source(
-    source_id: uuid.UUID, payload: SourceUpdate, session: SessionDep, _: AdminDep
+    source_id: uuid.UUID, payload: SourceUpdate, session: SessionDep, _: CurrentUserDep
 ) -> SourceOut:
     """修改采集源。把 `cursor_message_id` 回拨即可重采历史。"""
     source = await _get_or_404(session, source_id)
@@ -200,7 +197,7 @@ async def update_source(
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
-async def delete_source(source_id: uuid.UUID, session: SessionDep, _: AdminDep) -> None:
+async def delete_source(source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep) -> None:
     """删除采集源。已采集的原始文本会保留（source_id 置空）。"""
     source = await _get_or_404(session, source_id)
     await session.delete(source)
@@ -209,7 +206,7 @@ async def delete_source(source_id: uuid.UUID, session: SessionDep, _: AdminDep) 
 
 @router.post("/{source_id}/collect", response_model=CollectReportOut)
 async def trigger_collect(
-    source_id: uuid.UUID, session: SessionDep, _: AdminDep
+    source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep
 ) -> CollectReportOut:
     """立即采集一次（同步执行，便于接入时观察结果）。"""
     source = await _get_or_404(session, source_id)
@@ -232,7 +229,7 @@ async def trigger_collect(
 
 @router.post("/{source_id}/parse", response_model=SourceParseReportOut)
 async def trigger_parse(
-    source_id: uuid.UUID, session: SessionDep, _: AdminDep
+    source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep
 ) -> SourceParseReportOut:
     """立即解析该源一批待处理的原始文本（同步执行，单批，不排空整条队列）。
 

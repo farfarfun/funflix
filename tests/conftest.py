@@ -8,12 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from funflix.api.app import create_app
-from funflix.base.config import Settings, get_settings
 from funflix.base.db import get_session
-from funflix.models import Base
+from funflix.models import Base, User
+from funflix.security import hash_password
 
-#: 测试用的管理员 key。写接口与 /resources 列表要它。
-ADMIN_KEY = "test-admin-key"
+#: 测试用的登录账号。运维接口的读写都要先登录。
+ADMIN_USERNAME = "tester"
+ADMIN_PASSWORD = "test-password"
 
 
 @pytest_asyncio.fixture
@@ -58,8 +59,11 @@ async def client(engine) -> AsyncIterator[AsyncClient]:
 
 
 @pytest_asyncio.fixture
-async def admin_client(engine) -> AsyncIterator[AsyncClient]:
-    """带管理员 key 的客户端，用于需要鉴权的接口。"""
+async def admin_client(engine, session) -> AsyncIterator[AsyncClient]:
+    """已登录的客户端，用于需要登录态的运维接口。"""
+    session.add(User(username=ADMIN_USERNAME, password_hash=hash_password(ADMIN_PASSWORD)))
+    await session.commit()
+
     app = create_app()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -68,9 +72,10 @@ async def admin_client(engine) -> AsyncIterator[AsyncClient]:
             yield s
 
     app.dependency_overrides[get_session] = _override
-    app.dependency_overrides[get_settings] = lambda: Settings(admin_api_key=ADMIN_KEY)
     transport = ASGITransport(app=app)
-    async with AsyncClient(
-        transport=transport, base_url="http://test", headers={"X-API-Key": ADMIN_KEY}
-    ) as c:
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/api/v1/auth/login", json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD}
+        )
+        assert resp.status_code == 200
         yield c

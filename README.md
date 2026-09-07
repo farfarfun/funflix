@@ -171,7 +171,10 @@ funflix source collect
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `FUNFLIX_DATABASE_URL` | `sqlite+aiosqlite:///./funflix.db` | 切 PG 改成 `postgresql+asyncpg://...` |
-| `FUNFLIX_ADMIN_API_KEY` | 空 | 管理接口的 key，不配则管理接口关闭 |
+| `FUNFLIX_SESSION_SECRET` | 随机（每次重启变化） | 会话 cookie 签名密钥；多进程/需跨重启保留会话的部署必须固定配置 |
+| `FUNFLIX_SESSION_MAX_AGE` | `2592000`（30 天） | 会话 cookie 有效期（秒） |
+| `FUNFLIX_SESSION_COOKIE_SECURE` | `false` | 会话 cookie 是否加 Secure 标记；确认部署链路全程 HTTPS 后再打开 |
+| `FUNFLIX_REGISTRATION_ENABLED` | `false` | 是否开放自助注册；默认关闭，账号由 `funflix user create` 创建 |
 | `FUNFLIX_LOG_LEVEL` | `INFO` | |
 | `FUNFLIX_INGEST_MAX_BATCH` | `200` | 单批提交上限 |
 | `FUNFLIX_INGEST_MAX_CONTENT_LENGTH` | `100000` | 单条文本长度上限 |
@@ -230,19 +233,30 @@ PostgreSQL 上的三条实测结论（`tests/test_search_pg.py`，5 万行）：
 
 ### 鉴权
 
-写接口（`POST`/`PATCH`/`DELETE /sources`、`/sources/{id}/collect`）需要 `X-API-Key`：
+`/sources`、`/raw`、`/resources`、`/stats` 整个「运维」区都要求登录（基于会话
+cookie，不再是 `X-API-Key`）；`/media` 与 `/media/{id}` 保持开放，面向使用者。
+
+先建一个账号（自助注册默认关闭，见上面的 `FUNFLIX_REGISTRATION_ENABLED`）：
 
 ```bash
-export FUNFLIX_ADMIN_API_KEY=$(openssl rand -hex 32)
-curl -X POST localhost:8000/api/v1/sources \
-     -H "X-API-Key: $FUNFLIX_ADMIN_API_KEY" \
+funflix user create funflix --password funflix
+```
+
+再走登录接口拿会话 cookie：
+
+```bash
+curl -c cookies.txt -X POST localhost:8000/api/v1/auth/login \
+     -H "Content-Type: application/json" \
+     -d '{"username": "funflix", "password": "funflix"}'
+
+curl -b cookies.txt -X POST localhost:8000/api/v1/sources \
      -d '{"url": "https://t.me/s/某频道"}'
 ```
 
-未配置该变量时管理接口一律返回 403（默认关闭比默认放行安全）。CLI 不走 HTTP，不受影响。
+CLI（`funflix user` / `funflix source` 等）直连数据库，不走 HTTP，不受影响。
 
-> ⚠️ 查询接口目前仍是开放的，其中 `/resources` 会成页返回网盘链接与**提取码**，
-> 整库可在 `总数/200` 次请求内翻完。要暴露到公网的话，先给它也加上鉴权或限流。
+其余账号管理命令：`funflix user list` / `user set-password` / `user enable` /
+`user disable`。
 
 ## 网盘校验
 

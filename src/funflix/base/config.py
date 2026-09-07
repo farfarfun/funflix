@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from functools import lru_cache
 from pathlib import Path
 
@@ -125,8 +126,23 @@ class Settings(BaseSettings):
 
     # --- API ---
     api_prefix: str = "/api/v1"
-    #: 管理类接口（reparse / recheck / stats）的鉴权 key；为空则这些接口关闭。
-    admin_api_key: str | None = None
+
+    # --- 账号体系（见 api/v1/auth.py）---
+    #: 会话 cookie 的签名密钥。不配的话每次进程重启都会生成一个新的随机值——
+    #: 单进程部署够用（重启后老会话失效，重新登录即可）；多进程/会跨重启保留
+    #: 会话的生产部署，必须显式配置 FUNFLIX_SESSION_SECRET 为一个固定的随机串，
+    #: 否则同一个 cookie 在不同进程间无法互相验证。
+    session_secret: str = Field(default_factory=lambda: secrets.token_hex(32))
+    #: 会话 cookie 有效期，默认 30 天
+    session_max_age: int = 60 * 60 * 24 * 30
+    #: 是否给会话 cookie 加 Secure 标记（只在 HTTPS 下才会被发送）。
+    #: 默认关闭——这个服务常见部署形态是自建/反代到内网 HTTP，强制 Secure
+    #: 会导致没走 HTTPS 的场景下 cookie 直接发不出去、登录了也白登录。
+    #: 确认部署链路全程 HTTPS 后，生产可显式配置 FUNFLIX_SESSION_COOKIE_SECURE=true。
+    session_cookie_secure: bool = False
+    #: 注册入口默认关闭——账号应由运营在服务端用 `funflix user create` 创建，
+    #: 避免部署到公网后任何人都能自己注册一个「运维」账号。
+    registration_enabled: bool = False
 
     # --- 后台 worker（见 docs/DESIGN.md §5）---
     #: API 进程内是否顺带跑后台 worker。
