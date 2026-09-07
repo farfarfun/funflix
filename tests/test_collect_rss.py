@@ -62,6 +62,27 @@ def test_parse_atom() -> None:
     assert messages[0].url == "https://example.test/a"
 
 
+def test_parse_gb2312_feed() -> None:
+    payload = (
+        '<?xml version="1.0" encoding="gb2312"?>'
+        "<rss><channel><title>影视更新</title><item><guid>1</guid><title>剧集甲</title>"
+        "<description>https://pan.quark.cn/s/abc</description></item></channel></rss>"
+    ).encode("gb18030")
+    messages, title = parse_feed(payload)
+    assert title == "影视更新"
+    assert messages[0].message_id == "1"
+
+
+def test_parse_feed_ignores_whitespace_before_xml_declaration() -> None:
+    messages, title = parse_feed(
+        b'\n \n<?xml version="1.0" encoding="UTF-8"?>'
+        b"<rss><channel><title>Feed</title><item><guid>1</guid><title>Item</title>"
+        b"</item></channel></rss>"
+    )
+    assert title == "Feed"
+    assert messages[0].message_id == "1"
+
+
 @pytest.mark.asyncio
 async def test_fetch_is_incremental() -> None:
     client = httpx.AsyncClient(

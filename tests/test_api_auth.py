@@ -52,9 +52,7 @@ async def authed(engine, session) -> AsyncIterator[AsyncClient]:
     session.add(User(username=USERNAME, password_hash=hash_password(PASSWORD)))
     await session.commit()
     async with _client_with(engine, Settings()) as c:
-        resp = await c.post(
-            "/api/v1/auth/login", json={"username": USERNAME, "password": PASSWORD}
-        )
+        resp = await c.post("/api/v1/auth/login", json={"username": USERNAME, "password": PASSWORD})
         assert resp.status_code == 200
         yield c
 
@@ -108,9 +106,7 @@ class TestLogin:
 
     async def test_unknown_username_is_rejected(self, engine) -> None:
         async with _client_with(engine, Settings()) as c:
-            resp = await c.post(
-                "/api/v1/auth/login", json={"username": "nobody", "password": "x"}
-            )
+            resp = await c.post("/api/v1/auth/login", json={"username": "nobody", "password": "x"})
             assert resp.status_code == 401
 
     async def test_me_reflects_session(self, authed) -> None:

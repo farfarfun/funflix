@@ -113,6 +113,10 @@ class TestScanLinks:
         text = "https://pan.quark.cn/s/one1 https://pan.quark.cn/s/two2"
         assert len(scan_links(text)) == 2
 
+    def test_splits_links_joined_by_script_delimiters(self) -> None:
+        text = "剧集甲$https://pan.quark.cn/s/one1###剧集乙$https://pan.quark.cn/s/two2"
+        assert [link.share_id for link in scan_links(text)] == ["one1", "two2"]
+
     def test_canonicalizes_magnet_without_trackers(self) -> None:
         base = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
         raw = f"{base}&dn=Title&tr=https%3A%2F%2Ftracker.example%2Fannounce"

@@ -26,6 +26,8 @@ _SEEN_KEY = "rss_seen_ids"
 # dedicated cursor table only if feeds need exact change tracking beyond this window.
 _MAX_SEEN = 2000
 _HEX_HASH_RE = re.compile(r"^[0-9a-f]{20,64}$", re.I)
+_XML_ENCODING_RE = re.compile(rb"<\?xml[^>]*\bencoding\s*=\s*['\"]([^'\"]+)", re.I)
+_XML_DECLARATION_RE = re.compile(r"^\s*<\?xml[^>]*\?>", re.I)
 
 
 class _HTMLTextParser(HTMLParser):
@@ -114,6 +116,21 @@ def _stable_id(node: ET.Element, title: str, body: str, links: list[str]) -> str
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _xml_payload(payload: bytes | str) -> bytes | str:
+    payload = payload.lstrip()
+    if not isinstance(payload, bytes) or not (match := _XML_ENCODING_RE.search(payload[:200])):
+        return payload
+    encoding = match.group(1).decode("ascii", errors="ignore").lower()
+    if encoding in {"utf-8", "utf8", "us-ascii", "ascii"}:
+        return payload
+    if encoding in {"gb2312", "gbk"}:
+        encoding = "gb18030"
+    try:
+        return _XML_DECLARATION_RE.sub("", payload.decode(encoding, errors="replace"), count=1)
+    except LookupError:
+        return payload
+
+
 def _item_message(node: ET.Element) -> CollectedMessage | None:
     title = _text(_first_text(node, {"title"}))
     body = _text(_first_text(node, {"description", "summary", "encoded", "content"}))
@@ -143,7 +160,7 @@ def _item_message(node: ET.Element) -> CollectedMessage | None:
 
 def parse_feed(payload: bytes | str) -> tuple[list[CollectedMessage], str | None]:
     """解析 RSS 2.0 或 Atom，返回按发布时间/原顺序排列的条目。"""
-    root = ET.fromstring(payload)
+    root = ET.fromstring(_xml_payload(payload))
     title = _first_text(root, {"title"})
     if not title:
         channels = _children(root, {"channel"})

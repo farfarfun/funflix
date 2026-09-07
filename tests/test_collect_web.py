@@ -10,6 +10,7 @@ from funflix.models import Source
 from funflix.services.collect.registry import detect_source
 from funflix.services.collect.web import WebCollector
 from funflix.services.extract.rule import RuleExtractor
+from funflix.services.text.linkscan import scan_known_links
 
 
 @pytest.mark.asyncio
@@ -163,3 +164,67 @@ async def test_keeps_one_link_per_title_separate() -> None:
     outcome = await RuleExtractor().extract(result.messages[0].text)
     assert [item.title for item in outcome.items] == ["剧集甲", "剧集乙"]
     assert [[link.share_id for link in item.links] for item in outcome.items] == [["one"], ["two"]]
+
+
+@pytest.mark.asyncio
+async def test_discovers_semantic_article_links_and_embedded_resources() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/latest":
+            return httpx.Response(
+                200,
+                text=(
+                    '<a title="分类" href="/category/1.html">分类</a>'
+                    '<a title="电影甲" href="/articles/100.html">电影甲</a>'
+                ),
+            )
+        return httpx.Response(
+            200,
+            text=(
+                "<title>电影甲</title>"
+                '<button data-clipboard-text="https://pan.quark.cn/s/embedded">复制</button>'
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = Source(
+        id=1,
+        source_type=SourceType.WEB,
+        url="https://media.example/latest",
+        identifier="https://media.example/latest",
+        max_pages_per_fetch=1,
+        extra={},
+    )
+    result = await WebCollector(client).fetch(source)
+    await client.aclose()
+
+    assert len(result.messages) == 1
+    assert scan_known_links(result.messages[0].text)[0].share_id == "embedded"
+
+
+@pytest.mark.asyncio
+async def test_follows_torrent_intermediate_page() -> None:
+    info_hash = "0123456789abcdef0123456789abcdef01234567"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(200, text='<a href="/movie/1.html">电影甲</a>')
+        if request.url.path == "/movie/1.html":
+            return httpx.Response(
+                200,
+                text='<title>电影甲</title><a href="/download/1" title="第1集">下载</a>',
+            )
+        return httpx.Response(200, text=f'<a href="magnet:?xt=urn:btih:{info_hash}">磁力</a>')
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = Source(
+        id=1,
+        source_type=SourceType.WEB,
+        url="https://media.example/",
+        identifier="https://media.example/",
+        max_pages_per_fetch=5,
+        extra={},
+    )
+    result = await WebCollector(client).fetch(source)
+    await client.aclose()
+
+    assert scan_known_links(result.messages[0].text)[0].share_id == info_hash

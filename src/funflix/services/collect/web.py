@@ -26,6 +26,14 @@ _DETAIL_RE = re.compile(
 _ONCLICK_URL_RE = re.compile(
     r"(?:window\.)?location(?:\.href)?\s*=\s*(?P<quote>['\"])(?P<url>.+?)(?P=quote)", re.I
 )
+_CONTENT_LINK_RE = re.compile(r"(?:post|entry|article|thread|topic)[-_ ]?(?:title|link)", re.I)
+_RESOURCE_LABEL_RE = re.compile(
+    r"下载|网盘|磁力|torrent|\bBT\b|\b[124]K\b|1080|2160|全?第?\d+集", re.I
+)
+_ATTACHMENT_RE = re.compile(
+    r"(?:^|/)(?:attach(?:ment)?|download|tdown|torrent|bt)(?:[-_/]|$)|\.torrent(?:$|[?#])",
+    re.I,
+)
 _CHARSET_RE = re.compile(rb"charset\s*=\s*['\"]?([A-Za-z0-9_-]+)", re.I)
 _SEEN_KEY = "web_seen_ids"
 _MAX_SEEN = 2000
@@ -58,24 +66,41 @@ class _PageParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.title_parts: list[str] = []
         self.links: list[tuple[str, str]] = []
+        self.content_links: set[str] = set()
         self._in_title = False
         self._href: str | None = None
         self._label: list[str] = []
+        self._content_link = False
+        self._bookmark = False
+        self._link_title = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
         if tag == "title":
             self._in_title = True
-        elif tag == "a" and (href := dict(attrs).get("href")):
+        elif tag == "a" and (href := values.get("href")):
             self._href = href
             self._label = []
+            self._content_link = bool(
+                _CONTENT_LINK_RE.search(values.get("class") or "")
+                or (values.get("title") or "").strip()
+            )
+            self._bookmark = "bookmark" in (values.get("rel") or "").lower()
+            self._link_title = values.get("title") or ""
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "title":
             self._in_title = False
         elif tag == "a" and self._href is not None:
-            self.links.append((self._href, "".join(self._label).strip()))
+            label = self._link_title or "".join(self._label).strip()
+            self.links.append((self._href, label))
+            if self._content_link or (self._bookmark and _RESOURCE_LABEL_RE.search(label)):
+                self.content_links.add(self._href)
             self._href = None
             self._label = []
+            self._content_link = False
+            self._bookmark = False
+            self._link_title = ""
 
     def handle_data(self, data: str) -> None:
         if self._in_title:
@@ -184,21 +209,29 @@ class WebCollector(SupportsProgress):
         value = _decode(response.content)
         page = _parse_page(value)
         text = _text(value)
-        extra_magnets: list[str] = []
+        visible_keys = {link.key for link in scan_known_links(text)}
+        embedded_links = [
+            link.url for link in scan_known_links(value) if link.key not in visible_keys
+        ]
+        attachment_links: list[str] = []
         requests = 1
         attachments = [
             (urljoin(url, href), label)
             for href, label in page.links
-            if label.lower().endswith(".torrent") or "attach-download-" in href.lower()
+            if label.lower().endswith(".torrent") or _ATTACHMENT_RE.search(urlsplit(href).path)
         ]
         for attachment_url, label in attachments[:5]:
             torrent = await client.get(attachment_url, headers={"User-Agent": DEFAULT_UA})
             torrent.raise_for_status()
             requests += 1
             if magnet := _torrent_magnet(torrent.content, label or page.title):
-                extra_magnets.append(magnet)
+                attachment_links.append(magnet)
+            else:
+                attachment_links.extend(
+                    link.url for link in scan_known_links(_decode(torrent.content))
+                )
 
-        content = "\n".join((text, *extra_magnets))
+        content = "\n".join((text, *embedded_links, *attachment_links))
         links = scan_known_links(content)
         title = _title(html.unescape(listing_title or page.title))
         if not title or not links:
@@ -217,9 +250,17 @@ class WebCollector(SupportsProgress):
             listing = _parse_page(value)
             detail_urls: dict[str, str] = {}
             detail_pattern = _detail_pattern(source)
-            for href, label in listing.links:
+            for href, label in sorted(
+                listing.links,
+                key=lambda item: (
+                    item[0] not in listing.content_links,
+                    -max((len(value) for value in re.findall(r"\d+", item[0])), default=0),
+                ),
+            ):
                 url = urljoin(str(response.url), href)
-                if _host(url) == _host(str(response.url)) and detail_pattern.search(url):
+                if _host(url) == _host(str(response.url)) and (
+                    detail_pattern.search(url) or href in listing.content_links
+                ):
                     clean, _fragment = urldefrag(url)
                     detail_urls.setdefault(clean, label)
 
