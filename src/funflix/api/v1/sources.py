@@ -20,13 +20,24 @@ from funflix.api.deps import AdminDep, PageDep, SessionDep
 from funflix.base.enums import ParseStatus, SourceType
 from funflix.models import RawDocument, Resource, Source
 from funflix.schemas.raw import Page
-from funflix.schemas.source import CollectReportOut, SourceCreate, SourceOut, SourceUpdate
+from funflix.schemas.source import (
+    CollectReportOut,
+    SourceCreate,
+    SourceOut,
+    SourceParseReportOut,
+    SourceUpdate,
+)
 from funflix.services.collect.registry import detect_source, get_collector, supported_source_types
 from funflix.services.collect.runner import collect_source
+from funflix.worker.tasks import run_parse_once
 
 router = APIRouter(prefix="/sources", tags=["sources"])
 
 _ZERO_STATS = {"raw_total": 0, "raw_parsed": 0, "resource_total": 0}
+#: 手动触发解析一批处理多少条——比后台 worker 的 limit=20 略宽，因为默认
+#: 走本地 rule/sheet 抽取器（无外部调用），但仍要有界，不能让一次点击
+#: 卡住整个同步请求。
+_PARSE_TRIGGER_LIMIT = 50
 
 
 async def _source_stats(
@@ -216,4 +227,34 @@ async def trigger_collect(
         cursor_before=report.cursor_before,
         cursor_after=report.cursor_after,
         error=report.error,
+    )
+
+
+@router.post("/{source_id}/parse", response_model=SourceParseReportOut)
+async def trigger_parse(
+    source_id: uuid.UUID, session: SessionDep, _: AdminDep
+) -> SourceParseReportOut:
+    """立即解析该源一批待处理的原始文本（同步执行，单批，不排空整条队列）。
+
+    与后台 worker 共用同一套租约领取机制（`claim_documents`），不会跟它
+    重复处理同一条文档。
+    """
+    source = await _get_or_404(session, source_id)
+    report = await run_parse_once(session, source_id=source.id, limit=_PARSE_TRIGGER_LIMIT)
+    remaining = await session.scalar(
+        select(func.count())
+        .select_from(RawDocument)
+        .where(
+            RawDocument.source_id == source.id,
+            RawDocument.parse_status == ParseStatus.PENDING,
+        )
+    )
+    return SourceParseReportOut(
+        source_id=source.id,
+        claimed=report.claimed,
+        succeeded=report.succeeded,
+        failed=report.failed,
+        reclaimed=report.reclaimed,
+        abandoned=report.abandoned,
+        remaining_pending=remaining or 0,
     )

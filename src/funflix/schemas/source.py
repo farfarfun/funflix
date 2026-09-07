@@ -79,3 +79,15 @@ class CollectReportOut(BaseModel):
     cursor_before: str | None
     cursor_after: str | None
     error: str | None = None
+
+
+class SourceParseReportOut(BaseModel):
+    """一次（单批、不排空队列）解析触发的结果。"""
+
+    source_id: uuid.UUID
+    claimed: int = Field(description="本次领取到的原始文本数")
+    succeeded: int = Field(description="成功解析（含判定为目录帖 skipped）的数量")
+    failed: int = Field(description="解析失败的数量")
+    reclaimed: int = Field(description="从过期租约里重捞回来的条数")
+    abandoned: int = Field(description="重捞时已超重试上限、直接置 failed 的条数")
+    remaining_pending: int = Field(description="该源仍处于待解析状态的原始文本数")

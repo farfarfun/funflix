@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -130,6 +131,58 @@ async def run_collect_batch(
     return report
 
 
+async def _parse_one_batch(
+    session: AsyncSession,
+    *,
+    limit: int,
+    lease: timedelta,
+    extractor: str | None,
+    write_batch: int,
+    source_id: uuid.UUID | None = None,
+) -> BatchReport:
+    """`run_parse_batch`/`run_parse_once` 共用的单次领取-解析-提交循环体。
+
+    只领一批、处理完就返回，不循环到队列见底——是否循环由调用方决定。
+    """
+    report = BatchReport()
+    cache: dict[str, Extractor] = {}
+
+    claimed = await claim_documents(session, limit=limit, lease=lease, source_id=source_id)
+    report.claimed += len(claimed)
+    report.reclaimed += claimed.reclaimed
+    report.abandoned += claimed.abandoned
+
+    groups: dict[str, list[Any]] = {}
+    for doc in claimed.rows:
+        kind = extractor or default_extractor_for(doc.source_type)
+        groups.setdefault(kind, []).append(doc)
+
+    for kind, docs in groups.items():
+        if kind not in cache:
+            # LLM 抽取器在构造时就要读凭证，配置缺失会在这里抛
+            cache[kind] = get_extractor(kind)
+        for i in range(0, len(docs), write_batch):
+            chunk = docs[i : i + write_batch]
+            try:
+                results = await parse_batch(session, chunk, cache[kind])
+            except Exception as exc:
+                # parse_batch 内部已经把每条文档的抽取/落库异常都吞掉
+                # 并推进了各自的状态机，能漏到这里的是批级别的问题
+                # （比如批量预读查询本身失败），整个 chunk 未提交的
+                # 部分一起回滚，靠租约过期自然重试。
+                report.failed += len(chunk)
+                await _abort(session, "解析", f"{kind}#{chunk[0].id}..", exc)
+                continue
+            for result in results:
+                report.succeeded += int(result.ok)
+                report.failed += int(not result.ok)
+            for doc in chunk:
+                await _mark_done(doc)
+            await session.commit()
+
+    return report
+
+
 async def run_parse_batch(
     session: AsyncSession,
     *,
@@ -152,45 +205,43 @@ async def run_parse_batch(
             "每条文档一次往返"折叠成"每批几次往返"。
     """
     report = BatchReport()
-    cache: dict[str, Extractor] = {}
-
     while True:
-        claimed = await claim_documents(session, limit=limit, lease=lease)
-        report.claimed += len(claimed)
-        report.reclaimed += claimed.reclaimed
-        report.abandoned += claimed.abandoned
-
-        groups: dict[str, list[Any]] = {}
-        for doc in claimed.rows:
-            kind = extractor or default_extractor_for(doc.source_type)
-            groups.setdefault(kind, []).append(doc)
-
-        for kind, docs in groups.items():
-            if kind not in cache:
-                # LLM 抽取器在构造时就要读凭证，配置缺失会在这里抛
-                cache[kind] = get_extractor(kind)
-            for i in range(0, len(docs), write_batch):
-                chunk = docs[i : i + write_batch]
-                try:
-                    results = await parse_batch(session, chunk, cache[kind])
-                except Exception as exc:
-                    # parse_batch 内部已经把每条文档的抽取/落库异常都吞掉
-                    # 并推进了各自的状态机，能漏到这里的是批级别的问题
-                    # （比如批量预读查询本身失败），整个 chunk 未提交的
-                    # 部分一起回滚，靠租约过期自然重试。
-                    report.failed += len(chunk)
-                    await _abort(session, "解析", f"{kind}#{chunk[0].id}..", exc)
-                    continue
-                for result in results:
-                    report.succeeded += int(result.ok)
-                    report.failed += int(not result.ok)
-                for doc in chunk:
-                    await _mark_done(doc)
-                await session.commit()
-
-        if not claimed.rows:
+        batch = await _parse_one_batch(
+            session, limit=limit, lease=lease, extractor=extractor, write_batch=write_batch
+        )
+        report.claimed += batch.claimed
+        report.succeeded += batch.succeeded
+        report.failed += batch.failed
+        report.reclaimed += batch.reclaimed
+        report.abandoned += batch.abandoned
+        if batch.claimed == 0:
             break
     return report
+
+
+async def run_parse_once(
+    session: AsyncSession,
+    *,
+    source_id: uuid.UUID | None = None,
+    limit: int = 50,
+    lease: timedelta = DEFAULT_LEASE,
+    extractor: str | None = None,
+    write_batch: int = 20,
+) -> BatchReport:
+    """只领取并处理一批，不循环到清空——给同步 HTTP 触发用，避免一次请求
+    扛下整条队列。
+
+    可选 `source_id` 把领取范围收窄到某一个源，供「采集源」页面的解析
+    按钮使用；留空则跟后台 worker 一样面向全局队列。
+    """
+    return await _parse_one_batch(
+        session,
+        limit=limit,
+        lease=lease,
+        extractor=extractor,
+        write_batch=write_batch,
+        source_id=source_id,
+    )
 
 
 async def run_verify_batch(

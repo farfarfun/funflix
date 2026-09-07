@@ -25,6 +25,7 @@ schema 必须同时跑在 SQLite 与 PostgreSQL 上（§1）。
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -137,8 +138,14 @@ async def claim_documents(
     limit: int = 20,
     lease: timedelta = DEFAULT_LEASE,
     now: datetime | None = None,
+    source_id: uuid.UUID | None = None,
 ) -> Claimed[RawDocument]:
-    """领取待解析的原始文本，置 running 并加租约。"""
+    """领取待解析的原始文本，置 running 并加租约。
+
+    `source_id` 留空时面向全局队列（后台 worker 用）；传入时只领取该源
+    产出的文本，供「采集源」页面的手动解析触发使用——两者共用同一套
+    UPDATE 守卫，不会因为并发触发而重复处理同一条文档。
+    """
     now = now or utcnow()
     until = now + lease
     conditions = [
@@ -148,6 +155,8 @@ async def claim_documents(
         or_(RawDocument.lease_until.is_(None), RawDocument.lease_until <= now),
         or_(RawDocument.next_parse_at.is_(None), RawDocument.next_parse_at <= now),
     ]
+    if source_id is not None:
+        conditions.append(RawDocument.source_id == source_id)
 
     def decide(status: ParseStatus, attempts: int) -> tuple[dict[str, Any], bool, bool]:
         is_reclaim = status is ParseStatus.RUNNING
