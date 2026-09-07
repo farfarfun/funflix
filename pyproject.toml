@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funflix"
-version = "0.1.52"
+version = "0.1.53"
 description = "影视资源分享文本的结构化采集、解析与网盘链接校验"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -54,7 +54,7 @@ email = "niuliangtao@qq.com"
 name = "farfarfun"
 email = "farfarfun@qq.com"
 [project.optional-dependencies]
-llm = ["anthropic>=0.40"]
+llm = ["openai>=1.0"]
 drives = ["fundrive>=2.0.85"]
 zh = ["opencc-python-reimplemented>=0.1.7"]
 dev = [

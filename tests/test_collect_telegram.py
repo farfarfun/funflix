@@ -17,24 +17,24 @@ class TestNormalizeIdentifier:
     @pytest.mark.parametrize(
         "url",
         [
-            "https://t.me/s/Quark_Movies",
-            "https://t.me/Quark_Movies",
-            "http://t.me/s/Quark_Movies",
-            "@Quark_Movies",
-            "Quark_Movies",
+            "https://t.me/s/ExampleChannel",
+            "https://t.me/ExampleChannel",
+            "http://t.me/s/ExampleChannel",
+            "@ExampleChannel",
+            "ExampleChannel",
         ],
     )
     def test_accepts_all_channel_url_forms(self, url: str) -> None:
-        assert TelegramChannelCollector.normalize_identifier(url) == "Quark_Movies"
+        assert TelegramChannelCollector.normalize_identifier(url) == "ExampleChannel"
 
     @pytest.mark.parametrize("url", ["https://example.com/x", "https://t.me/", "ab"])
     def test_rejects_non_channel_urls(self, url: str) -> None:
         assert TelegramChannelCollector.normalize_identifier(url) is None
 
     def test_detect_source_maps_to_telegram(self) -> None:
-        assert detect_source("https://t.me/s/Quark_Movies") == (
+        assert detect_source("https://t.me/s/ExampleChannel") == (
             SourceType.TELEGRAM,
-            "Quark_Movies",
+            "ExampleChannel",
         )
 
 

@@ -27,9 +27,9 @@ class Source(TimestampMixin, Base):
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
 
     source_type: Mapped[SourceType] = mapped_column(enum_col(SourceType), nullable=False)
-    #: 采集源地址，如 https://t.me/s/Quark_Movies
+    #: 采集源地址，如 https://t.me/s/example_channel
     url: Mapped[str] = mapped_column(sa.String(1024), nullable=False)
-    #: 规范化后的唯一标识，如 Telegram 的频道名 "Quark_Movies"。
+    #: 规范化后的唯一标识，如 Telegram 的频道名 "example_channel"。
     #: 同一频道有多种 URL 写法（t.me/x、t.me/s/x、@x），靠它做唯一性判定而非 url。
     identifier: Mapped[str] = mapped_column(sa.String(128), nullable=False)
     title: Mapped[str | None] = mapped_column(sa.String(255))

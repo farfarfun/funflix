@@ -43,6 +43,10 @@ class _HTMLTextParser(HTMLParser):
             if href and href.lower().startswith(("http://", "https://", "magnet:")):
                 self.parts.extend((" ", href, " "))
 
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"p", "div", "li", "tr"}:
+            self.parts.append("\n")
+
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
 

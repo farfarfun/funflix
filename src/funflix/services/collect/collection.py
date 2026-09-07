@@ -1,13 +1,14 @@
-"""电影云集（bbs.dyyjv.com）合集采集器。"""
+"""集合页采集器：从索引页追踪多个资源详情页。"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -15,16 +16,17 @@ from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 from funflix.services.text.linkscan import scan_known_links
 
-_HOST = "bbs.dyyjv.com"
-_READER_API = f"https://r.jina.ai/https://{_HOST}/api/discussions/"
-_HEAD_KEY = "dyyjv_head_id"
-_DISCUSSION_RE = re.compile(rf"https?://{re.escape(_HOST)}/d/(\d+)", re.I)
+_READER_PREFIX = "https://r.jina.ai/"
+_HEAD_KEY = "forum_head_id"
+_DISCUSSION_RE = re.compile(r"https?://[^/\s<>\"']+/d/(\d+)", re.I)
 _NUMBERED_TITLE_RE = re.compile(r"^\d{1,4}\s*[.、:：)）-]\s*(?P<title>\S.+)$")
-_BOOK_TITLE_RE = re.compile(r"^《[^》]{1,200}》.*$")
+_NAMED_TITLE_RE = re.compile(r"^(?:名称|片名|剧名|标题|资源名称|影片名)\s*[:：]\s*(?P<title>\S.+)$")
+_BOOK_TITLE_RE = re.compile(r"^(?P<title>《[^》]{1,200}》)")
+_URL_SUFFIX_RE = re.compile(r"\s+(?:https?://|magnet:|ed2k://).*$", re.I)
 
 
-class DYYJVError(RuntimeError):
-    """站点返回了无法安全继续采集的数据。"""
+class CollectionError(RuntimeError):
+    """集合页返回了无法安全继续采集的数据。"""
 
 
 class _HTMLTextParser(HTMLParser):
@@ -61,9 +63,9 @@ def _reader_json(text: str) -> dict[str, Any]:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise DYYJVError("电影云集接口未返回 JSON") from exc
+        raise CollectionError("集合页接口未返回 JSON") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
-        raise DYYJVError("电影云集接口返回格式无效")
+        raise CollectionError("集合页接口返回格式无效")
     return payload
 
 
@@ -98,40 +100,79 @@ def _index_ids(payload: dict[str, Any], index_id: str) -> list[int]:
     return sorted({int(value) for value in _DISCUSSION_RE.findall(text) if value != index_id})
 
 
-def _message(payload: dict[str, Any]) -> CollectedMessage | None:
-    discussion_id, title, published_at, text = _discussion(payload)
+def collection_text(text: str) -> str | None:
+    """规范多名称详情页；逐项地址保留原布局，共享地址显式标记。"""
     links = scan_known_links(text)
-    if not discussion_id or not links:
+    if not links:
         return None
 
     titles: list[str] = []
-    for line in text.splitlines():
-        match = _NUMBERED_TITLE_RE.match(line)
-        candidate = (
-            match.group("title") if match else line if _BOOK_TITLE_RE.fullmatch(line) else ""
-        )
+    title_span: list[tuple[int, int]] = []
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.strip()
+        match = _NUMBERED_TITLE_RE.match(line) or _NAMED_TITLE_RE.match(line)
+        book = _BOOK_TITLE_RE.match(line)
+        candidate = match.group("title") if match else book.group("title") if book else ""
+        candidate = _URL_SUFFIX_RE.sub("", candidate).strip()
         if candidate and candidate not in titles:
             titles.append(candidate)
-    if not titles:
+            title_span.append((offset, offset + len(raw_line)))
+        offset += len(raw_line)
+    if len(titles) < 2:
         return None
+
+    first_title, last_title = title_span[0][0], title_span[-1][1]
+    if any(first_title <= link.start < last_title for link in links):
+        lines: list[str] = []
+        attributed = 0
+        for index, (title, (start, _end)) in enumerate(zip(titles, title_span, strict=True)):
+            end = title_span[index + 1][0] if index + 1 < len(title_span) else last_title
+            own_links = [link for link in links if start <= link.start < end]
+            if own_links:
+                attributed += 1
+            lines.append(f"名称：{title}")
+            for link in own_links:
+                suffix = f" 提取码：{link.passcode}" if link.passcode else ""
+                lines.append(f"{link.provider.value}：{link.url}{suffix}")
+        if attributed >= 2:
+            lines.extend(("原文：", text))
+            return "\n".join(lines)
+        return text
 
     lines: list[str] = []
     for item in titles:
-        lines.extend((f"名称：{item}", "类型：短剧"))
+        lines.append(f"名称：{item}")
     lines.append("合集资源：")
     for link in links:
         suffix = f" 提取码：{link.passcode}" if link.passcode else ""
         lines.append(f"{link.provider.value}：{link.url}{suffix}")
+    return "\n".join(lines)
+
+
+def _message(payload: dict[str, Any], origin: str) -> CollectedMessage | None:
+    discussion_id, _title, published_at, text = _discussion(payload)
+    normalized = collection_text(text)
+    if not discussion_id or not normalized:
+        return None
     return CollectedMessage(
         message_id=discussion_id,
-        text="\n".join(lines),
+        text=normalized,
         published_at=published_at,
-        url=f"https://{_HOST}/d/{discussion_id}",
+        url=f"{origin}/d/{discussion_id}",
     )
 
 
-class DYYJVCollector(SupportsProgress):
-    name = "dyyjv-forum-v1"
+def _target(url: str) -> tuple[str, str]:
+    parts = urlsplit(url.strip())
+    match = re.fullmatch(r"/d/(\d+)/?", parts.path)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname or not match:
+        raise CollectionError("无效的集合页地址")
+    return urlunsplit((parts.scheme.lower(), parts.netloc, "", "", "")), match.group(1)
+
+
+class CollectionCollector(SupportsProgress):
+    name = "collection-page-v1"
     detect_priority = 25
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
@@ -143,37 +184,46 @@ class DYYJVCollector(SupportsProgress):
     def normalize_identifier(url: str) -> str | None:
         parts = urlsplit(url.strip())
         match = re.fullmatch(r"/d/(\d+)/?", parts.path)
-        if parts.scheme.lower() in {"http", "https"} and parts.hostname == _HOST and match:
-            return match.group(1)
+        if parts.scheme.lower() in {"http", "https"} and parts.hostname and match:
+            identifier = f"{parts.hostname.lower()}:{match.group(1)}"
+            return (
+                identifier
+                if len(identifier) <= 128
+                else "sha256:" + hashlib.sha256(identifier.encode()).hexdigest()
+            )
         return None
 
-    async def _get(self, client: httpx.AsyncClient, discussion_id: int | str) -> dict[str, Any]:
-        response = await client.get(f"{_READER_API}{discussion_id}")
+    async def _get(
+        self, client: httpx.AsyncClient, api: str, discussion_id: int | str
+    ) -> dict[str, Any]:
+        response = await client.get(f"{api}{discussion_id}")
         response.raise_for_status()
         return _reader_json(response.text)
 
     async def _load_messages(
-        self, client: httpx.AsyncClient, ids: list[int], stage: str
+        self, client: httpx.AsyncClient, api: str, origin: str, ids: list[int], stage: str
     ) -> list[CollectedMessage]:
         messages: list[CollectedMessage] = []
         for page, discussion_id in enumerate(ids, 1):
-            if message := _message(await self._get(client, discussion_id)):
+            if message := _message(await self._get(client, api, discussion_id), origin):
                 messages.append(message)
             self._report(stage, page, len(ids), len(messages), position=discussion_id)
         return messages
 
     async def fetch(self, source: Source) -> FetchResult:
+        origin, index_id = _target(source.url)
+        api = f"{_READER_PREFIX}{origin}/api/discussions/"
         client = self._client or httpx.AsyncClient(timeout=60.0, follow_redirects=True)
         try:
-            index = await self._get(client, source.identifier)
-            self._ids = _index_ids(index, source.identifier)
+            index = await self._get(client, api, index_id)
+            self._ids = _index_ids(index, index_id)
             _id, title, _published, _text = _discussion(index)
             budget = max(1, source.max_pages_per_fetch)
             raw_head = source.extra.get(_HEAD_KEY)
             head = int(raw_head) if str(raw_head).isdigit() else None
             pending = [value for value in self._ids if head is not None and value > head]
             selected = pending[:budget] if head is not None else self._ids[-budget:]
-            messages = await self._load_messages(client, selected, "fetch")
+            messages = await self._load_messages(client, api, origin, selected, "fetch")
         finally:
             if self._owns_client:
                 await client.aclose()
@@ -183,18 +233,18 @@ class DYYJVCollector(SupportsProgress):
             messages=messages,
             pages_fetched=1 + len(selected),
             truncated=head is not None and len(pending) > len(selected),
-            title=title or "电影云集",
+            title=title or "资源合集",
             state=state,
         )
 
     async def backfill(self, source: Source) -> FetchResult:
+        origin, index_id = _target(source.url)
+        api = f"{_READER_PREFIX}{origin}/api/discussions/"
         client = self._client or httpx.AsyncClient(timeout=60.0, follow_redirects=True)
         loaded_index = False
         try:
             if not self._ids:
-                self._ids = _index_ids(
-                    await self._get(client, source.identifier), source.identifier
-                )
+                self._ids = _index_ids(await self._get(client, api, index_id), index_id)
                 loaded_index = True
             raw_cursor = source.backfill_cursor_id
             cursor = (
@@ -204,7 +254,7 @@ class DYYJVCollector(SupportsProgress):
             )
             pending = [value for value in self._ids if value < cursor]
             selected = pending[-max(1, source.max_pages_per_fetch) :]
-            messages = await self._load_messages(client, selected, "backfill")
+            messages = await self._load_messages(client, api, origin, selected, "backfill")
         finally:
             if self._owns_client:
                 await client.aclose()

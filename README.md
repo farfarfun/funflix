@@ -37,11 +37,11 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 | `tencent_doc` | 腾讯文本文档接口 | 文档 revision | 文本型资源清单 |
 | `kdocs` | 金山多维表格接口 | sheet 偏移 | 结构化资源表 |
 | `rss` | 通用 RSS 2.0 / Atom | 条目 `guid` / `id` | 公开影视、动漫、种子 feed |
-| `forum` | 电影云集 Flarum 合集 | 帖子 ID，可追新/补历史 | `bbs.dyyjv.com` 日更合集 |
+| `forum` | 集合页 | 详情页 ID，可追新/补历史 | 一个索引页下的多资源合集 |
 | `web` | 公开影视网站与论坛 | 详情页 URL，可持续追新 | 网盘、磁力与 torrent 附件 |
 | `api` | 人人影视快照与评论接口 | 快照校验和 / 评论 ID | 历史资源与网友分享 |
 
-`weibo` 等枚举值目前只是预留，尚未注册采集器；登记时会被拒绝。
+`weibo` 等枚举值目前没有专用采集器，普通公开 URL 会由 `web` 兜底。
 
 ## 快速开始
 
@@ -128,11 +128,11 @@ funflix server restart
 | `funflix ingest <path>` | 从文件导入原始文本（`.txt` / `.jsonl`） |
 
 采集源除 Telegram 频道和腾讯文档外，还支持公开 RSS/Atom feed。RSS 条目标题、
-描述、真实链接、Atom enclosure，以及 Nyaa 的 `infoHash` 都会转成原始文本，按
+描述、真实链接、Atom enclosure，以及扩展字段里的 `infoHash` 都会转成原始文本，按
 feed 的 `guid`/`id` 增量去重。示例：
 
 ```bash
-funflix source add 'https://nyaa.si/?page=rss&c=1_2&f=0'
+funflix source add 'https://feeds.example/latest.rss'
 funflix source collect
 ```
 

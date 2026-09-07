@@ -15,7 +15,7 @@ RSS = """<?xml version="1.0"?><rss version="2.0"><channel>
 <enclosure url="https://example.test/a.torrent" type="application/x-bittorrent" />
 <pubDate>Fri, 04 Sep 2026 04:21:27 +0000</pubDate></item>
 <item><guid>b</guid><title>动漫乙</title><nyaa:infoHash
-xmlns:nyaa="https://nyaa.si/xmlns/nyaa">ABCDEF0123456789ABCDEF0123456789ABCDEF01</nyaa:infoHash>
+xmlns:nyaa="urn:example:torrent">ABCDEF0123456789ABCDEF0123456789ABCDEF01</nyaa:infoHash>
 <torrent:magnetURI xmlns:torrent="http://xmlns.ezrss.it/0.1/"><![CDATA[
 magnet:?xt=urn:btih:1234567890ABCDEF1234567890ABCDEF12345678
 ]]></torrent:magnetURI></item>
@@ -29,18 +29,21 @@ def _source(extra: dict | None = None) -> Source:
     return Source(
         id=1,
         source_type=SourceType.RSS,
-        url="https://nyaa.si/?page=rss&c=1_2&f=0",
-        identifier="https://nyaa.si/?page=rss&c=1_2&f=0",
+        url="https://feeds.example/latest.rss?category=translated",
+        identifier="https://feeds.example/latest.rss?category=translated",
         extra=extra or {},
     )
 
 
-def test_detects_feed_urls_without_claiming_arbitrary_pages() -> None:
-    assert detect_source("https://nyaa.si/?page=rss&c=1_2") == (
+def test_detects_feed_urls_before_generic_web_pages() -> None:
+    assert detect_source("https://feeds.example/latest.rss?category=translated") == (
         SourceType.RSS,
-        "https://nyaa.si/?page=rss&c=1_2",
+        "https://feeds.example/latest.rss?category=translated",
     )
-    assert detect_source("https://example.com/whatever") is None
+    assert detect_source("https://example.com/whatever") == (
+        SourceType.WEB,
+        "https://example.com/whatever",
+    )
 
 
 def test_parse_rss_keeps_links_and_builds_magnet() -> None:

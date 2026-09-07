@@ -78,7 +78,10 @@ def test_detects_snapshot_and_comments_as_separate_sources() -> None:
         SourceType.API,
         "yyets-comments",
     )
-    assert detect_source("https://yyets.click/api/resource/latest") is None
+    assert detect_source("https://yyets.click/api/resource/latest") == (
+        SourceType.WEB,
+        "https://yyets.click/api/resource/latest",
+    )
 
 
 @pytest.mark.asyncio

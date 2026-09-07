@@ -31,6 +31,7 @@ class TestDispatch:
             (f"https://docs.qq.com/doc/{SHEET_ID}", SourceType.TENCENT_DOC),
             ("https://kdocs.cn/l/ck4zloFnPg8f?R=L1MvMQ==", SourceType.KDOCS),
             ("https://t.me/s/SomeChannel", SourceType.TELEGRAM),
+            ("https://media.example/latest", SourceType.WEB),
         ],
     )
     def test_url_routes_to_the_right_collector(self, url: str, expected: SourceType) -> None:
@@ -44,8 +45,8 @@ class TestDispatch:
         assert result is not None
         assert result[0] is not SourceType.TELEGRAM
 
-    def test_unknown_url_returns_none(self) -> None:
-        assert detect_source("https://example.com/whatever") is None
+    def test_non_http_url_returns_none(self) -> None:
+        assert detect_source("ftp://example.com/whatever") is None
 
 
 class TestPriorityOrdering:
@@ -63,14 +64,19 @@ class TestPriorityOrdering:
         ]
         assert len(set(priorities)) == len(priorities), f"优先级有重复：{priorities}"
 
-    def test_telegram_is_last(self) -> None:
-        telegram = get_collector_class(SourceType.TELEGRAM).detect_priority  # type: ignore[union-attr]
+    def test_generic_web_is_last(self) -> None:
+        web = get_collector_class(SourceType.WEB).detect_priority  # type: ignore[union-attr]
         others = [
             get_collector_class(s).detect_priority  # type: ignore[union-attr]
             for s in supported_source_types()
-            if s is not SourceType.TELEGRAM
+            if s is not SourceType.WEB
         ]
-        assert all(telegram > p for p in others), "Telegram 的兜底模式必须最后问"
+        assert all(web > priority for priority in others), "通用网页采集器必须最后问"
+
+    def test_telegram_is_asked_before_generic_web(self) -> None:
+        telegram = get_collector_class(SourceType.TELEGRAM).detect_priority  # type: ignore[union-attr]
+        web = get_collector_class(SourceType.WEB).detect_priority  # type: ignore[union-attr]
+        assert telegram < web
 
     def test_sheet_is_asked_before_text_doc(self) -> None:
         """两者同域名，智能表格的模式更具体，先问。"""

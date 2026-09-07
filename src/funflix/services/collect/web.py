@@ -13,32 +13,18 @@ import httpx
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
+from funflix.services.collect.collection import collection_text
 from funflix.services.collect.rss import _text
 from funflix.services.text.linkscan import scan_known_links
 
-_SUPPORTED_HOSTS = frozenset(
-    {
-        "1lou.pro",
-        "1lou.me",
-        "5266ys.com",
-        "66ss.org",
-        "66yingshi.com",
-        "6v520.net",
-        "6v520.tv",
-        "6v520.cc",
-        "6vgood.net",
-        "6vw.cc",
-        "ai66.cc",
-        "dygang.net",
-        "dytt8899.com",
-        "hao6v.org",
-        "kuakeba.com",
-        "xb6v.com",
-    }
-)
 _DETAIL_RE = re.compile(
-    r"(?:/(?:\d{8}|\d{4}-\d{2}-\d{2})/\d+|/[^/]+/\d+)\.html?$|/thread-\d+\.htm$",
+    r"/(?:[^/?#]+/)*\d+\.html?$|/threads/(?:[^/?#]+\.)?\d+/?$"
+    r"|/d/\d+(?:-[^/?#]+)?/?$|/(?:thread|topic|post)-?\d+(?:\.html?)?$"
+    r"|[?&](?:id|tid|topic|post)=\d+",
     re.I,
+)
+_ONCLICK_URL_RE = re.compile(
+    r"(?:window\.)?location(?:\.href)?\s*=\s*(?P<quote>['\"])(?P<url>.+?)(?P=quote)", re.I
 )
 _CHARSET_RE = re.compile(rb"charset\s*=\s*['\"]?([A-Za-z0-9_-]+)", re.I)
 _SEEN_KEY = "web_seen_ids"
@@ -106,6 +92,9 @@ def _parse_page(value: str) -> _PageParser:
     parser = _PageParser()
     parser.feed(value)
     parser.close()
+    parser.links.extend(
+        (html.unescape(match.group("url")), "") for match in _ONCLICK_URL_RE.finditer(value)
+    )
     return parser
 
 
@@ -117,7 +106,7 @@ def _title(value: str) -> str:
     if candidate := next((item for item in brackets if not _TITLE_NOISE_RE.search(item)), ""):
         return candidate
     return re.split(
-        r"(?:迅雷下载|下载[,，_-]|[-_|](?:最新电影|电影天堂|66影视|(?:新版)?6v电影))",
+        r"(?:迅雷下载|下载[,，_-]|[-_|](?:最新电影|电影下载|免费电影下载|影视下载))",
         value,
     )[0].strip()
 
@@ -164,15 +153,20 @@ def _torrent_magnet(payload: bytes, name: str) -> str | None:
 
 def _canonical_url(url: str) -> str | None:
     parts = urlsplit(url.strip())
-    if parts.scheme.lower() not in {"http", "https"} or _host(url) not in _SUPPORTED_HOSTS:
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
         return None
     clean, _fragment = urldefrag(urlunsplit(parts))
-    return clean
+    return clean if len(clean) <= 128 else "sha256:" + hashlib.sha256(clean.encode()).hexdigest()
+
+
+def _detail_pattern(source: Source) -> re.Pattern[str]:
+    raw = (source.extra or {}).get("detail_pattern")
+    return re.compile(str(raw), re.I) if raw else _DETAIL_RE
 
 
 class WebCollector(SupportsProgress):
     name = "public-web-v1"
-    detect_priority = 110
+    detect_priority = 950
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client
@@ -204,16 +198,14 @@ class WebCollector(SupportsProgress):
             if magnet := _torrent_magnet(torrent.content, label or page.title):
                 extra_magnets.append(magnet)
 
-        links = scan_known_links("\n".join((text, *extra_magnets)))
+        content = "\n".join((text, *extra_magnets))
+        links = scan_known_links(content)
         title = _title(html.unescape(listing_title or page.title))
         if not title or not links:
             return None, requests
-        lines = [f"名称：{title}"]
-        for link in links:
-            suffix = f" 提取码：{link.passcode}" if link.passcode else ""
-            lines.append(f"{link.provider.value}：{link.url}{suffix}")
+        normalized = collection_text(content) or f"名称：{title}\n{content}"
         message_id = hashlib.sha256(url.encode()).hexdigest()
-        return CollectedMessage(message_id=message_id, text="\n".join(lines), url=url), requests
+        return CollectedMessage(message_id=message_id, text=normalized, url=url), requests
 
     async def fetch(self, source: Source) -> FetchResult:
         client = self._client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
@@ -224,9 +216,10 @@ class WebCollector(SupportsProgress):
             value = _decode(response.content)
             listing = _parse_page(value)
             detail_urls: dict[str, str] = {}
+            detail_pattern = _detail_pattern(source)
             for href, label in listing.links:
                 url = urljoin(str(response.url), href)
-                if _host(url) == _host(str(response.url)) and _DETAIL_RE.search(urlsplit(url).path):
+                if _host(url) == _host(str(response.url)) and detail_pattern.search(url):
                     clean, _fragment = urldefrag(url)
                     detail_urls.setdefault(clean, label)
 

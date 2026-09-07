@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from funflix.base.enums import SourceType
 from funflix.services.collect.base import Collector
-from funflix.services.collect.dyyjv import DYYJVCollector
+from funflix.services.collect.collection import CollectionCollector
 from funflix.services.collect.kdocs import KDocsCollector
 from funflix.services.collect.rss import RSSCollector
 from funflix.services.collect.telegram import TelegramChannelCollector
@@ -18,7 +18,7 @@ _REGISTRY: dict[SourceType, type[Collector]] = {
     SourceType.TENCENT_DOCS: TencentSheetCollector,
     SourceType.TENCENT_DOC: TencentTextCollector,
     SourceType.KDOCS: KDocsCollector,
-    SourceType.FORUM: DYYJVCollector,
+    SourceType.FORUM: CollectionCollector,
     SourceType.WEB: WebCollector,
     SourceType.RSS: RSSCollector,
     SourceType.API: YYeTsCollector,
@@ -41,8 +41,7 @@ def supported_source_types() -> list[SourceType]:
 def detect_source(url: str) -> tuple[SourceType, str] | None:
     """从 URL 猜采集源类型与标识；无法识别时返回 None。
 
-    顺序有意义：先问模式更具体的采集器。Telegram 的兜底模式能匹配任意裸标识串，
-    最后问才不会抢走别人的 URL。
+    顺序有意义：先问模式更具体的采集器，通用网页采集器最后兜底。
 
     顺序取自各采集器自己声明的 `detect_priority`，而不是在这里手写一个类型元组。
     手写元组有两个问题：新增采集器时容易忘了加进去（于是它永远识别不出来，
