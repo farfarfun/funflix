@@ -854,6 +854,7 @@ def user_create(
             if existing is not None:
                 return False
             session.add(User(username=username, password_hash=hash_password(password)))
+            await session.commit()
             return True
 
     if not _run(_do):
@@ -885,6 +886,7 @@ def user_set_password(
             if user is None:
                 return False
             user.password_hash = hash_password(password)
+            await session.commit()
             return True
 
     if not _run(_do):
@@ -926,6 +928,7 @@ def _set_active(username: str, *, active: bool) -> None:
             if user is None:
                 return False
             user.is_active = active
+            await session.commit()
             return True
 
     if not _run(_do):
