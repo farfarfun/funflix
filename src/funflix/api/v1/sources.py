@@ -207,9 +207,7 @@ async def delete_source(source_id: uuid.UUID, session: SessionDep, _: CurrentUse
 @router.post(
     "/{source_id}/reset-cursor", status_code=status.HTTP_204_NO_CONTENT, response_model=None
 )
-async def reset_source_cursor(
-    source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep
-) -> None:
+async def reset_source_cursor(source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep) -> None:
     """归零单个采集源的水位，保留已采集的原始文本。"""
     source = await _get_or_404(session, source_id)
     source.reset_watermark()
@@ -217,9 +215,7 @@ async def reset_source_cursor(
 
 
 @router.post("/{source_id}/reset-parse", response_model=int)
-async def reset_source_parse(
-    source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep
-) -> int:
+async def reset_source_parse(source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep) -> int:
     """清除该源的抽取缓存，并把全部原始文本重新放回解析队列。"""
     source = await _get_or_404(session, source_id)
     document_ids = select(RawDocument.id).where(RawDocument.source_id == source.id)

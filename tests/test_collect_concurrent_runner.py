@@ -229,9 +229,7 @@ class TestOpaqueSources:
 
         assert result.reports == []
 
-    async def test_limit_prioritizes_stale_loss_sensitive_source(
-        self, db_url, monkeypatch
-    ) -> None:
+    async def test_limit_prioritizes_stale_loss_sensitive_source(self, db_url, monkeypatch) -> None:
         async with open_session(db_url) as session:
             now = datetime.now(UTC)
             session.add_all(
