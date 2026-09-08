@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 
 from funflix.base.enums import CheckStatus, MediaType, Provider, Quality
-from funflix.models import Media, Resource, utcnow
+from funflix.models import Media, Resource, Tag, TagKind, utcnow
 from funflix.services.counters import refresh_media_counters
 
 
@@ -35,7 +35,7 @@ def _resource(share_id: str, *, provider=Provider.QUARK, status=CheckStatus.VALI
 
 @pytest_asyncio.fixture
 async def seeded(session):
-    """两部作品：一部带一条有效资源，一部没有资源。
+    """三部作品：一部带有效资源，两部只有未校验资源。
 
     计数走 `refresh_media_counters` 真实算一遍，而不是手工赋值 ——
     手工赋值会把「生产代码从不维护这两个计数」这件事整个盖住。
@@ -44,9 +44,11 @@ async def seeded(session):
     hit.resources = [_resource("aaa111")]
 
     barren = _media("流浪地球", "流浪地球", media_type=MediaType.TV, year=2019)
+    barren.resources = [_resource("bbb222", status=CheckStatus.UNCHECKED)]
 
     # 年份未知的哨兵值，用来验证出参会被抹成 null
     unknown = _media("无名剧", "无名剧", year=0)
+    unknown.resources = [_resource("ccc333", status=CheckStatus.UNCHECKED)]
 
     session.add_all([hit, barren, unknown])
     await session.commit()
@@ -115,7 +117,9 @@ class TestListMedia:
         assert body["items"] == []
 
     async def test_literal_percent_in_title_is_findable(self, client, session, seeded) -> None:
-        session.add(_media("100%纯爱", "100纯爱"))
+        media = _media("100%纯爱", "100纯爱")
+        media.resources = [_resource("percent1")]
+        session.add(media)
         await session.commit()
         body = (await client.get("/api/v1/media", params={"keyword": "100%纯"})).json()
         assert [i["title"] for i in body["items"]] == ["100%纯爱"]
@@ -145,10 +149,19 @@ class TestResourceCounters:
         assert body["items"][0]["resource_count"] == 1
         assert body["items"][0]["valid_resource_count"] == 1
 
-    async def test_media_without_resources_counts_zero(self, client, seeded) -> None:
-        body = (await client.get("/api/v1/media", params={"keyword": "流浪地球"})).json()
-        assert body["items"][0]["resource_count"] == 0
-        assert body["items"][0]["valid_resource_count"] == 0
+    async def test_media_without_resources_is_physically_deleted(self, session, seeded) -> None:
+        orphan = _media("空作品", "空作品")
+        tag = Tag(kind=TagKind.GENRE, name="悬疑", norm_key="悬疑", media_count=1)
+        orphan.tags = [tag]
+        session.add_all([orphan, tag])
+        await session.commit()
+
+        await refresh_media_counters(session, [orphan.id])
+        await session.commit()
+
+        assert await session.get(Media, orphan.id) is None
+        await session.refresh(tag)
+        assert tag.media_count == 0
 
     async def test_valid_count_drops_when_link_dies(self, client, session, seeded) -> None:
         """链接被校验成失效后，作品的有效计数要跟着降下来。"""
@@ -243,8 +256,8 @@ class TestListResources:
 
     async def test_lists_resources(self, admin_client, seeded) -> None:
         body = (await admin_client.get("/api/v1/resources")).json()
-        assert body["total"] == 1
-        assert body["items"][0]["url"].endswith("aaa111")
+        assert body["total"] == 3
+        assert any(item["url"].endswith("aaa111") for item in body["items"])
 
     async def test_filters_by_check_status(self, admin_client, seeded) -> None:
         assert (
@@ -270,12 +283,13 @@ class TestStats:
     async def test_reports_pipeline_counts(self, admin_client, seeded) -> None:
         body = (await admin_client.get("/api/v1/stats")).json()
         assert body["media_total"] == 3
-        assert body["resource_total"] == 1
+        assert body["resource_total"] == 3
         assert body["media_by_type"]["movie"] == 2
         assert body["media_by_type"]["tv"] == 1
         assert body["resource_by_check"]["valid"] == 1
-        assert body["resource_by_provider"]["quark"] == 1
-        assert body["media_resource_total"] == 1
+        assert body["resource_by_check"]["unchecked"] == 2
+        assert body["resource_by_provider"]["quark"] == 3
+        assert body["media_resource_total"] == 3
 
     async def test_counts_orphan_resources(self, admin_client, session, seeded) -> None:
         """没挂到任何作品上的资源要被单独统计出来，否则数据丢失是无声的。"""
@@ -283,7 +297,7 @@ class TestStats:
         await session.commit()
         body = (await admin_client.get("/api/v1/stats")).json()
         assert body["resource_orphan"] == 1
-        assert body["resource_total"] == 2
+        assert body["resource_total"] == 4
 
     async def test_empty_db_returns_zeros(self, admin_client) -> None:
         body = (await admin_client.get("/api/v1/stats")).json()

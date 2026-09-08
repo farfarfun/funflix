@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 
 import pytest
@@ -19,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from funflix.api.app import create_app
 from funflix.base.config import Settings, get_settings
 from funflix.base.db import get_session
-from funflix.models import User
+from funflix.base.enums import ParseStatus
+from funflix.models import Extraction, RawDocument, Source, User, utcnow
 from funflix.security import hash_password
 
 USERNAME = "tester"
@@ -87,6 +89,82 @@ class TestOpsEndpointsRequireLogin:
         created = await authed.post("/api/v1/sources", json=PAYLOAD)
         source_id = created.json()["id"]
         assert (await authed.delete(f"/api/v1/sources/{source_id}")).status_code == 204
+
+    async def test_reset_source_cursor(self, authed, session) -> None:
+        created = await authed.post("/api/v1/sources", json=PAYLOAD)
+        source = await session.get(Source, uuid.UUID(created.json()["id"]))
+        assert source is not None
+        source.cursor_message_id = "123"
+        source.backfill_cursor_id = "100"
+        source.backfill_done = True
+        source.extra = {"revision": 9}
+        await session.commit()
+
+        response = await authed.post(f"/api/v1/sources/{source.id}/reset-cursor")
+        await session.refresh(source)
+
+        assert response.status_code == 204
+        assert source.cursor_message_id is None
+        assert source.backfill_cursor_id is None
+        assert source.backfill_done is False
+        assert source.extra == {}
+
+    async def test_reset_source_parse(self, authed, session) -> None:
+        created = await authed.post("/api/v1/sources", json=PAYLOAD)
+        source = await session.get(Source, uuid.UUID(created.json()["id"]))
+        assert source is not None
+        now = utcnow()
+        done = RawDocument(
+            content="done",
+            content_hash="1" * 64,
+            source=source,
+            source_type=source.source_type,
+            collected_at=now,
+            parse_status=ParseStatus.DONE,
+            parse_attempts=2,
+            last_parsed_at=now,
+        )
+        skipped = RawDocument(
+            content="skipped",
+            content_hash="2" * 64,
+            source=source,
+            source_type=source.source_type,
+            collected_at=now,
+            parse_status=ParseStatus.SKIPPED,
+            parse_attempts=1,
+            parse_error="old error",
+            lease_until=now,
+            next_parse_at=now,
+            last_parsed_at=now,
+        )
+        extraction = Extraction(
+            raw_document=done,
+            model="test",
+            prompt_version="v1",
+            output={},
+            stats={},
+        )
+        session.add_all([done, skipped, extraction])
+        await session.commit()
+        extraction_id = extraction.id
+
+        before = await authed.get(f"/api/v1/sources/{source.id}")
+        response = await authed.post(f"/api/v1/sources/{source.id}/reset-parse")
+        await session.refresh(done)
+        await session.refresh(skipped)
+        session.expunge(extraction)
+
+        assert before.json()["raw_parsed"] == 2
+        assert response.status_code == 200
+        assert response.json() == 2
+        for document in (done, skipped):
+            assert document.parse_status == ParseStatus.PENDING
+            assert document.parse_attempts == 0
+            assert document.parse_error is None
+            assert document.lease_until is None
+            assert document.next_parse_at is None
+            assert document.last_parsed_at is None
+        assert await session.get(Extraction, extraction_id) is None
 
     async def test_logout_revokes_access(self, authed) -> None:
         assert (await authed.post("/api/v1/auth/logout")).status_code == 204

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from queue import Queue
 
 import pytest
@@ -228,6 +228,31 @@ class TestOpaqueSources:
         result = run_collect_pipeline(settings=Settings(database_url=db_url), concurrency=1)
 
         assert result.reports == []
+
+    async def test_limit_prioritizes_stale_loss_sensitive_source(
+        self, db_url, monkeypatch
+    ) -> None:
+        async with open_session(db_url) as session:
+            now = datetime.now(UTC)
+            session.add_all(
+                [
+                    _source("normal", last_success_at=now - timedelta(days=2)),
+                    _source(
+                        "urgent",
+                        source_type=SourceType.RSS,
+                        last_success_at=now - timedelta(hours=13),
+                    ),
+                ]
+            )
+            await session.commit()
+
+        monkeypatch.setattr(cr, "get_collector_class", lambda _source_type: StubCollector)
+
+        result = run_collect_pipeline(
+            settings=Settings(database_url=db_url), batch_size=1, concurrency=1, limit=1
+        )
+
+        assert [identifier for identifier, _report in result.reports] == ["urgent"]
 
     async def test_progress_callback_fires(self, db_url) -> None:
         async with open_session(db_url) as session:

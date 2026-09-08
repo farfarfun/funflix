@@ -31,12 +31,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import ColumnElement, or_, select, update
+from sqlalchemy import ColumnElement, case, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import backoff
 from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus
 from funflix.models import RawDocument, Resource, Source, utcnow
+from funflix.services.collect.priority import loss_sensitive_source_clause
 from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS
 
 logger = logging.getLogger(__name__)
@@ -290,7 +291,11 @@ async def claim_sources(
         Source,
         columns=[Source.id, Source.lease_until, Source.consecutive_failures],
         conditions=conditions,
-        order_by=[Source.next_fetch_at.nulls_first(), Source.id],
+        order_by=[
+            case((loss_sensitive_source_clause(now), 0), else_=1),
+            Source.next_fetch_at.nulls_first(),
+            Source.id,
+        ],
         limit=limit,
         decide=decide,
     )

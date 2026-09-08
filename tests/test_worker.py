@@ -330,6 +330,23 @@ class TestClaimSources:
         assert len(await claim_sources(session, limit=10)) == 0
 
     @pytest.mark.asyncio
+    async def test_prioritizes_stale_loss_sensitive_source(self, session) -> None:
+        now = utcnow()
+        normal = make_source(1, last_success_at=now - timedelta(days=2))
+        urgent = make_source(
+            2,
+            source_type=SourceType.RSS,
+            url="https://example.com/feed.xml",
+            last_success_at=now - timedelta(hours=13),
+        )
+        session.add_all([normal, urgent])
+        await session.commit()
+
+        claimed = await claim_sources(session, limit=1, now=now)
+
+        assert claimed.rows[0].id == urgent.id
+
+    @pytest.mark.asyncio
     async def test_reclaim_backs_off(self, session) -> None:
         """采集崩溃复用健康度机制退避，而不是每轮都去踩同一个坑。"""
         session.add(make_source(1, lease_until=utcnow() - timedelta(minutes=1)))

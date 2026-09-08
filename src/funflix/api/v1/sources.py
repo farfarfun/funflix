@@ -10,11 +10,11 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 
 from funflix.api.deps import CurrentUserDep, PageDep, SessionDep
 from funflix.base.enums import ParseStatus, SourceType
-from funflix.models import RawDocument, Resource, Source
+from funflix.models import Extraction, RawDocument, Resource, Source
 from funflix.schemas.raw import Page
 from funflix.schemas.source import (
     CollectReportOut,
@@ -52,7 +52,7 @@ async def _source_stats(
     for source_id, parse_status, count in raw_rows.all():
         row = stats[source_id]
         row["raw_total"] += count
-        if parse_status == ParseStatus.DONE:
+        if parse_status in (ParseStatus.DONE, ParseStatus.SKIPPED):
             row["raw_parsed"] += count
 
     resource_rows = await session.execute(
@@ -202,6 +202,42 @@ async def delete_source(source_id: uuid.UUID, session: SessionDep, _: CurrentUse
     source = await _get_or_404(session, source_id)
     await session.delete(source)
     await session.commit()
+
+
+@router.post(
+    "/{source_id}/reset-cursor", status_code=status.HTTP_204_NO_CONTENT, response_model=None
+)
+async def reset_source_cursor(
+    source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep
+) -> None:
+    """归零单个采集源的水位，保留已采集的原始文本。"""
+    source = await _get_or_404(session, source_id)
+    source.reset_watermark()
+    await session.commit()
+
+
+@router.post("/{source_id}/reset-parse", response_model=int)
+async def reset_source_parse(
+    source_id: uuid.UUID, session: SessionDep, _: CurrentUserDep
+) -> int:
+    """清除该源的抽取缓存，并把全部原始文本重新放回解析队列。"""
+    source = await _get_or_404(session, source_id)
+    document_ids = select(RawDocument.id).where(RawDocument.source_id == source.id)
+    await session.execute(delete(Extraction).where(Extraction.raw_document_id.in_(document_ids)))
+    result = await session.execute(
+        update(RawDocument)
+        .where(RawDocument.source_id == source.id)
+        .values(
+            parse_status=ParseStatus.PENDING,
+            parse_attempts=0,
+            parse_error=None,
+            lease_until=None,
+            next_parse_at=None,
+            last_parsed_at=None,
+        )
+    )
+    await session.commit()
+    return result.rowcount or 0
 
 
 @router.post("/{source_id}/collect", response_model=CollectReportOut)

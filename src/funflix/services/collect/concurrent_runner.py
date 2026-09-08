@@ -67,7 +67,7 @@ from typing import Any
 
 import httpx
 from funworker import BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from funflix.base.backoff import MAX_BACKOFF, backoff
@@ -75,6 +75,7 @@ from funflix.base.config import Settings, get_settings
 from funflix.base.db import create_engine
 from funflix.models import Source, utcnow
 from funflix.services.collect.base import CollectedMessage, Collector, FetchResult
+from funflix.services.collect.priority import loss_sensitive_source_clause
 from funflix.services.collect.registry import get_collector_class
 from funflix.services.collect.runner import (
     _BACKFILL_TIME_BUDGET,
@@ -343,9 +344,8 @@ class _CollectProducer(BaseProducer):
             self._engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
         )
         self._buffer: list[Any] = []
-        # 全零 UUID 当"比任何真实 UUIDv7 都小"的哨兵，理由同
-        # `services/extract/concurrent_runner.py::_ParseProducer.on_start`。
-        self._last_id: uuid.UUID = uuid.UUID(int=0)
+        self._source_offset = 0
+        self._source_ids = self._aio_loop.run_until_complete(self._ordered_source_ids())
         self._exhausted = False
         self._single_done = False
 
@@ -357,14 +357,26 @@ class _CollectProducer(BaseProducer):
         if not self._buffer and not self._exhausted:
             if self.limit is not None and self._produced >= self.limit:
                 #: 已经规划够 `limit` 个任务了——这一次 collect 到此为止，不再扫
-                #: 描剩下的源。它们没被跳过，下次 collect 重新按 id 升序扫描时
-                #: 会从头再来（`_last_id` 只在本实例内存里，不跨进程持久化）。
+                #: 描剩下的源。它们没被跳过，下次 collect 会重新生成优先级快照。
                 self._exhausted = True
             else:
                 self._aio_loop.run_until_complete(self._fetch_page())
         if not self._buffer:
             raise StopIteration
         return self._buffer.pop(0)
+
+    async def _ordered_source_ids(self) -> list[uuid.UUID]:
+        if self.source_id is not None:
+            return []
+        now = utcnow()
+        async with self._sessionmaker() as session:
+            return list(
+                await session.scalars(
+                    select(Source.id)
+                    .where(Source.enabled)
+                    .order_by(case((loss_sensitive_source_clause(now), 0), else_=1), Source.id)
+                )
+            )
 
     async def _fetch_page(self) -> None:
         async with self._sessionmaker() as session:
@@ -385,18 +397,16 @@ class _CollectProducer(BaseProducer):
                     )
                 self._single_done = True
             else:
-                sources = list(
-                    await session.scalars(
-                        select(Source)
-                        .where(Source.enabled, Source.id > self._last_id)
-                        .order_by(Source.id)
-                        .limit(self.batch_size)
-                    )
-                )
-                if not sources:
+                source_ids = self._source_ids[
+                    self._source_offset : self._source_offset + self.batch_size
+                ]
+                self._source_offset += len(source_ids)
+                if not source_ids:
                     self._exhausted = True
                     return
-                self._last_id = sources[-1].id
+                rows = list(await session.scalars(select(Source).where(Source.id.in_(source_ids))))
+                by_id = {source.id: source for source in rows}
+                sources = [by_id[source_id] for source_id in source_ids if source_id in by_id]
 
             now = utcnow()
             for source in sources:
@@ -703,8 +713,8 @@ def run_collect_pipeline(
 
     `limit` 才是管累计总数的开关：一次 collect 最多规划这么多个任务
     （Telegram 单页翻页任务、其它源的整源任务都算）就收工，扫描到一半的源
-    留给下次 collect 继续（`_last_id` 只存在这次运行的内存里，不持久化，
-    不会丢）。默认 `_DEFAULT_LIMIT`，适合"跑一次别刷太猛，配合外部定时任务
+    留给下次 collect 继续（源顺序快照只存在这次运行的内存里，不会丢）。
+    默认 `_DEFAULT_LIMIT`，适合"跑一次别刷太猛，配合外部定时任务
     分批把存量慢慢啃完"这种用法；传 `None` 关掉，一次性扫完所有到期的源。
 
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者

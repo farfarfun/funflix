@@ -14,15 +14,15 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterable
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import CheckStatus
-from funflix.models import Media, Resource, media_resource
+from funflix.models import Media, Resource, Tag, media_resource, media_tag
 
 
 async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[uuid.UUID]) -> int:
-    """按关联表重算这些作品的资源计数。返回被更新的作品数。"""
+    """按关联表重算资源计数，并物理删除没有资源的作品。"""
     ids = {i for i in media_ids if i is not None}
     if not ids:
         return 0
@@ -43,24 +43,41 @@ async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[uuid
     ).all()
 
     counted = {mid: (total, int(valid or 0)) for mid, total, valid in rows}
-    # 一条关联都不剩的作品不会出现在分组结果里，必须显式归零，
-    # 否则删掉最后一条资源后计数会永远停在旧值。
-    by_id = {media_id: counted.get(media_id, (0, 0)) for media_id in ids}
+    orphan_ids = ids - counted.keys()
+    if orphan_ids:
+        affected_tag_ids = set(
+            await session.scalars(
+                select(media_tag.c.tag_id).where(media_tag.c.media_id.in_(orphan_ids))
+            )
+        )
+        await session.execute(delete(media_tag).where(media_tag.c.media_id.in_(orphan_ids)))
+        await session.execute(delete(Media).where(Media.id.in_(orphan_ids)))
+        if affected_tag_ids:
+            actual_count = (
+                select(func.count())
+                .select_from(media_tag)
+                .where(media_tag.c.tag_id == Tag.id)
+                .scalar_subquery()
+            )
+            await session.execute(
+                update(Tag).where(Tag.id.in_(affected_tag_ids)).values(media_count=actual_count)
+            )
 
     # 单条 CASE 表达式一次性把整批更新写完，而不是每个作品各发一次 UPDATE——
     # 远程数据库上一次往返 ~100ms，作品多的批次逐条更新代价很高。
-    await session.execute(
-        update(Media)
-        .where(Media.id.in_(ids))
-        .values(
-            resource_count=case(
-                {mid: total for mid, (total, _valid) in by_id.items()}, value=Media.id
-            ),
-            valid_resource_count=case(
-                {mid: valid for mid, (_total, valid) in by_id.items()}, value=Media.id
-            ),
+    if counted:
+        await session.execute(
+            update(Media)
+            .where(Media.id.in_(counted))
+            .values(
+                resource_count=case(
+                    {mid: total for mid, (total, _valid) in counted.items()}, value=Media.id
+                ),
+                valid_resource_count=case(
+                    {mid: valid for mid, (_total, valid) in counted.items()}, value=Media.id
+                ),
+            )
         )
-    )
     return len(ids)
 
 
