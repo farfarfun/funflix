@@ -166,6 +166,26 @@ class TestClaimDocuments:
         assert len(await claim_documents(session, limit=2)) == 2
 
     @pytest.mark.asyncio
+    async def test_prioritizes_source_with_less_remaining_work(self, session) -> None:
+        almost_done = make_source(1)
+        backlogged = make_source(2)
+        session.add_all([almost_done, backlogged])
+        await session.flush()
+        session.add(make_doc(1, source_id=almost_done.id))
+        for i in range(2, 5):
+            session.add(make_doc(i, source_id=backlogged.id))
+        await session.commit()
+
+        claimed = await claim_documents(session, limit=4)
+
+        assert [doc.source_id for doc in claimed.rows] == [
+            almost_done.id,
+            backlogged.id,
+            backlogged.id,
+            backlogged.id,
+        ]
+
+    @pytest.mark.asyncio
     async def test_does_not_claim_live_lease(self, session) -> None:
         """租约没过期就是别的 worker 正在处理，不能抢。"""
         session.add(

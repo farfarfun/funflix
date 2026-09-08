@@ -30,10 +30,9 @@ from funflix.worker.tasks import run_parse_once
 router = APIRouter(prefix="/sources", tags=["sources"])
 
 _ZERO_STATS = {"raw_total": 0, "raw_parsed": 0, "resource_total": 0}
-#: 手动触发解析一批处理多少条——比后台 worker 的 limit=20 略宽，因为默认
-#: 走本地 rule/sheet 抽取器（无外部调用），但仍要有界，不能让一次点击
-#: 卡住整个同步请求。
-_PARSE_TRIGGER_LIMIT = 50
+#: 采集源页面单次解析上限。请求由前端操作队列异步调度，但后端仍保留上限，
+#: 避免单个源长期占住一个 worker。
+_PARSE_TRIGGER_LIMIT = 500
 
 
 async def _source_stats(

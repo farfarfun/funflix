@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import ColumnElement, case, or_, select, update
+from sqlalchemy import ColumnElement, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import backoff
@@ -125,11 +125,11 @@ async def _claim_rows[T](
     await session.commit()
 
     if claimed_ids:
-        result.rows = list(
-            await session.scalars(
-                select(model).where(model.id.in_(claimed_ids)).order_by(model.id)  # type: ignore[attr-defined]
-            )
+        rows = list(
+            await session.scalars(select(model).where(model.id.in_(claimed_ids)))  # type: ignore[attr-defined]
         )
+        rows_by_id = {row.id: row for row in rows}  # type: ignore[attr-defined]
+        result.rows = [rows_by_id[row_id] for row_id in claimed_ids]
     return result
 
 
@@ -192,8 +192,15 @@ async def claim_documents(
         RawDocument,
         columns=[RawDocument.id, RawDocument.parse_status, RawDocument.parse_attempts],
         conditions=conditions,
-        # 没解析过的排在最前：新文档的第一次抽取比失败重试更有价值。
-        order_by=[RawDocument.last_parsed_at.nulls_first(), RawDocument.id],
+        # 先清掉余量少的源；手工文档没有 source，每条按独立来源计。
+        order_by=[
+            case(
+                (RawDocument.source_id.is_(None), 1),
+                else_=func.count().over(partition_by=RawDocument.source_id),
+            ),
+            RawDocument.last_parsed_at.nulls_first(),
+            RawDocument.id,
+        ],
         limit=limit,
         decide=decide,
     )
