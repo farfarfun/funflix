@@ -22,6 +22,20 @@ _DISCUSSION_RE = re.compile(r"https?://[^/\s<>\"']+/d/(\d+)", re.I)
 _NUMBERED_TITLE_RE = re.compile(r"^\d{1,4}\s*[.、:：)）-]\s*(?P<title>\S.+)$")
 _NAMED_TITLE_RE = re.compile(r"^(?:名称|片名|剧名|标题|资源名称|影片名)\s*[:：]\s*(?P<title>\S.+)$")
 _BOOK_TITLE_RE = re.compile(r"^(?P<title>《[^》]{1,200}》)")
+_TITLE_HEADERS = {
+    "name",
+    "title",
+    "名称",
+    "片名",
+    "剧名",
+    "标题",
+    "资源名称",
+    "影片名",
+    "电影名",
+    "剧集名",
+    "番名",
+}
+_URL_SCHEME_RE = re.compile(r"(?:https?://|magnet:|ed2k://)", re.I)
 _URL_SUFFIX_RE = re.compile(r"\s+(?:https?://|magnet:|ed2k://).*$", re.I)
 
 
@@ -108,12 +122,38 @@ def collection_text(text: str) -> str | None:
 
     titles: list[str] = []
     title_span: list[tuple[int, int]] = []
+    table_title_column: int | None = None
     offset = 0
     for raw_line in text.splitlines(keepends=True):
         line = raw_line.strip()
         match = _NUMBERED_TITLE_RE.match(line) or _NAMED_TITLE_RE.match(line)
         book = _BOOK_TITLE_RE.match(line)
-        candidate = match.group("title") if match else book.group("title") if book else ""
+        cells = (
+            [cell.strip() for cell in line[line.index("|") + 1 :].strip("|").split("|")]
+            if line.count("|") >= 2
+            else []
+        )
+        if cells and not _URL_SCHEME_RE.search(line):
+            table_title_column = next(
+                (index for index, cell in enumerate(cells) if cell.casefold() in _TITLE_HEADERS),
+                table_title_column,
+            )
+        elif line and not cells:
+            table_title_column = None
+        table_title = (
+            cells[table_title_column if table_title_column is not None else 0]
+            if cells and _URL_SCHEME_RE.search(line)
+            else ""
+        )
+        candidate = (
+            match.group("title")
+            if match
+            else book.group("title")
+            if book
+            else table_title
+            if table_title
+            else ""
+        )
         candidate = _URL_SUFFIX_RE.sub("", candidate).strip()
         if candidate and candidate not in titles:
             titles.append(candidate)

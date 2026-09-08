@@ -38,7 +38,7 @@ class _HTMLTextParser(HTMLParser):
         self.parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"br", "p", "div", "li", "tr"}:
+        if tag in {"br", "p", "div", "li", "tr", "td", "th"}:
             self.parts.append("\n")
         if tag == "a":
             href = dict(attrs).get("href")
@@ -46,7 +46,7 @@ class _HTMLTextParser(HTMLParser):
                 self.parts.extend((" ", href, " "))
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"p", "div", "li", "tr"}:
+        if tag in {"p", "div", "li", "tr", "td", "th"}:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:

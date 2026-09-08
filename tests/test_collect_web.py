@@ -14,6 +14,86 @@ from funflix.services.text.linkscan import scan_known_links
 
 
 @pytest.mark.asyncio
+async def test_collects_listing_page_links_incrementally() -> None:
+    share_id = "one"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                "<title>每日合集</title><p>剧集甲</p>"
+                f'<a href="https://pan.quark.cn/s/{share_id}">地址</a>'
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = Source(
+        id=1,
+        source_type=SourceType.WEB,
+        url="https://media.example/collections",
+        identifier="https://media.example/collections",
+        max_pages_per_fetch=5,
+        extra={},
+    )
+    collector = WebCollector(client)
+    first = await collector.fetch(source)
+    source.extra = first.state
+    second = await collector.fetch(source)
+    share_id = "two"
+    third = await collector.fetch(source)
+    await client.aclose()
+
+    assert scan_known_links(first.messages[0].text)[0].share_id == "one"
+    assert second.messages == []
+    assert scan_known_links(third.messages[0].text)[0].share_id == "two"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        (
+            "| 资源名称 | 分享链接 |\n| --- | --- |\n"
+            "| 剧集甲 | https://pan.quark.cn/s/one |\n"
+            "| 剧集乙 | https://pan.quark.cn/s/two |"
+        ),
+        (
+            "| 资源类型 | 资源名称 | 文件名称 | 分享链接 |\n| --- | --- | --- | --- |\n"
+            "| 电视剧 | 剧集甲 | 01.mp4 | https://pan.quark.cn/s/one |\n"
+            "| 电影 | 剧集乙 | 正片.mp4 | https://pan.quark.cn/s/two |"
+        ),
+        (
+            "<table><tr><td>剧集甲</td><td>https://pan.quark.cn/s/one</td></tr>"
+            "<tr><td>剧集乙</td><td>https://pan.quark.cn/s/two</td></tr></table>"
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_keeps_table_row_links_with_their_titles(body: str) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text=f"<title>资源表</title>{body}")
+        )
+    )
+    source = Source(
+        id=1,
+        source_type=SourceType.WEB,
+        url="https://media.example/table",
+        identifier="https://media.example/table",
+        max_pages_per_fetch=5,
+        extra={},
+    )
+    result = await WebCollector(client).fetch(source)
+    await client.aclose()
+
+    outcome = await RuleExtractor().extract(result.messages[0].text)
+    assert [item.title for item in outcome.items] == ["剧集甲", "剧集乙"]
+    assert [[link.share_id for link in item.links] for item in outcome.items] == [
+        ["one"],
+        ["two"],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_collects_direct_links_and_torrent_attachments() -> None:
     torrent_info = b"d4:name9:Movie.mkve"
     torrent = b"d4:info" + torrent_info + b"e"

@@ -123,6 +123,13 @@ def _parse_page(value: str) -> _PageParser:
     return parser
 
 
+def _page_content(value: str) -> str:
+    text = _text(value)
+    visible_keys = {link.key for link in scan_known_links(text)}
+    embedded_links = [link.url for link in scan_known_links(value) if link.key not in visible_keys]
+    return "\n".join((text, *embedded_links))
+
+
 def _title(value: str) -> str:
     prefix = re.split(r"[【\[]", value, maxsplit=1)[0].strip()
     if prefix and prefix != value:
@@ -208,11 +215,7 @@ class WebCollector(SupportsProgress):
         response.raise_for_status()
         value = _decode(response.content)
         page = _parse_page(value)
-        text = _text(value)
-        visible_keys = {link.key for link in scan_known_links(text)}
-        embedded_links = [
-            link.url for link in scan_known_links(value) if link.key not in visible_keys
-        ]
+        content = _page_content(value)
         attachment_links: list[str] = []
         requests = 1
         attachments = [
@@ -231,7 +234,7 @@ class WebCollector(SupportsProgress):
                     link.url for link in scan_known_links(_decode(torrent.content))
                 )
 
-        content = "\n".join((text, *embedded_links, *attachment_links))
+        content = "\n".join((content, *attachment_links))
         links = scan_known_links(content)
         title = _title(html.unescape(listing_title or page.title))
         if not title or not links:
@@ -268,14 +271,31 @@ class WebCollector(SupportsProgress):
             if not isinstance(raw_seen, list):
                 raw_seen = []
             seen = {str(value) for value in raw_seen if value}
+            content = _page_content(value)
+            direct_links = scan_known_links(content)
+            messages: list[CollectedMessage] = []
+            attempted: list[str] = []
+            if direct_links:
+                direct_id = hashlib.sha256(
+                    "\n".join((str(response.url), *(link.url for link in direct_links))).encode()
+                ).hexdigest()
+                if direct_id not in seen:
+                    normalized = collection_text(content) or content
+                    messages.append(
+                        CollectedMessage(
+                            message_id=direct_id,
+                            text=normalized,
+                            url=str(response.url),
+                        )
+                    )
+                    attempted.append(direct_id)
             pending = [
                 (url, label)
                 for url, label in detail_urls.items()
                 if hashlib.sha256(url.encode()).hexdigest() not in seen
             ]
             selected = pending[: max(1, source.max_pages_per_fetch)]
-            messages: list[CollectedMessage] = []
-            attempted: list[str] = []
+            detail_attempted: list[str] = []
             errors: list[httpx.HTTPError] = []
             for index, (url, listing_title) in enumerate(selected, 1):
                 try:
@@ -283,7 +303,9 @@ class WebCollector(SupportsProgress):
                 except httpx.HTTPStatusError as exc:
                     pages += 1
                     if exc.response.status_code == 404:
-                        attempted.append(hashlib.sha256(url.encode()).hexdigest())
+                        message_id = hashlib.sha256(url.encode()).hexdigest()
+                        attempted.append(message_id)
+                        detail_attempted.append(message_id)
                     else:
                         errors.append(exc)
                     self._report("fetch", index, len(selected), len(messages), position=url)
@@ -294,11 +316,13 @@ class WebCollector(SupportsProgress):
                     self._report("fetch", index, len(selected), len(messages), position=url)
                     continue
                 pages += used
-                attempted.append(hashlib.sha256(url.encode()).hexdigest())
+                message_id = hashlib.sha256(url.encode()).hexdigest()
+                attempted.append(message_id)
+                detail_attempted.append(message_id)
                 if message:
                     messages.append(message)
                 self._report("fetch", index, len(selected), len(messages), position=url)
-            if errors and not attempted:
+            if errors and not detail_attempted:
                 raise errors[0]
         finally:
             if self._owns_client:
@@ -308,7 +332,7 @@ class WebCollector(SupportsProgress):
         return FetchResult(
             messages=messages,
             pages_fetched=pages,
-            truncated=len(pending) > len(attempted),
+            truncated=len(pending) > len(detail_attempted),
             title=listing.title or _host(source.url),
             state={_SEEN_KEY: recent[-_MAX_SEEN:]},
             backfill_done=True,
