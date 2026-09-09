@@ -8,6 +8,7 @@ import pytest_asyncio
 from funflix.base.enums import CheckStatus, MediaType, Provider, Quality
 from funflix.models import Media, Resource, Tag, TagKind, utcnow
 from funflix.services.counters import refresh_media_counters
+from funflix.worker.tasks import BatchReport
 
 
 def _media(title: str, norm: str, *, media_type=MediaType.MOVIE, year: int = 2024) -> Media:
@@ -276,6 +277,31 @@ class TestListResources:
     async def test_single_lookup_requires_login(self, client, seeded) -> None:
         """issue #2：id 是自增整数，单条不上锁等于列表那把锁白加。"""
         assert (await client.get("/api/v1/resources/1")).status_code == 401
+
+    async def test_lists_only_checkable_providers(self, admin_client) -> None:
+        body = (await admin_client.get("/api/v1/resources/providers/checkable")).json()
+        assert "quark" in body
+        assert "ctfile" in body
+        assert "baidu" not in body
+
+    async def test_rejects_manual_check_for_unsupported_provider(self, admin_client) -> None:
+        response = await admin_client.post("/api/v1/resources/providers/baidu/verify")
+        assert response.status_code == 422
+
+    async def test_triggers_manual_check_for_provider(self, admin_client, monkeypatch) -> None:
+        called = {}
+
+        async def _run(_session, **kwargs):
+            called.update(kwargs)
+            return BatchReport(claimed=2, succeeded=1, failed=1)
+
+        monkeypatch.setattr("funflix.api.v1.resources.run_verify_once", _run)
+
+        body = (await admin_client.post("/api/v1/resources/providers/quark/verify")).json()
+
+        assert body["claimed"] == 2
+        assert called["provider"] is Provider.QUARK
+        assert called["limit"] == 500
 
 
 @pytest.mark.asyncio

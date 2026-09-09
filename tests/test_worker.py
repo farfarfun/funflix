@@ -330,6 +330,28 @@ class TestClaimResources:
 
         assert len(await claim_resources(session, limit=10)) == 0
 
+    @pytest.mark.asyncio
+    async def test_manual_claim_filters_provider_and_forces_recheck(self, session) -> None:
+        quark = make_resource(
+            1,
+            check_status=CheckStatus.VALID,
+            next_check_at=utcnow() + timedelta(days=3),
+        )
+        alipan = make_resource(
+            2,
+            provider=Provider.ALIPAN,
+            check_status=CheckStatus.VALID,
+            next_check_at=utcnow() + timedelta(days=3),
+        )
+        session.add_all([quark, alipan])
+        await session.commit()
+
+        claimed = await claim_resources(
+            session, limit=10, provider=Provider.QUARK, force=True
+        )
+
+        assert [resource.id for resource in claimed.rows] == [quark.id]
+
 
 class TestClaimSources:
     @pytest.mark.asyncio

@@ -17,16 +17,21 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
 from funflix.api.deps import CurrentUserDep, PageDep, SessionDep, get_or_404
-from funflix.base.enums import CheckStatus, Provider
+from funflix.base.config import get_settings
+from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, Provider
 from funflix.models import Resource
 from funflix.schemas.common import Page
-from funflix.schemas.media import ResourceOut
+from funflix.schemas.media import ProviderVerifyReportOut, ResourceOut
+from funflix.services.verify.runner import RateLimiter
+from funflix.worker.tasks import run_verify_once
 
 router = APIRouter(prefix="/resources", tags=["resources"])
+
+_VERIFY_TRIGGER_LIMIT = 500
 
 
 @router.get("", response_model=Page[ResourceOut])
@@ -63,6 +68,38 @@ async def list_resources(
         total=total or 0,
         page=paging.page,
         size=paging.size,
+    )
+
+
+@router.get("/providers/checkable", response_model=list[Provider])
+async def list_checkable_providers(_: CurrentUserDep) -> list[Provider]:
+    """返回当前真正实现了探针的网盘，供界面禁用其余校验按钮。"""
+    return sorted(CHECKABLE_PROVIDERS, key=lambda provider: provider.value)
+
+
+@router.post("/providers/{provider}/verify", response_model=ProviderVerifyReportOut)
+async def verify_provider(
+    provider: Provider, session: SessionDep, _: CurrentUserDep
+) -> ProviderVerifyReportOut:
+    """手动强制复查指定网盘最久未校验的一批资源。"""
+    if provider not in CHECKABLE_PROVIDERS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"{provider.value} 暂不支持校验",
+        )
+    report = await run_verify_once(
+        session,
+        provider=provider,
+        limit=_VERIFY_TRIGGER_LIMIT,
+        limiter=RateLimiter(rate_per_second=get_settings().worker_verify_rate),
+    )
+    return ProviderVerifyReportOut(
+        provider=provider,
+        claimed=report.claimed,
+        succeeded=report.succeeded,
+        failed=report.failed,
+        reclaimed=report.reclaimed,
+        abandoned=report.abandoned,
     )
 
 

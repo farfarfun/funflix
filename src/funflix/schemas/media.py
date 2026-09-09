@@ -47,6 +47,15 @@ class ResourceOut(BaseModel):
     seen_count: int = Field(description="被多少条分享文本提到过，可当热度用")
 
 
+class ProviderVerifyReportOut(BaseModel):
+    provider: Provider
+    claimed: int
+    succeeded: int
+    failed: int
+    reclaimed: int
+    abandoned: int
+
+
 class MediaSummary(BaseModel):
     """列表项。资源计数走 media 表上的冗余字段，不做聚合查询。"""
 

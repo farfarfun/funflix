@@ -30,6 +30,7 @@ from funflix.worker.tasks import (
     run_collect_batch,
     run_parse_batch,
     run_verify_batch,
+    run_verify_once,
 )
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "run_collect_batch",
     "run_parse_batch",
     "run_verify_batch",
+    "run_verify_once",
     "spawn",
     "stale_summary",
 ]

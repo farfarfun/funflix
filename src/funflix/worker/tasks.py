@@ -223,7 +223,7 @@ async def run_parse_once(
     session: AsyncSession,
     *,
     source_id: uuid.UUID | None = None,
-    limit: int = 50,
+    limit: int = 500,
     lease: timedelta = DEFAULT_LEASE,
     extractor: str | None = None,
     write_batch: int = 20,
@@ -242,6 +242,66 @@ async def run_parse_once(
         write_batch=write_batch,
         source_id=source_id,
     )
+
+
+async def _verify_one_batch(
+    session: AsyncSession,
+    *,
+    limit: int,
+    lease: timedelta,
+    limiter: RateLimiter | None,
+    write_batch: int,
+    probes: dict[Provider, Any],
+    provider: Provider | None = None,
+    force: bool = False,
+) -> BatchReport:
+    """领取并校验一批资源；循环策略和探针生命周期由调用方负责。"""
+    report = BatchReport()
+    claimed = await claim_resources(
+        session, limit=limit, lease=lease, provider=provider, force=force
+    )
+    report.claimed = len(claimed)
+    report.reclaimed = claimed.reclaimed
+    report.abandoned = claimed.abandoned
+
+    pending = 0
+    for resource in claimed.rows:
+        try:
+            if resource.provider not in probes:
+                probes[resource.provider] = get_probe(resource.provider)
+            result = await check_resource(
+                session,
+                resource,
+                probes[resource.provider],
+                limiter,
+                # 领取时状态已被改成 checking，那只是占位。不把领取前的结论
+                # 传进去，"连续两次失效就停止复查"永远算不出来。
+                prior_status=claimed.priors.get(resource.id),
+            )
+            # error / rate_limited 不是关于链接的结论，是"没探出来"，算失败。
+            inconclusive = result.status in {CheckStatus.ERROR, CheckStatus.RATE_LIMITED}
+            report.succeeded += int(not inconclusive)
+            report.failed += int(inconclusive)
+            await _mark_done(resource)
+            pending += 1
+        except Exception as exc:
+            report.failed += 1
+            await _abort(session, "校验", resource.id, exc)
+            pending = 0
+            continue
+        if pending >= write_batch:
+            await session.commit()
+            pending = 0
+    if pending:
+        await session.commit()
+    return report
+
+
+async def _close_probes(probes: dict[Provider, Any]) -> None:
+    for probe in probes.values():
+        aclose = getattr(probe, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 async def run_verify_batch(
@@ -268,53 +328,49 @@ async def run_verify_batch(
     report = BatchReport()
     probes: dict[Provider, Any] = {}
 
-    def _probe_for(provider: Provider) -> Any:
-        if provider not in probes:
-            probes[provider] = get_probe(provider)
-        return probes[provider]
-
     try:
         while True:
-            claimed = await claim_resources(session, limit=limit, lease=lease)
-            report.claimed += len(claimed)
-            report.reclaimed += claimed.reclaimed
-            report.abandoned += claimed.abandoned
-
-            pending = 0
-            for resource in claimed.rows:
-                try:
-                    probe = _probe_for(resource.provider)
-                    result = await check_resource(
-                        session,
-                        resource,
-                        probe,
-                        limiter,
-                        # 领取时状态已被改成 checking，那只是占位。不把领取前的结论
-                        # 传进去，"连续两次失效就停止复查"永远算不出来。
-                        prior_status=claimed.priors.get(resource.id),
-                    )
-                    # error / rate_limited 不是关于链接的结论，是"没探出来"，算失败。
-                    inconclusive = result.status in {CheckStatus.ERROR, CheckStatus.RATE_LIMITED}
-                    report.succeeded += int(not inconclusive)
-                    report.failed += int(inconclusive)
-                    await _mark_done(resource)
-                    pending += 1
-                except Exception as exc:
-                    report.failed += 1
-                    await _abort(session, "校验", resource.id, exc)
-                    pending = 0
-                    continue
-                if pending >= write_batch:
-                    await session.commit()
-                    pending = 0
-            if pending:
-                await session.commit()
-
-            if not claimed.rows:
+            batch = await _verify_one_batch(
+                session,
+                limit=limit,
+                lease=lease,
+                limiter=limiter,
+                write_batch=write_batch,
+                probes=probes,
+            )
+            report.claimed += batch.claimed
+            report.succeeded += batch.succeeded
+            report.failed += batch.failed
+            report.reclaimed += batch.reclaimed
+            report.abandoned += batch.abandoned
+            if batch.claimed == 0:
                 break
     finally:
-        for probe in probes.values():
-            aclose = getattr(probe, "aclose", None)
-            if aclose is not None:
-                await aclose()
+        await _close_probes(probes)
     return report
+
+
+async def run_verify_once(
+    session: AsyncSession,
+    *,
+    provider: Provider,
+    limit: int = 500,
+    lease: timedelta = DEFAULT_LEASE,
+    limiter: RateLimiter | None = None,
+    write_batch: int = 20,
+) -> BatchReport:
+    """强制复查指定网盘的一批资源，供“网盘管理”页面手动触发。"""
+    probes: dict[Provider, Any] = {}
+    try:
+        return await _verify_one_batch(
+            session,
+            limit=limit,
+            lease=lease,
+            limiter=limiter,
+            write_batch=write_batch,
+            probes=probes,
+            provider=provider,
+            force=True,
+        )
+    finally:
+        await _close_probes(probes)

@@ -35,7 +35,7 @@ from sqlalchemy import ColumnElement, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import backoff
-from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus
+from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus, Provider
 from funflix.models import RawDocument, Resource, Source, utcnow
 from funflix.services.collect.priority import loss_sensitive_source_clause
 from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS
@@ -219,6 +219,8 @@ async def claim_resources(
     limit: int = 20,
     lease: timedelta = DEFAULT_LEASE,
     now: datetime | None = None,
+    provider: Provider | None = None,
+    force: bool = False,
 ) -> Claimed[Resource]:
     """领取待校验的资源，置 checking 并加租约。
 
@@ -230,12 +232,18 @@ async def claim_resources(
     conditions = [
         Resource.provider.in_(CHECKABLE_PROVIDERS),
         or_(Resource.lease_until.is_(None), Resource.lease_until <= now),
-        or_(
-            Resource.next_check_at <= now,
-            # 刚落库、还没排过复查时间的
-            Resource.next_check_at.is_(None) & (Resource.check_status == CheckStatus.UNCHECKED),
-        ),
     ]
+    if not force:
+        conditions.append(
+            or_(
+                Resource.next_check_at <= now,
+                # 刚落库、还没排过复查时间的
+                Resource.next_check_at.is_(None)
+                & (Resource.check_status == CheckStatus.UNCHECKED),
+            )
+        )
+    if provider is not None:
+        conditions.append(Resource.provider == provider)
 
     def decide(status: CheckStatus, attempts: int) -> tuple[dict[str, Any], bool, bool]:
         is_reclaim = status is CheckStatus.CHECKING
@@ -252,8 +260,11 @@ async def claim_resources(
         Resource,
         columns=[Resource.id, Resource.check_status, Resource.check_attempts],
         conditions=conditions,
-        # 没校验过的排在最前：新资源的第一次结论比老资源的复查更有价值
-        order_by=[Resource.next_check_at.nulls_first(), Resource.id],
+        # 手动强制复查时从最久没检查的开始，连续点击会自然推进到下一批。
+        order_by=[
+            (Resource.last_checked_at if force else Resource.next_check_at).nulls_first(),
+            Resource.id,
+        ],
         limit=limit,
         decide=decide,
     )
