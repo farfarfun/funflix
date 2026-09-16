@@ -55,17 +55,10 @@ alembic upgrade head
 funflix source add https://t.me/s/<频道名>
 funflix source collect
 funflix source list
-
-# 起服务（前台，开发用；默认端口 18810）
-funflix server run --reload
-# 接口文档 http://127.0.0.1:18810/docs
-
-# 后台常驻、状态查询、停止、重启（生产用，本地一样适用）
-funflix server start
-funflix server status
-funflix server stop
-funflix server restart
 ```
+
+HTTP API 服务由独立的 `funflix-api` 包提供（依赖本包），见
+[funflix-api](https://github.com/farfarfun/funflix-api)。
 
 ## 命令行
 
@@ -76,7 +69,7 @@ funflix server restart
 | `funflix verify` | 校验，默认处理到清空为止，可用 `--limit` 显式设上限 |
 | `funflix run` | 采集 → 解析（`--skip-collect` 时只解析，均不含校验），解析默认处理到清空为止 |
 | `funflix worker --once` | 采集 → 解析 → 校验，各推进到队列清空后退出 |
-| `funflix worker` / `funflix server start`/`run`（`FUNFLIX_WORKER_ENABLED=true`） | 循环反复：采集 → 解析 → 校验，各推进到队列清空，直到停止（某一队列大量积压时会在这一轮里暂时独占，属预期行为） |
+| `funflix worker` / `funflix-api start`/`run`（`FUNFLIX_WORKER_ENABLED=true`） | 循环反复：采集 → 解析 → 校验，各推进到队列清空，直到停止（某一队列大量积压时会在这一轮里暂时独占，属预期行为） |
 
 `parse`/`verify` 内部按 `--batch-size`（默认 500）分批拉取执行，不会一次性把全部
 待处理行读进内存；进度条从一开始就按总量显示，过程中持续推进。每批内部再按
@@ -111,16 +104,6 @@ funflix server restart
 | `funflix verify` | 校验：探测网盘链接现在还能不能用 |
 | `funflix run` | 一条龙：采集全部启用的源，再解析待处理文本 |
 | `funflix worker` | 常驻后台 worker：周期性地采集、解析、校验（`--once` 只跑一轮就退出） |
-| `funflix server run` | 前台启动 API 服务，Ctrl-C 停止；`--reload` 开发用 |
-| `funflix server start` | 后台启动 API 服务：拉一个子进程跑 `server run` |
-| `funflix server stop` | 停止后台服务（`SIGTERM` 优雅退出） |
-| `funflix server restart` | 先 `stop` 再 `start` |
-| `funflix server status` | 查看后台服务是否在跑、PID、安装的版本号 |
-
-`server` 各命令默认监听 `127.0.0.1:18810`，`--host`/`--port`/`--config` 可覆盖；
-`--config` 缺省时读 `${XDG_CONFIG_HOME:-~/.config}/farfarfun/funflix/config.toml`
-（不存在就用默认值，不算错误）。`start` 写的 PID 文件（`server.pid`）和日志
-（`server.log`）都放在同一个配置目录下，跟 `--config` 默认路径统一管理。
 | `funflix probes` | 列出可用的网盘校验探针 |
 | `funflix extractors` | 列出可用的抽取器 |
 | `funflix search <keyword>` | 按剧名搜索作品及其资源 |
@@ -181,35 +164,10 @@ funflix source collect
 
 ## 接口
 
-### 采集源
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/v1/sources` | 登记采集源，只给 `url` 即可自动识别类型与标识 |
-| `GET` | `/api/v1/sources` | 列表 |
-| `GET` | `/api/v1/sources/supported` | 当前支持的源类型 |
-| `PATCH` | `/api/v1/sources/{id}` | 改配置；回拨 `cursor_message_id` 即可重采历史 |
-| `POST` | `/api/v1/sources/{id}/collect` | 立即采集一次 |
-| `DELETE` | `/api/v1/sources/{id}` | 删除（已采文本保留） |
-
-### 原始文本
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/v1/raw` | 提交一条；命中 `content_hash` 返回 `duplicated=true` |
-| `POST` | `/api/v1/raw/bulk` | 批量提交 |
-| `GET` | `/api/v1/raw` | 按状态 / 来源翻页，不返回全文 |
-| `GET` | `/api/v1/raw/{id}` | 详情，含全文 |
-
-### 查询
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/v1/media` | 搜索 / 浏览作品，支持 `keyword`、`media_type`、`year`、`valid_only` 与翻页 |
-| `GET` | `/api/v1/media/{id}` | 作品详情，含全部网盘资源与标签 |
-| `GET` | `/api/v1/resources` | 按 `provider` / `check_status` 翻页看链接 |
-| `GET` | `/api/v1/resources/{id}` | 单条资源 |
-| `GET` | `/api/v1/stats` | 流水线各环节记录数与分布（`funflix status` 的 HTTP 版）|
+HTTP API（`/api/v1/sources`、`/raw`、`/media`、`/resources`、`/stats`、鉴权等）由
+独立的 `funflix-api` 包提供，见
+[funflix-api](https://github.com/farfarfun/funflix-api) 的 README。CLI（`funflix
+user` / `funflix source` 等）直连数据库，不走 HTTP，不受影响。
 
 `/media` 的关键词匹配走 `services/search.py` 的后端抽象：PostgreSQL 上用 `pg_trgm`
 容错匹配并按相似度排序，其余方言回落 `LIKE`，调用方无感知。
@@ -230,33 +188,6 @@ PostgreSQL 上的三条实测结论（`tests/test_search_pg.py`，5 万行）：
 > ⚠️ DESIGN §7.3 还规划了 `SqliteFtsBackend`（FTS5 虚拟表），目前**尚未实现**。
 > 也就是说 SQLite 部署上关键词搜索仍是 `LIKE %x%` 全表扫描 —— 几千条无所谓，
 > 上万条就会明显变慢。数据量起来之前先用 PostgreSQL，或者补上 FTS5 后端。
-
-### 鉴权
-
-`/sources`、`/raw`、`/resources`、`/stats` 整个「运维」区都要求登录（基于会话
-cookie，不再是 `X-API-Key`）；`/media` 与 `/media/{id}` 保持开放，面向使用者。
-
-先建一个账号（自助注册默认关闭，见上面的 `FUNFLIX_REGISTRATION_ENABLED`）：
-
-```bash
-funflix user create funflix --password funflix
-```
-
-再走登录接口拿会话 cookie：
-
-```bash
-curl -c cookies.txt -X POST localhost:8000/api/v1/auth/login \
-     -H "Content-Type: application/json" \
-     -d '{"username": "funflix", "password": "funflix"}'
-
-curl -b cookies.txt -X POST localhost:8000/api/v1/sources \
-     -d '{"url": "https://t.me/s/某频道"}'
-```
-
-CLI（`funflix user` / `funflix source` 等）直连数据库，不走 HTTP，不受影响。
-
-其余账号管理命令：`funflix user list` / `user set-password` / `user enable` /
-`user disable`。
 
 ## 网盘校验
 
