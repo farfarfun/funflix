@@ -346,9 +346,7 @@ class TestClaimResources:
         session.add_all([quark, alipan])
         await session.commit()
 
-        claimed = await claim_resources(
-            session, limit=10, provider=Provider.QUARK, force=True
-        )
+        claimed = await claim_resources(session, limit=10, provider=Provider.QUARK, force=True)
 
         assert [resource.id for resource in claimed.rows] == [quark.id]
 

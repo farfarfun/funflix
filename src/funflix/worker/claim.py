@@ -238,8 +238,7 @@ async def claim_resources(
             or_(
                 Resource.next_check_at <= now,
                 # 刚落库、还没排过复查时间的
-                Resource.next_check_at.is_(None)
-                & (Resource.check_status == CheckStatus.UNCHECKED),
+                Resource.next_check_at.is_(None) & (Resource.check_status == CheckStatus.UNCHECKED),
             )
         )
     if provider is not None:
