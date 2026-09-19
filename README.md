@@ -223,3 +223,16 @@ UC 与夸克是同一套接口（连业务码都一样），所以 UC 探针直�
 ## 开发
 
 开发环境搭建、测试、lint、生成迁移等见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+
+---
+
+## 关于 farfarfun
+
+[farfarfun](https://github.com/farfarfun) 是一个专注于实用工具库的开源组织，
+涵盖云存储、数据处理、AI、多媒体与开发工具链等方向。
+
+- 🏠 组织主页：<https://github.com/farfarfun>
+- 📦 PyPI：<https://pypi.org/user/niuliangtao/>
+- 📧 联系：farfarfun@qq.com
+
+本项目基于 [MIT](LICENSE) 协议开源。
