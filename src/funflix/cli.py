@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import uuid
 from collections.abc import Awaitable, Callable
@@ -17,6 +16,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn
 import click
 import questionary
 import typer
+from farlog import getLogger
 from sqlalchemy import select
 from tqdm import tqdm
 
@@ -27,7 +27,7 @@ from funflix.base.enums import CheckStatus, MediaType, ParseStatus, SourceType
 if TYPE_CHECKING:
     from funflix.services.sync import SyncReport
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 app = typer.Typer(help="funflix 命令行工具")
 db_app = typer.Typer(help="数据库迁移与检查", no_args_is_help=True)
@@ -266,7 +266,6 @@ def worker(
     同一条任务不会被两个进程重复处理；进程崩了，租约过期后任务自动回到队列。
     `run` 没有这层保护，只适合手动跑一次。
     """
-    import logging
 
     from funflix.worker import Worker, progress_heartbeat
 
@@ -286,11 +285,6 @@ def worker(
             if v is not None
         }
     )
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
     instance = Worker(settings)
 
     if once:

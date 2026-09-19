@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
+from farlog import getLogger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import backoff
@@ -19,7 +19,7 @@ from funflix.services.counters import refresh_for_resource
 from funflix.services.verify.base import CheckOutcome, LinkProbe, LinkRef
 from funflix.services.verify.registry import get_probe
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 各状态的复查间隔，见 docs/DESIGN.md §6.4
 _RECHECK_TTL: dict[CheckStatus, timedelta | None] = {

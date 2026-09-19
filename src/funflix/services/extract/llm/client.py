@@ -7,13 +7,14 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from farlog import getLogger
+
 from funflix.services.extract.llm.prompts import TOOL_NAME, TOOL_SCHEMA
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: funsecret 的分类路径：read_secret("funflix", "llm", <key>)
 SECRET_CATE1 = "funflix"

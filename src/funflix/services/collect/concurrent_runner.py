@@ -57,7 +57,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 import uuid
 from collections.abc import Callable
@@ -66,6 +65,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
+from farlog import getLogger
 from funworker import BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
 from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -91,7 +91,7 @@ from funflix.services.collect.telegram import (
     plan_backfill_pages,
 )
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 每次生产者扫到一个 Telegram 源时最多规划这么多页历史——跟 `backfill()`
 #: 原有的单次页数上限保持一致，只是含义从"单次调用实际翻了几页"变成
@@ -277,7 +277,7 @@ async def _run_opaque_source(
         source.last_error = f"{type(exc).__name__}: {exc}"
         source.next_fetch_at = now + backoff(source.consecutive_failures)
         report.error = source.last_error
-        logger.warning("采集失败 source=%s: %s", source.identifier, source.last_error)
+        logger.warning(f"采集失败 source={source.identifier}: {source.last_error}")
         return fetch_messages, backfill_messages, report
 
     report.fetched = len(result.messages)
@@ -292,7 +292,7 @@ async def _run_opaque_source(
             try:
                 b_result = await collector.backfill(source)
             except Exception as exc:
-                logger.warning("补历史失败 source=%s: %s", source.identifier, exc)
+                logger.warning(f"补历史失败 source={source.identifier}: {exc}")
                 break
             backfill_messages.extend(b_result.messages)
             report.backfilled += len(b_result.messages)
@@ -482,9 +482,7 @@ class _CollectProcessor(BaseProcessor):
             html = await fetch_page_html(self._client, item.identifier, item.before)
             messages, _title = parse_channel_page(html, item.identifier)
         except Exception as exc:
-            logger.warning(
-                "补历史翻页失败 source_id=%s before=%s: %s", item.source_id, item.before, exc
-            )
+            logger.warning(f"补历史翻页失败 source_id={item.source_id} before={item.before}: {exc}")
             messages = []
         # 只保留比 before 更旧的消息——parse_channel_page 只按 ID 排序，
         # 不保证服务端严格只返回 < before 的部分。

@@ -7,8 +7,9 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
+
+from farlog import getLogger
 
 from funflix.base.enums import MediaType, Quality
 from funflix.services.extract.base import ExtractedItem, ExtractionOutcome
@@ -17,7 +18,7 @@ from funflix.services.extract.llm.prompts import PROMPT_VERSION, SYSTEM_PROMPT, 
 from funflix.services.text.linkscan import ScannedLink, scan_links
 from funflix.services.text.normalize import clean_title, extract_tags, norm_key
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 年份的合理区间，超出即视为模型瞎填
 _YEAR_MIN, _YEAR_MAX = 1900, 2100
@@ -187,6 +188,6 @@ class LLMExtractor:
 
         if outcome.stats["invalid_link_index"]:
             logger.warning(
-                "模型给出了 %d 个越界链接序号，已丢弃", outcome.stats["invalid_link_index"]
+                f"模型给出了 {outcome.stats['invalid_link_index']} 个越界链接序号，已丢弃"
             )
         return outcome

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 from dataclasses import dataclass
 
+from farlog import getLogger
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,7 +14,7 @@ from funflix.base.enums import ParseStatus
 from funflix.models import RawDocument, utcnow
 from funflix.schemas.raw import RawDocumentCreate
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 
 def normalize_for_hash(content: str) -> str:
@@ -76,7 +76,7 @@ async def ingest_document(
         async with session.begin_nested():
             await session.flush()
     except IntegrityError:
-        logger.info("并发插入命中 content_hash 冲突，回落到已有记录: %s", digest)
+        logger.info(f"并发插入命中 content_hash 冲突，回落到已有记录: {digest}")
         session.expunge(doc)
         winner = await session.scalar(select(RawDocument).where(RawDocument.content_hash == digest))
         if winner is None:  # pragma: no cover - 理论上不可达
@@ -145,7 +145,7 @@ async def ingest_many(
             async with session.begin_nested():
                 await session.flush()
         except IntegrityError:
-            logger.info("批量插入命中 content_hash 冲突，退化为逐条处理: %d 条", len(fresh_docs))
+            logger.info(f"批量插入命中 content_hash 冲突，退化为逐条处理: {len(fresh_docs)} 条")
             for doc in fresh_docs:
                 session.expunge(doc)
             for i in fresh_indices:

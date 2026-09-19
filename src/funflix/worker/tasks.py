@@ -19,12 +19,12 @@
 
 from __future__ import annotations
 
-import logging
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+from farlog import getLogger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import CheckStatus, Provider
@@ -42,7 +42,7 @@ from funflix.worker.claim import (
     claim_sources,
 )
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 
 @dataclass(slots=True)
@@ -84,7 +84,7 @@ async def _abort(session: AsyncSession, kind: str, row_id: Any, exc: Exception) 
     次数，多次崩溃后就会被置终态，不会变成一个能把 worker 反复拖垮的毒任务。
     """
     await session.rollback()
-    logger.exception("%s 任务异常 id=%s: %s", kind, row_id, exc)
+    logger.exception(f"{kind} 任务异常 id={row_id}: {exc}")
 
 
 async def run_collect_batch(

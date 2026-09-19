@@ -15,13 +15,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
+from farlog import getLogger
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,7 +38,7 @@ from funflix.worker.tasks import (
     run_verify_batch,
 )
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
@@ -223,7 +223,7 @@ async def _run_progress_ticks(
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("进度查询失败，%ss 后重试", interval)
+            logger.exception(f"进度查询失败，{interval}s 后重试")
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -232,7 +232,7 @@ async def _run_progress_ticks(
 
 
 def _default_on_tick(line: str) -> None:
-    logger.info("进度：%s", line)
+    logger.info(f"进度：{line}")
 
 
 @asynccontextmanager
@@ -293,12 +293,9 @@ class Worker:
             stale = await stale_summary(session)
         if stale.total:
             logger.warning(
-                "发现 %s 条上次未收尾的任务（文档 %s / 资源 %s / 源 %s），"
-                "租约已过期，本轮起会被自动重新领取",
-                stale.total,
-                stale.documents,
-                stale.resources,
-                stale.sources,
+                f"发现 {stale.total} 条上次未收尾的任务（文档 {stale.documents} / "
+                f"资源 {stale.resources} / 源 {stale.sources}），"
+                "租约已过期，本轮起会被自动重新领取"
             )
         return stale
 
@@ -344,24 +341,24 @@ class Worker:
         stop = stop or asyncio.Event()
         interval = self.settings.worker_poll_seconds
         await self.startup_check()
-        logger.info("worker 启动，轮询间隔 %ss，租约 %s", interval, self._lease)
+        logger.info(f"worker 启动，轮询间隔 {interval}s，租约 {self._lease}")
 
         async with progress_heartbeat(
             self.settings.worker_progress_seconds,
             self._session_factory,
-            on_tick=lambda line: logger.info("worker 进度：%s", line),
+            on_tick=lambda line: logger.info(f"worker 进度：{line}"),
         ):
             while not stop.is_set():
                 try:
                     report = await self.run_once()
                     if not report.idle:
-                        logger.info("worker 一轮完成：%s", report.summary())
+                        logger.info(f"worker 一轮完成：{report.summary()}")
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     # 一轮失败不该让整个 worker 退出 —— 下一轮大概率就好了
                     # （数据库重启、网络抖动）。真正的坏任务由重试上限兜住。
-                    logger.exception("worker 本轮异常，%ss 后重试", interval)
+                    logger.exception(f"worker 本轮异常，{interval}s 后重试")
 
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=interval)

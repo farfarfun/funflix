@@ -24,13 +24,13 @@ schema 必须同时跑在 SQLite 与 PostgreSQL 上（§1）。
 
 from __future__ import annotations
 
-import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from farlog import getLogger
 from sqlalchemy import ColumnElement, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,7 +40,7 @@ from funflix.models import RawDocument, Resource, Source, utcnow
 from funflix.services.collect.priority import loss_sensitive_source_clause
 from funflix.services.extract.runner import MAX_PARSE_ATTEMPTS
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 租约时长。worker 崩溃后，任务最多被卡这么久就会被重新领取。
 #: 必须显著长于单条任务的正常耗时（LLM 调用可能几十秒），否则任务还在跑
@@ -206,9 +206,8 @@ async def claim_documents(
     )
     if claimed.reclaimed or claimed.abandoned:
         logger.warning(
-            "解析队列重捞 %s 条过期任务，其中 %s 条已超重试上限置为 failed",
-            claimed.reclaimed,
-            claimed.abandoned,
+            f"解析队列重捞 {claimed.reclaimed} 条过期任务，"
+            f"其中 {claimed.abandoned} 条已超重试上限置为 failed"
         )
     return claimed
 
@@ -268,7 +267,7 @@ async def claim_resources(
         decide=decide,
     )
     if claimed.reclaimed:
-        logger.warning("校验队列重捞 %s 条过期任务", claimed.reclaimed)
+        logger.warning(f"校验队列重捞 {claimed.reclaimed} 条过期任务")
     return claimed
 
 
@@ -317,5 +316,5 @@ async def claim_sources(
         decide=decide,
     )
     if claimed.reclaimed:
-        logger.warning("采集队列重捞 %s 个中断的源", claimed.reclaimed)
+        logger.warning(f"采集队列重捞 {claimed.reclaimed} 个中断的源")
     return claimed

@@ -21,19 +21,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 import re
 import zlib
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from farlog import getLogger
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 统一到 base.http，避免五个文件各抄一份
 _UA = DEFAULT_UA
@@ -312,7 +312,7 @@ class TencentSheetCollector(SupportsProgress):
                 try:
                     payload = await self._get(client, doc_id, sheet_id, start)
                 except httpx.HTTPError as exc:
-                    logger.warning("sheet %s 补历史请求失败：%s", sheet_id, exc)
+                    logger.warning(f"sheet {sheet_id} 补历史请求失败：{exc}")
                     if not messages:
                         pages = 0
                     break
@@ -329,10 +329,7 @@ class TencentSheetCollector(SupportsProgress):
                 if not rows:
                     if start < target:
                         logger.warning(
-                            "sheet %s 在第 %d 行处返回空片（共 %s 行）",
-                            sheet_id,
-                            start,
-                            target,
+                            f"sheet {sheet_id} 在第 {start} 行处返回空片（共 {target} 行）"
                         )
                         if not messages:
                             pages = 0
@@ -383,7 +380,7 @@ class TencentSheetCollector(SupportsProgress):
         except Exception as exc:
             # 拿不到列名不该让整轮补历史失败 —— 退化成原始字段 ID，
             # 内容仍然入库，只是抽取质量差一些。
-            logger.warning("sheet %s 取列定义失败：%s", sheet_id, exc)
+            logger.warning(f"sheet {sheet_id} 取列定义失败：{exc}")
             return {}
 
     def _to_messages(
@@ -445,7 +442,7 @@ class TencentSheetCollector(SupportsProgress):
             pages += 1
             sheet_ids = parse_sheet_ids(first)
             title = (first.get("clientVars") or {}).get("title") or None
-            logger.info("腾讯文档 %s 共 %d 个 sheet", doc_id, len(sheet_ids))
+            logger.info(f"腾讯文档 {doc_id} 共 {len(sheet_ids)} 个 sheet")
 
             for sheet_id in sheet_ids:
                 payload = await self._get(client, doc_id, sheet_id, 0)
@@ -456,7 +453,7 @@ class TencentSheetCollector(SupportsProgress):
 
                 if version is not None and known_versions.get(sheet_id) == version:
                     # 版本没变 —— 整个 sheet 跳过，一次请求就判完了
-                    logger.debug("sheet %s 版本未变（%s），跳过", sheet_id, version)
+                    logger.debug(f"sheet {sheet_id} 版本未变（{version}），跳过")
                     continue
 
                 if isinstance(total_row, int) and total_row >= 0:

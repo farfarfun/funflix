@@ -16,10 +16,13 @@ from urllib.parse import quote, urldefrag, urlsplit, urlunsplit
 from xml.etree import ElementTree as ET
 
 import httpx
+from farlog import getLogger
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
+
+logger = getLogger("funflix")
 
 _SEEN_KEY = "rss_seen_ids"
 # ponytail: keep 2000 IDs in JSON; content_hash still catches older repeats, use a
@@ -61,9 +64,10 @@ def _text(value: str | None) -> str:
         parser.feed(value)
         parser.close()
         value = "".join(parser.parts)
-    except Exception:
-        # HTML in a feed is untrusted decoration; the XML item itself remains usable.
-        pass
+    except Exception as exc:
+        # HTML in a feed is untrusted decoration; the XML item itself remains usable,
+        # so fall back to the raw (unparsed) value instead of failing the whole item.
+        logger.warning(f"feed 描述 HTML 解析失败，回退为原始文本：{exc!r}")
     lines = [line.strip() for line in value.replace("\r", "\n").split("\n")]
     return "\n".join(line for line in lines if line)
 

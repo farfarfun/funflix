@@ -10,11 +10,11 @@ tag 去重、关联是否已存在……），批量预读把这些查询从 O(�
 
 from __future__ import annotations
 
-import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from farlog import getLogger
 from sqlalchemy import and_, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,7 +38,7 @@ from funflix.services.extract.base import ExtractedItem, ExtractionOutcome, Extr
 from funflix.services.text.linkscan import ScannedLink
 from funflix.services.text.normalize import tag_norm_key
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 连续失败这么多次后置终态 failed，不再自动重试。
 #: worker 领取时也要用它判断"崩溃重捞"是否已经捞够次数，故为公开常量。
@@ -683,7 +683,7 @@ async def parse_document(
         # 同样不算一次"处理过"：last_parsed_at 不动，下次仍按原优先级排队。
         report.status = doc.parse_status
         report.error = "并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
-        logger.info("解析撞车 doc=%s: 并发写入冲突，留待下次重试", doc.id)
+        logger.info(f"解析撞车 doc={doc.id}: 并发写入冲突，留待下次重试")
 
     except Exception as exc:
         doc.parse_attempts += 1
@@ -698,7 +698,7 @@ async def parse_document(
             doc.next_parse_at = now + backoff(doc.parse_attempts)
         report.status = doc.parse_status
         report.error = doc.parse_error
-        logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)
+        logger.warning(f"解析失败 doc={doc.id}: {doc.parse_error}")
 
     return report
 
@@ -756,7 +756,7 @@ async def persist_extracted(
                 doc.next_parse_at = now + backoff(doc.parse_attempts)
             report.status = doc.parse_status
             report.error = doc.parse_error
-            logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)
+            logger.warning(f"解析失败 doc={doc.id}: {doc.parse_error}")
             continue
 
         persistable_docs.append(doc)
@@ -854,7 +854,7 @@ async def _persist_chunk(
             report = reports[doc.id]
             report.status = doc.parse_status
             report.error = "同批并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
-        logger.info("解析撞车 docs=%s: 同批并发写入冲突，留待下次重试", [d.id for d in chunk])
+        logger.info(f"解析撞车 docs={[d.id for d in chunk]}: 同批并发写入冲突，留待下次重试")
 
     except Exception as exc:
         # 同上：这个 chunk 的 SAVEPOINT 整体回滚了，缓存里这个 chunk 期间
@@ -878,11 +878,11 @@ async def _persist_chunk(
                     doc.next_parse_at = now + backoff(doc.parse_attempts)
                 report.status = doc.parse_status
                 report.error = doc.parse_error
-                logger.warning("解析失败 doc=%s: %s", doc.id, doc.parse_error)
+                logger.warning(f"解析失败 doc={doc.id}: {doc.parse_error}")
             else:
                 report.status = doc.parse_status
                 report.error = "同批其它文档处理异常，已回滚，留待下次重试（不计入失败次数）"
-                logger.info("解析连带回滚 doc=%s: 同批其它文档异常，留待下次重试", doc.id)
+                logger.info(f"解析连带回滚 doc={doc.id}: 同批其它文档异常，留待下次重试")
 
 
 async def parse_batch(

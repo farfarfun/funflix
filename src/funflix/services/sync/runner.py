@@ -15,12 +15,12 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import timedelta
 
 import sqlalchemy as sa
+from farlog import getLogger
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from funflix.models import Base
 from funflix.services.sync.tables import SyncTable, sync_tables
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 容忍两台机器的时钟漂移，以及"提交时刻"与"对其他连接可见时刻"之间的偏差。
 #: 多拉到的重叠部分靠 upsert 的幂等性兜底，不会造成数据错误，只是多扫一遍。
@@ -125,10 +125,7 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
             # https://github.com/farfarfun/funflix/issues/3：之前没打出真实异常，
             # 排查一个"结构上不可能冲突"的表被 100% 跳过时无从下手）。
             logger.warning(
-                "%s: 批量 upsert 失败，降级为逐行处理（%d 行）：%r",
-                spec.table.name,
-                len(chunk),
-                err,
+                f"{spec.table.name}: 批量 upsert 失败，降级为逐行处理（{len(chunk)} 行）：{err!r}"
             )
 
         for row in chunk:
@@ -138,7 +135,7 @@ async def _apply_rows(session: AsyncSession, spec: SyncTable, rows: list[dict]) 
                 result.applied += 1
             except DBAPIError as err:
                 pk_value = {c: row.get(c) for c in pk_cols}
-                logger.warning("%s: 跳过一行，主键=%s：%r", spec.table.name, pk_value, err)
+                logger.warning(f"{spec.table.name}: 跳过一行，主键={pk_value}：{err!r}")
                 result.skipped_conflicts += 1
 
     await session.commit()

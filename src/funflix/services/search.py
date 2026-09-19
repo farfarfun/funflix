@@ -9,10 +9,10 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from farlog import getLogger
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,7 +20,7 @@ from funflix.base.enums import CheckStatus, MediaType, Provider
 from funflix.models import Media, Resource, media_resource
 from funflix.services.text.normalize import norm_key
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 相似度阈值不在这里 —— 它由 `pg_trgm.similarity_threshold` 这个 GUC 提供，
 #: 随连接参数下发（`Settings.search_trgm_threshold` → base/db.py）。
@@ -187,7 +187,7 @@ def get_backend(session_or_bind: Any) -> SearchBackend:
 
 async def search_media(session: AsyncSession, query: SearchQuery) -> list[Media]:
     backend = get_backend(session)
-    logger.debug("搜索后端=%s 关键词=%r", backend.name, query.keyword)
+    logger.debug(f"搜索后端={backend.name} 关键词={query.keyword!r}")
     return await backend.search(session, query)
 
 

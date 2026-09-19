@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from farlog import getLogger
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 _LINK_RE = re.compile(r"^https?://(?:www\.)?kdocs\.cn/l/(?P<id>[A-Za-z0-9_-]+)", re.I)
 _OFFSETS_KEY = "kdocs_offsets"

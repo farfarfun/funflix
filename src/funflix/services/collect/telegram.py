@@ -14,19 +14,19 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 
 import httpx
+from farlog import getLogger
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: 统一到 base.http，避免五个文件各抄一份
 _UA = DEFAULT_UA
@@ -117,7 +117,7 @@ class _ChannelPageParser(HTMLParser):
             try:
                 published = datetime.fromisoformat(self._published)
             except ValueError:
-                logger.debug("无法解析消息时间: %r", self._published)
+                logger.debug(f"无法解析消息时间: {self._published!r}")
         self.messages.append(
             CollectedMessage(
                 message_id=self._msg_id,
@@ -347,9 +347,7 @@ class TelegramChannelCollector(SupportsProgress):
                 try:
                     html = await self._get_page(client, channel, oldest)
                 except httpx.HTTPError as exc:
-                    logger.warning(
-                        "补历史请求失败 source=%s: %s，先收工这一轮已拿到的", channel, exc
-                    )
+                    logger.warning(f"补历史请求失败 source={channel}: {exc}，先收工这一轮已拿到的")
                     break
                 messages, _ = parse_channel_page(html, channel)
                 pages += 1

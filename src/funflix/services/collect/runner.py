@@ -6,11 +6,11 @@
 
 from __future__ import annotations
 
-import logging
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 
+from farlog import getLogger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import MAX_BACKOFF, backoff
@@ -27,7 +27,7 @@ from funflix.services.collect.base import (
 from funflix.services.collect.registry import get_collector
 from funflix.services.ingest import ingest_many
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 _INGEST_CHUNK_SIZE = 5_000
 
@@ -104,7 +104,7 @@ async def collect_source(
             source.last_error = f"{type(exc).__name__}: {exc}"
             source.next_fetch_at = now + backoff(source.consecutive_failures)
             report.error = source.last_error
-            logger.warning("采集失败 source=%s: %s", source.identifier, source.last_error)
+            logger.warning(f"采集失败 source={source.identifier}: {source.last_error}")
             return report
 
         report.fetched = len(result.messages)
@@ -155,7 +155,7 @@ async def collect_source(
 
         if result.backfill_pending and source.backfill_done:
             # 又有没采到的历史内容了，重新打开补历史
-            logger.info("source=%s 出现新的历史内容，重新打开补历史", source.identifier)
+            logger.info(f"source={source.identifier} 出现新的历史内容，重新打开补历史")
             source.backfill_done = False
 
         source.total_collected += report.created
@@ -203,7 +203,7 @@ async def _run_backfill(
         try:
             result = await collector.backfill(source)
         except Exception as exc:
-            logger.warning("补历史失败 source=%s: %s", source.identifier, exc)
+            logger.warning(f"补历史失败 source={source.identifier}: {exc}")
             return
 
         report.backfilled += len(result.messages)
@@ -220,7 +220,7 @@ async def _run_backfill(
             source.backfill_cursor_id = result.backfill_cursor
         if result.backfill_done:
             source.backfill_done = True
-            logger.info("source=%s 历史已补完", source.identifier)
+            logger.info(f"source={source.identifier} 历史已补完")
 
         source.total_backfilled += created
         report.backfill_cursor = source.backfill_cursor_id

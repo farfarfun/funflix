@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import logging
 import secrets
 from functools import lru_cache
 from pathlib import Path
 
+from farlog import getLogger
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 #: funsecret 里都没有、环境变量也没给时的兜底。
 #: 用本地 SQLite 而不是报错 —— 让"刚 clone 下来就能跑起来"成立。
@@ -73,7 +73,7 @@ def resolve_database_url() -> str:
     try:
         value = read_secret("funflix", "db", "url")
     except Exception as exc:  # 密钥库损坏 / 权限问题，不该让整个应用起不来
-        logger.warning("读取 funsecret 数据库配置失败，回落到默认值：%s", exc)
+        logger.warning(f"读取 funsecret 数据库配置失败，回落到默认值：{exc}")
         return _fallback_to_default()
 
     if not value:
@@ -81,7 +81,7 @@ def resolve_database_url() -> str:
         return _fallback_to_default()
 
     # 只记方言，不记完整 URL —— 它可能带账号密码
-    logger.info("数据库地址来自 funsecret（%s）", value.split("://", 1)[0])
+    logger.info(f"数据库地址来自 funsecret（{value.split('://', 1)[0]}）")
     return value
 
 

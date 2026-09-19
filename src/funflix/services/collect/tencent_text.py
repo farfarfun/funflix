@@ -27,18 +27,18 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from farlog import getLogger
 
 from funflix.base.http import DEFAULT_UA
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 _API = "https://docs.qq.com/dop-api/opendoc"
 #: 统一到 base.http，避免五个文件各抄一份
@@ -186,12 +186,12 @@ class TencentTextCollector(SupportsProgress):
             )
 
         if rev is not None and known_rev == rev:
-            logger.debug("腾讯文档 %s 版本未变（rev=%s），跳过", doc_id, rev)
+            logger.debug(f"腾讯文档 {doc_id} 版本未变（rev={rev}），跳过")
             return FetchResult(pages_fetched=1, title=title, backfill_done=True)
 
         blocks = split_blocks(extract_plain_text(payload))
         now = datetime.now(UTC)
-        logger.info("腾讯文档 %s 切出 %d 个段落块", doc_id, len(blocks))
+        logger.info(f"腾讯文档 {doc_id} 切出 {len(blocks)} 个段落块")
 
         messages = [
             CollectedMessage(

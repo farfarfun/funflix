@@ -8,15 +8,16 @@
 
 from __future__ import annotations
 
-import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from farlog import getLogger
+
 from funflix.base.enums import CheckStatus, Provider
 from funflix.base.http import json_headers
 
-logger = logging.getLogger(__name__)
+logger = getLogger("funflix")
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +188,7 @@ class AnonymousHttpProbe:
             outcome = CheckOutcome(status=CheckStatus.ERROR, detail=f"{type(exc).__name__}: {exc}")
         except Exception as exc:
             # 解析逻辑自己抛了 —— 同样不能算链接失效
-            logger.exception("%s 探针异常", self.name)
+            logger.exception(f"{self.name} 探针异常")
             outcome = CheckOutcome(status=CheckStatus.ERROR, detail=f"{type(exc).__name__}: {exc}")
 
         outcome.latency_ms = int((time.monotonic() - started) * 1000)
@@ -199,7 +200,7 @@ class AnonymousHttpProbe:
             return outcome
         # 认不出来的响应：多半是接口改版了。归 ERROR 而非 INVALID ——
         # 宁可下轮重试，也不要把还能用的链接误标成失效。
-        logger.warning("%s 返回了未知响应，已归为 ERROR：%s", self.name, str(payload)[:160])
+        logger.warning(f"{self.name} 返回了未知响应，已归为 ERROR：{str(payload)[:160]}")
         return CheckOutcome(
             status=CheckStatus.ERROR, http_code=http_code, detail=f"未知响应：{str(payload)[:160]}"
         )

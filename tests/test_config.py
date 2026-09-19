@@ -5,7 +5,6 @@ from types import ModuleType
 
 import pytest
 
-from funflix.base import config as config_module
 from funflix.base.config import (
     DEFAULT_DATABASE_URL,
     Settings,
@@ -103,13 +102,24 @@ class TestResolveDatabaseUrl:
         fake_funsecret(None, raises=RuntimeError("密钥库损坏"))
         assert resolve_database_url() == DEFAULT_DATABASE_URL
 
-    def test_does_not_log_full_url(self, fake_funsecret, caplog) -> None:
-        """URL 可能带账号密码，日志里只该出现方言。"""
+    def test_does_not_log_full_url(self, fake_funsecret) -> None:
+        """URL 可能带账号密码，日志里只该出现方言。
+
+        farlog 基于 loguru，不走标准库 logging，pytest 的 `caplog` 抓不到，
+        这里直接挂一个临时 sink 抓 loguru 的输出。
+        """
+        from loguru import logger as _loguru_logger
+
         fake_funsecret("postgresql+asyncpg://user:secret-password@host/db")
-        with caplog.at_level("INFO", logger=config_module.__name__):
+        messages: list[str] = []
+        sink_id = _loguru_logger.add(lambda message: messages.append(str(message)), level="INFO")
+        try:
             resolve_database_url()
-        assert "secret-password" not in caplog.text
-        assert "postgresql+asyncpg" in caplog.text
+        finally:
+            _loguru_logger.remove(sink_id)
+        combined = "".join(messages)
+        assert "secret-password" not in combined
+        assert "postgresql+asyncpg" in combined
 
 
 class TestSettingsPrecedence:
