@@ -35,9 +35,11 @@ dependencies = [
     # 所以这两个都要在。
     "asyncpg>=0.29",
     # 数据库地址与 LLM 凭证都从这里读
-    "funsecret",
+    "funsecret>=1.4.95",
     # parse 命令的并发流水线：生产者/处理单元线程池/消费者
     "funworker>=0.1.1",
+    # 统一日志出口，见 §8.1
+    "farlog>=1.1.8",
 ]
 license-files = ["LICENSE"]
 

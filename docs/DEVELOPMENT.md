@@ -5,14 +5,14 @@
 ## 常用命令
 
 ```bash
-pip install -e ".[dev]"
+uv sync --extra dev
 
-pytest              # 测试
-ruff check .        # lint
-ruff format .       # 格式化
+uv run pytest              # 测试
+uv run ruff check .        # lint
+uv run ruff format .       # 格式化
 
 # 改了模型后生成迁移
-alembic revision --autogenerate -m "描述"
+uv run alembic revision --autogenerate -m "描述"
 ```
 
 ## 跑 PostgreSQL 那部分测试
@@ -23,7 +23,7 @@ alembic revision --autogenerate -m "描述"
 
 ```bash
 export FUNFLIX_TEST_PG_URL='postgresql+asyncpg://用户@/库名'
-pytest tests/test_search_pg.py
+uv run pytest tests/test_search_pg.py
 ```
 
 其中 `test_keyword_query_uses_the_trgm_index` 断言的是**查询计划**而不是结果。
