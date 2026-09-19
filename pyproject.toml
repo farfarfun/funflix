@@ -21,10 +21,13 @@ dependencies = [
     "pydantic-settings>=2.3",
     "aiosqlite>=0.20",
     "httpx>=0.27",
-    "typer>=0.12",
-    # cli.py 直接 import click 做菜单/参数交互，不能只靠 typer 传递依赖——
-    # typer>=0.27 起不再强制依赖 click，传递安装会装不上它。
-    "click>=8.0",
+    # cli.py 直接用 click.Parameter/Option/Argument/Command/Group 内省 typer 生成的
+    # 命令树做交互式菜单，这些类型要和 typer 内部构建 Command 时用的是同一套。
+    # typer>=0.26 起把 click 整份 vendor 进了 typer._click（私有模块，fork 自
+    # click 8.3.1），不再依赖外部 click 包——那样 TyperOption/TyperArgument 继承的
+    # 是 vendored 版本，跟外部 click 包的类型对不上，isinstance 判断会全部失败。
+    # 锁在 vendoring 之前的版本，让 click 继续作为 typer 的真实传递依赖。
+    "typer>=0.12,<0.26",
     # 账号密码：登录密码哈希（CLI user 命令与 funflix-api 都用）
     "bcrypt>=4.0",
     "tqdm>=4.66",
