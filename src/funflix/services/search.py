@@ -107,6 +107,7 @@ class LikeSearchBackend:
         return or_(*conditions)
 
     async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
+        """按查询条件返回匹配的媒体列表。"""
         stmt = select(Media)
         clause = self._keyword_clause(query)
         if clause is not None:
@@ -116,6 +117,7 @@ class LikeSearchBackend:
         return list(await session.scalars(stmt))
 
     async def count(self, session: AsyncSession, query: SearchQuery) -> int:
+        """按查询条件返回匹配的媒体数量。"""
         stmt = select(func.count()).select_from(Media)
         clause = self._keyword_clause(query)
         if clause is not None:

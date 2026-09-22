@@ -128,9 +128,11 @@ class AnonymousHttpProbe:
             self._client = None
 
     def build_url(self, ref: LinkRef) -> str:
+        """根据资源引用构造待校验的 URL。"""
         return self.endpoint
 
     def build_params(self, ref: LinkRef) -> dict[str, str] | None:
+        """根据资源引用构造请求参数；无需参数时返回 None。"""
         return self.params
 
     def build_payload(self, ref: LinkRef) -> dict[str, Any]:

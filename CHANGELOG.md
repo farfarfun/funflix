@@ -19,4 +19,18 @@
 
 ## [0.1.67]
 
-- 详见 GitHub Releases：<https://github.com/farfarfun/funflix/releases>。
+### 新增
+
+- 增加 `scripts/setup.sh`，统一管理 worker 生命周期。
+
+### 修复
+
+- 补充搜索、采集和校验公开 API 的中文 docstring。
+
+### 变更
+
+- 历史版本变更详情参见 GitHub Releases：<https://github.com/farfarfun/funflix/releases>。
+
+### 废弃
+
+- 无。

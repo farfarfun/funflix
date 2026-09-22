@@ -91,6 +91,7 @@ class SupportsProgress:
     _progress: ProgressHook | None = None
 
     def set_progress(self, hook: ProgressHook | None) -> None:
+        """设置采集进度回调；传入 None 可关闭回调。"""
         self._progress = hook
 
     def _report(

@@ -104,6 +104,17 @@ HTTP API 服务由独立的 `funflix-api` 包提供（依赖本包），见
 | `funflix verify` | 校验：探测网盘链接现在还能不能用 |
 | `funflix run` | 一条龙：采集全部启用的源，再解析待处理文本 |
 | `funflix worker` | 常驻后台 worker：周期性地采集、解析、校验（`--once` 只跑一轮就退出） |
+
+后台 worker 也可以通过 `scripts/setup.sh` 管理：
+
+```bash
+scripts/setup.sh dev start
+scripts/setup.sh dev status
+scripts/setup.sh dev stop
+scripts/setup.sh prod run
+```
+
+运行状态、PID 和日志位于 `.run/`。
 | `funflix probes` | 列出可用的网盘校验探针 |
 | `funflix extractors` | 列出可用的抽取器 |
 | `funflix search <keyword>` | 按剧名搜索作品及其资源 |
