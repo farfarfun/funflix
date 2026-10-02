@@ -34,6 +34,19 @@ def _tune_sqlite(dbapi_conn: Any, _record: Any) -> None:
 
 
 def create_engine(settings: Settings | None = None) -> AsyncEngine:
+    """按配置创建一个新的异步 SQLAlchemy 引擎。
+
+    SQLite 与 PostgreSQL 分别调优：SQLite 走连接级 PRAGMA（见 `_tune_sqlite`），
+    内存库额外切到 `StaticPool` 以便跨会话共享；PostgreSQL 开连接池并下发
+    `pg_trgm.similarity_threshold`。
+
+    参数：
+        settings：显式传入的配置；为 `None` 时回退到 `get_settings()` 的全局配置。
+
+    返回：
+        尚未关联到进程级缓存的全新 `AsyncEngine` 实例。多数调用方应优先用
+        `get_engine()` 复用单例，只有需要独立引擎（如测试隔离）时才直接调用本函数。
+    """
     settings = settings or get_settings()
     kwargs: dict[str, Any] = {"echo": settings.db_echo, "future": True}
     if settings.is_sqlite:
@@ -65,11 +78,22 @@ def create_engine(settings: Settings | None = None) -> AsyncEngine:
 
 @lru_cache(maxsize=1)
 def get_engine() -> AsyncEngine:
+    """获取进程级共享的异步引擎单例（懒加载，首次调用时创建）。
+
+    返回：
+        全局唯一的 `AsyncEngine`，同一进程内的所有调用返回同一实例。
+    """
     return create_engine()
 
 
 @lru_cache(maxsize=1)
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    """获取进程级共享的异步 session 工厂单例（懒加载，首次调用时创建）。
+
+    返回：
+        绑定到 `get_engine()` 的 `async_sessionmaker`；`expire_on_commit=False`
+        以便提交后仍可读取对象属性，`autoflush=False` 避免隐式 flush。
+    """
     return async_sessionmaker(
         get_engine(),
         class_=AsyncSession,
@@ -100,5 +124,12 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 
 async def dispose_engine() -> None:
+    """释放进程级共享引擎持有的连接池，并清空单例缓存。
+
+    仅在 `get_engine()` 已经被调用过（即单例已创建）时才真正释放，避免
+    为了关闭一个从未打开过的引擎而意外创建它。应用退出、测试用例收尾时调用。
+    """
     if get_engine.cache_info().currsize:
         await get_engine().dispose()
+        get_engine.cache_clear()
+        get_sessionmaker.cache_clear()

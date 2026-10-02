@@ -104,22 +104,23 @@ HTTP API 服务由独立的 `funflix-api` 包提供（依赖本包），见
 | `funflix verify` | 校验：探测网盘链接现在还能不能用 |
 | `funflix run` | 一条龙：采集全部启用的源，再解析待处理文本 |
 | `funflix worker` | 常驻后台 worker：周期性地采集、解析、校验（`--once` 只跑一轮就退出） |
-
-后台 worker 也可以通过 `scripts/setup.sh` 管理：
-
-```bash
-scripts/setup.sh dev start
-scripts/setup.sh dev status
-scripts/setup.sh dev stop
-scripts/setup.sh prod run
-```
-
-运行状态、PID 和日志位于 `.run/`。
 | `funflix probes` | 列出可用的网盘校验探针 |
 | `funflix extractors` | 列出可用的抽取器 |
 | `funflix search <keyword>` | 按剧名搜索作品及其资源 |
 | `funflix doc <doc_id>` | 查看一条原始文本及其解析状态 |
 | `funflix ingest <path>` | 从文件导入原始文本（`.txt` / `.jsonl`） |
+
+后台 worker 也可以通过 `scripts/setup.sh` 管理（`<action>` 在前，`<dev|prod>` 在后；
+`status` 不区分环境，不带参数）：
+
+```bash
+scripts/setup.sh start dev
+scripts/setup.sh status
+scripts/setup.sh stop dev
+scripts/setup.sh run prod
+```
+
+运行状态、PID 和日志位于 `.run/`。
 
 采集源除 Telegram 频道和腾讯文档外，还支持公开 RSS/Atom feed。RSS 条目标题、
 描述、真实链接、Atom enclosure，以及扩展字段里的 `infoHash` 都会转成原始文本，按

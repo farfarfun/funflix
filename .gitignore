@@ -10,15 +10,22 @@ venv/
 *.db
 *.db-wal
 *.db-shm
+*.rar
 
 # fundrive 导入时自建的日志目录
 logs/
+
+# scripts/setup.sh 生命周期管理生成的 PID/日志/锁文件
+.run/
 
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
 htmlcov/
+
+.idea/
+.vscode/
 
 # ---- AI 编码助手 ----
 # 只忽略本地状态；团队有意共享的 agent / 命令 / 规则定义仍然版本化。

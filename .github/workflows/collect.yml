@@ -31,13 +31,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+
+      - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+        run: uv sync --locked
 
       # 数据库地址、采集源凭证等都不进仓库，运行前从远端密钥库拉到本地。
       # secret 里若混入尾随空白（复制粘贴常见），会被解析进库名导致连接失败，先 trim 掉。
@@ -46,10 +44,10 @@ jobs:
           FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
         run: |
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
-          funsecret load "$url"
+          uv run funsecret load "$url"
 
       - name: Collect
-        run: funflix collect --limit 10000
+        run: uv run funflix collect --limit 10000
 
   parse:
     runs-on: ubuntu-latest
@@ -63,25 +61,23 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+
+      - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+        run: uv sync --locked
 
       - name: Load secrets
         env:
           FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
         run: |
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
-          funsecret load "$url"
+          uv run funsecret load "$url"
 
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
       # 影响范围有限，不会一次把所有待解析的都搭进去。
       - name: Parse
-        run: funflix parse --limit 20000
+        run: uv run funflix parse --limit 20000
 
   verify:
     runs-on: ubuntu-latest
@@ -95,20 +91,18 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+
+      - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+        run: uv sync --locked
 
       - name: Load secrets
         env:
           FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
         run: |
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
-          funsecret load "$url"
+          uv run funsecret load "$url"
 
       - name: Verify
-        run: funflix verify --limit 10000
+        run: uv run funflix verify --limit 10000
