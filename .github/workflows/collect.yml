@@ -35,7 +35,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: uv sync --locked
+        run: uv sync
 
       # 数据库地址、采集源凭证等都不进仓库，运行前从远端密钥库拉到本地。
       # secret 里若混入尾随空白（复制粘贴常见），会被解析进库名导致连接失败，先 trim 掉。
@@ -65,7 +65,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: uv sync --locked
+        run: uv sync
 
       - name: Load secrets
         env:
@@ -95,7 +95,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: uv sync --locked
+        run: uv sync
 
       - name: Load secrets
         env:
