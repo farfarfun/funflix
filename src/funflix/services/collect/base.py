@@ -22,6 +22,7 @@ class CollectedMessage:
 
     @property
     def numeric_id(self) -> int | None:
+        """`message_id` 的整数形式；非纯数字 ID（如 KDocs 的 `sheet:record`）返回 None。"""
         return int(self.message_id) if self.message_id.isdigit() else None
 
 

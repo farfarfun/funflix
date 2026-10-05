@@ -162,7 +162,7 @@ class TestIndexIsActuallyUsed:
 
         from sqlalchemy import select
 
-        stmt = select(Media.id).where(backend._keyword_clause(query, key, similarity))
+        stmt = select(Media.id).where(backend._keyword_clause(query, key))
         compiled = stmt.compile(
             dialect=pg_session.bind.dialect, compile_kwargs={"literal_binds": True}
         )

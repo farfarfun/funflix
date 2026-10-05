@@ -26,15 +26,32 @@ _REGISTRY: dict[SourceType, type[Collector]] = {
 
 
 def get_collector_class(source_type: SourceType) -> type[Collector] | None:
+    """按源类型查找对应的采集器类。
+
+    Args:
+        source_type: 源的类型枚举。
+
+    Returns:
+        已注册的采集器类；未注册该类型时返回 None。
+    """
     return _REGISTRY.get(source_type)
 
 
 def get_collector(source_type: SourceType) -> Collector | None:
+    """按源类型创建一个采集器实例（用默认参数构造，不传 `client`）。
+
+    Args:
+        source_type: 源的类型枚举。
+
+    Returns:
+        新建的采集器实例；未注册该类型时返回 None。
+    """
     cls = get_collector_class(source_type)
     return cls() if cls else None
 
 
 def supported_source_types() -> list[SourceType]:
+    """列出当前已注册采集器的全部源类型，按枚举值排序。"""
     return sorted(_REGISTRY, key=lambda s: s.value)
 
 

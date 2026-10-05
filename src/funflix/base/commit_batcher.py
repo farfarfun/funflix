@@ -19,6 +19,16 @@ from funflix.models import utcnow
 
 @dataclass(slots=True)
 class CommitBatcher:
+    """会话提交节流器：攒够 `max_pending` 条或距上次提交超过 `max_interval` 就提交。
+
+    Attributes:
+        session: 被托管的数据库会话，提交动作发在它身上。
+        max_pending: 条数阈值，累计上报量到了就提交。
+        max_interval: 时间阈值，距上次提交超过它就提交，避免低速场景迟迟不落盘。
+        pending: 自上次提交以来累计上报的变更条数。
+        since: 上次提交的时刻（UTC）。
+    """
+
     session: AsyncSession
     max_pending: int = 100
     max_interval: timedelta = timedelta(minutes=1)

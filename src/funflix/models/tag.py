@@ -30,6 +30,12 @@ class TagKind(StrEnum):
 
 
 class Tag(TimestampMixin, Base):
+    """一个标签：维度（`kind`）+ 展示名（`name`）+ 归一匹配键（`norm_key`）。
+
+    题材、地区、语言、年代共用这一张表，靠 `kind` 区分，这样加一个筛选维度
+    不需要改 schema。与作品的多对多关系走 `media_tag` 关联表。
+    """
+
     __tablename__ = "tag"
 
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)

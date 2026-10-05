@@ -112,6 +112,21 @@ class SheetExtractor:
     version = VERSION
 
     async def extract(self, content: str) -> ExtractionOutcome:
+        """把 `列名：值` 格式的一行表格内容按列直接映射成一个作品，不做任何猜测。
+
+        先用 `parse_fields` 解析出字段字典，再用 `find_title` 找标题列。
+        标题像目录帖（如日期/合集标题）则整行判为目录帖、不产出作品；
+        找不到标题列则所有链接记为未归属；否则年份/类型/集数/画质优先读
+        对应命名列，缺失时才回落到对标题/原文做正则猜测，所有链接和标签
+        都归属给这一行对应的唯一作品。
+
+        Args:
+            content: 一行的原始内容，`列名：值` 格式，逐行对应各列。
+
+        Returns:
+            `ExtractionOutcome`，`extractor_name`/`extractor_version` 固定为
+            `"sheet"`/`VERSION`，`raw_payload` 留档解析出的字段字典。
+        """
         return self._build(content)
 
     def rehydrate(self, payload: dict[str, Any], content: str) -> ExtractionOutcome:

@@ -29,11 +29,21 @@ def normalize_for_hash(content: str) -> str:
 
 
 def content_hash(content: str) -> str:
+    """计算 `content` 规范化后的 SHA-256 指纹，用作去重依据。
+
+    Args:
+        content: 原始文本。
+
+    Returns:
+        64 位十六进制 SHA-256 摘要。
+    """
     return hashlib.sha256(normalize_for_hash(content).encode("utf-8")).hexdigest()
 
 
 @dataclass(slots=True)
 class IngestOutcome:
+    """单条摄入的结果：落库（或已存在）的文档记录，以及它是否命中了已有记录。"""
+
     document: RawDocument
     duplicated: bool
 

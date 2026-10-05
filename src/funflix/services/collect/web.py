@@ -63,6 +63,7 @@ def _decode(payload: bytes) -> str:
 
 class _PageParser(HTMLParser):
     def __init__(self) -> None:
+        """初始化标题/链接收集缓冲区，以及解析 `<a>` 标签时用到的临时状态。"""
         super().__init__(convert_charrefs=True)
         self.title_parts: list[str] = []
         self.links: list[tuple[str, str]] = []
@@ -75,6 +76,10 @@ class _PageParser(HTMLParser):
         self._link_title = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """记录 `<title>` 开始；`<a href>` 开始时记下 href 并重置锚文本收集，
+        同时依据 class/title 属性或 `rel=bookmark` 预判它是否可能是「正文内容
+        链接」（详情页入口），供 `handle_endtag` 最终归类使用。
+        """
         values = dict(attrs)
         if tag == "title":
             self._in_title = True
@@ -89,6 +94,10 @@ class _PageParser(HTMLParser):
             self._link_title = values.get("title") or ""
 
     def handle_endtag(self, tag: str) -> None:
+        """`</title>` 结束标题收集；`</a>` 结束时把 `(href, 锚文本)` 记入
+        `links`，并根据起始标签阶段的判定（`content_link` 或 `bookmark` +
+        资源关键词匹配锚文本）决定是否把该链接计入 `content_links`。
+        """
         if tag == "title":
             self._in_title = False
         elif tag == "a" and self._href is not None:
@@ -103,6 +112,7 @@ class _PageParser(HTMLParser):
             self._link_title = ""
 
     def handle_data(self, data: str) -> None:
+        """在 `<title>` 内累积标题文本；在 `<a>` 标签内累积锚文本。"""
         if self._in_title:
             self.title_parts.append(data)
         if self._href is not None:
@@ -110,6 +120,7 @@ class _PageParser(HTMLParser):
 
     @property
     def title(self) -> str:
+        """合并后的页面标题文本（连续空白折叠成单个空格）。"""
         return " ".join("".join(self.title_parts).split())
 
 
@@ -197,15 +208,38 @@ def _detail_pattern(source: Source) -> re.Pattern[str]:
 
 
 class WebCollector(SupportsProgress):
+    """公开影视网站/论坛列表页采集器。
+
+    抓一次列表页：若列表页本身已经带资源链接（如论坛帖子页），直接把它当作
+    一条消息产出；同时按 URL 模式与正文特征识别出列表里的「详情页」链接，
+    逐个访问并提取其中的资源链接（含种子文件解出 magnet）。只采一轮、没有
+    跨轮翻页，去重状态存在 `Source.extra[_SEEN_KEY]`。
+    """
+
     name = "public-web-v1"
     detect_priority = 950
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        """
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时各方法自行创建并关闭。
+        """
         self._client = client
         self._owns_client = client is None
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """把 url 规范化（去 fragment，过长则做哈希摘要）作为 identifier。
+
+        `detect_priority` 是所有采集器里最大的，因为这里几乎接受任何合法的
+        http(s) URL——只有在其他更具体的采集器都未命中时才会轮到它兜底。
+
+        Args:
+            url: 待识别的源地址。
+
+        Returns:
+            规范化后的 URL（或其哈希）；协议非 http(s) 或缺少 host 时返回 None。
+        """
         return _canonical_url(url)
 
     async def _detail_message(
@@ -244,6 +278,29 @@ class WebCollector(SupportsProgress):
         return CollectedMessage(message_id=message_id, text=normalized, url=url), requests
 
     async def fetch(self, source: Source) -> FetchResult:
+        """抓列表页，产出列表页自身内容（如果有资源链接）与详情页内容。
+
+        先按 `_detail_pattern(source)`（或 `source.extra["detail_pattern"]`
+        覆盖）与「正文内容链接」双重判定筛出候选详情页 URL，按「已在正文里
+        出现的链接优先、URL 中最长数字串靠前」排序后，最多取
+        `source.max_pages_per_fetch` 个未采过的详情页逐个访问；详情页里若带
+        `.torrent` 附件会一并下载解出 magnet 链接。已处理过的消息 ID（对
+        列表页自身内容、每个详情页分别算一个 ID）记入去重窗口
+        `Source.extra[_SEEN_KEY]`（滚动保留最新 `_MAX_SEEN` 个）。
+
+        Args:
+            source: 待采集的源，`source.url` 为列表页地址。
+
+        Returns:
+            FetchResult：`messages` 为本轮新产出的消息；`truncated` 表示还有
+            未采的候选详情页；`title` 取列表页标题或域名兜底；
+            `backfill_done` 恒为 True，因为没有「补历史」语义。
+
+        Raises:
+            httpx.HTTPError: 列表页请求失败，或所有候选详情页都请求失败
+                （只要有至少一个详情页被成功处理过，单个详情页的请求错误会
+                被吞掉记作 404/失败跳过，不会向上抛出）。
+        """
         client = self._client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         pages = 1
         try:
@@ -339,4 +396,5 @@ class WebCollector(SupportsProgress):
         )
 
     async def backfill(self, source: Source) -> FetchResult:
+        """列表页采集没有「补历史」语义，直接返回已完成。"""
         return FetchResult(backfill_done=True)

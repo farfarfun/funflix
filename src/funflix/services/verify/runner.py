@@ -44,11 +44,26 @@ class RateLimiter:
     """
 
     def __init__(self, rate_per_second: float = 1.0) -> None:
+        """初始化限流器。
+
+        Args:
+            rate_per_second: 每个网盘每秒允许的最大请求数；小于等于 0 时
+                不限流。
+        """
         self._interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
         self._locks: dict[Provider, asyncio.Lock] = {}
         self._last: dict[Provider, float] = {}
 
     async def acquire(self, provider: Provider) -> None:
+        """按该网盘的令牌桶节奏阻塞等待，直到可以发起下一次请求。
+
+        同一网盘的并发调用通过各自的 `asyncio.Lock` 排队；锁与计时都绑定在
+        当前事件循环上，不能跨线程共享同一个实例（跨线程场景见
+        `BlockingRateLimiter`）。
+
+        Args:
+            provider: 即将请求的网盘类型。
+        """
         if self._interval <= 0:
             return
         lock = self._locks.setdefault(provider, asyncio.Lock())
@@ -71,6 +86,12 @@ class BlockingRateLimiter:
     """
 
     def __init__(self, rate_per_second: float = 1.0) -> None:
+        """初始化限流器。
+
+        Args:
+            rate_per_second: 每个网盘每秒允许的最大请求数；小于等于 0 时
+                不限流。
+        """
         self._interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
         self._dict_lock = threading.Lock()
         self._locks: dict[Provider, threading.Lock] = {}
@@ -85,6 +106,15 @@ class BlockingRateLimiter:
             return lock
 
     def acquire(self, provider: Provider) -> None:
+        """按该网盘的令牌桶节奏阻塞等待，直到可以发起下一次请求。
+
+        用 `threading.Lock` + `time.monotonic()` 实现，可在多线程间共享
+        同一个实例，使"每个网盘每秒最多几次请求"在全部处理单元线程间
+        全局生效。
+
+        Args:
+            provider: 即将请求的网盘类型。
+        """
         if self._interval <= 0:
             return
         with self._lock_for(provider):
@@ -97,6 +127,8 @@ class BlockingRateLimiter:
 
 @dataclass(slots=True)
 class VerifyReport:
+    """一次资源校验的结果报告：校验前后的状态、结论细节与耗时。"""
+
     resource_id: uuid.UUID
     status: CheckStatus
     before: CheckStatus
@@ -105,6 +137,7 @@ class VerifyReport:
 
     @property
     def changed(self) -> bool:
+        """本次校验结论是否与校验前的状态不同。"""
         return self.status is not self.before
 
 

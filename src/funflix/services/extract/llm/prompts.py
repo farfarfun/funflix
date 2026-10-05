@@ -130,5 +130,15 @@ TOOL_SCHEMA: dict[str, Any] = {
 
 
 def build_user_message(content: str, link_lines: list[str]) -> str:
+    """把原文与已扫描到的链接行拼进 `USER_TEMPLATE`，生成发给模型的 user 消息。
+
+    Args:
+        content: 原始分享文案全文。
+        link_lines: 带序号的链接行（见 `format_link_lines`）；为空列表时
+            用 `NO_LINKS_PLACEHOLDER` 占位，提示模型原文中没有可用链接。
+
+    Returns:
+        拼装好的完整 user 消息文本。
+    """
     links = "\n".join(link_lines) if link_lines else NO_LINKS_PLACEHOLDER
     return USER_TEMPLATE.format(content=content, links=links, tool=TOOL_NAME)

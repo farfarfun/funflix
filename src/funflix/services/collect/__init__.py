@@ -1,3 +1,5 @@
+"""采集模块对外入口：统一导出采集器协议、注册表查询与运行时触发接口。"""
+
 from funflix.services.collect.base import CollectedMessage, Collector, FetchResult
 from funflix.services.collect.registry import (
     detect_source,

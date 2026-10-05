@@ -22,6 +22,13 @@ if TYPE_CHECKING:
 
 
 class Source(TimestampMixin, Base):
+    """一个可持续拉取的采集源，并持有它的采集水位与调度状态。
+
+    唯一性按 `identifier`（规范化后的频道名/文档 ID）判定而不是 `url`，
+    同一个源有多种 URL 写法。采集只取水位之后的新消息，写成 RawDocument
+    后职责即结束，解析由下游任务接手。
+    """
+
     __tablename__ = "source"
 
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)

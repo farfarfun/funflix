@@ -60,6 +60,12 @@ def classify(payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
 
 
 class AlipanProbe(AnonymousHttpProbe):
+    """阿里云盘匿名探针：调用 `get_share_by_anonymous` 接口判断分享是否可用。
+
+    免登录，直接 POST 分享详情接口；失效/需要提取码/限流的判定逻辑见
+    模块级 `classify` 函数。
+    """
+
     name = "alipan-anon-v1"
     provider = Provider.ALIPAN
 
@@ -67,7 +73,16 @@ class AlipanProbe(AnonymousHttpProbe):
     referer = "https://www.alipan.com/"
 
     def build_payload(self, ref: LinkRef) -> dict[str, Any]:
+        """构造探测请求体，只需要分享 ID。
+
+        Args:
+            ref: 待校验的链接引用。
+
+        Returns:
+            包含 `share_id` 的请求体。
+        """
         return {"share_id": ref.share_id}
 
     def classify(self, payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
+        """委托给模块级 `classify` 函数解析响应。"""
         return classify(payload, http_code)

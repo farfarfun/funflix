@@ -569,6 +569,14 @@ def extract_category(text: str) -> str | None:
 
 
 def extract_quality(text: str) -> Quality:
+    """从文本中识别画质档位，按 4K / 1080P / 720P / 标清的顺序依次匹配，取先命中者。
+
+    Args:
+        text: 待识别的原始文本（标题或正文均可）。
+
+    Returns:
+        识别到的画质档位；未命中任何关键词时返回 `Quality.UNKNOWN`。
+    """
     lowered = unicodedata.normalize("NFKC", text).lower()
     if re.search(r"\b(4k|2160p|8k)\b|4k|超清|蓝光原盘", lowered):
         return Quality.UHD_4K

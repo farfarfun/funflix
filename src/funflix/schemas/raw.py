@@ -39,6 +39,8 @@ class RawDocumentCreate(BaseModel):
 
 
 class RawDocumentBatchCreate(BaseModel):
+    """批量提交原始文本。至少一条，上限由 `Settings.ingest_max_batch` 在服务层校验。"""
+
     items: list[RawDocumentCreate] = Field(min_length=1)
 
 
@@ -52,6 +54,8 @@ class IngestResult(BaseModel):
 
 
 class BatchIngestResult(BaseModel):
+    """批量摄入结果。`total = created + duplicated`，`items` 与入参逐条对应。"""
+
     total: int
     created: int
     duplicated: int
@@ -59,6 +63,8 @@ class BatchIngestResult(BaseModel):
 
 
 class RawDocumentOut(BaseModel):
+    """一条原始文本的完整出参，含全文与抽取状态（`RawDocumentSummary` 是它的精简版）。"""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID

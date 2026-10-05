@@ -23,6 +23,13 @@ UNKNOWN_YEAR = 0
 
 
 class Media(TimestampMixin, Base):
+    """归一后的作品。多条来源、多个网盘链接最终都挂到同一行上。
+
+    身份由 `uq_media_identity`（`norm_key` + `media_type` + `year`）唯一确定，
+    `title` 只是展示用的；年份未知时 `year` 写 `UNKNOWN_YEAR`（0）而不是 NULL，
+    理由见 `UNKNOWN_YEAR` 的注释。
+    """
+
     __tablename__ = "media"
 
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
@@ -66,4 +73,10 @@ class Media(TimestampMixin, Base):
 
     @property
     def year_or_none(self) -> int | None:
+        """年份，未知时返回 None 而不是哨兵值 0。
+
+        Returns:
+            真实年份；`year` 等于 `UNKNOWN_YEAR` 时返回 None。对外输出（API、
+            CLI 展示）一律用这个，别直接读 `year`，否则会显示成"0 年"。
+        """
         return None if self.year == UNKNOWN_YEAR else self.year

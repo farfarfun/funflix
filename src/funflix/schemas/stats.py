@@ -6,6 +6,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class PipelineStatsOut(BaseModel):
+    """整条流水线各环节的记录数快照，字段与 `services.stats.PipelineStats` 一一对应。
+
+    `*_by_*` 都是分组计数（键是枚举值字符串），供 `funflix status` 与运维页展示。
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     sources_total: int

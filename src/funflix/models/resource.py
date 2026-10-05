@@ -19,6 +19,13 @@ if TYPE_CHECKING:
 
 
 class Resource(TimestampMixin, Base):
+    """一条网盘资源：链接本体 + 资源描述 + 最新一次校验结论。
+
+    全局去重锚点是 `(provider, share_id)` 而不是 `url`——同一份分享的 URL
+    写法会变（协议、子域名、追踪参数）。重解析会整表清空重建，因此这里只存
+    "最新结论"，完整的校验时序在 `models/check.py` 里。
+    """
+
     __tablename__ = "resource"
 
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)

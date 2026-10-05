@@ -212,7 +212,11 @@ class BackfillPageTotals:
 
 @dataclass(slots=True)
 class CollectPipelineResult:
+    """`run_collect_pipeline` 跑完一整轮并发采集后的汇总结果。"""
+
+    #: 按源汇总的整源任务报告：`(源标识, CollectReport)`。
     reports: list[tuple[str, CollectReport]] = field(default_factory=list)
+    #: Telegram 并发翻页补历史任务的全局汇总（不区分源，理由见 `BackfillPageTotals`）。
     backfill_pages: BackfillPageTotals = field(default_factory=BackfillPageTotals)
 
 
@@ -331,6 +335,17 @@ class _CollectProducer(BaseProducer):
         limit: int | None = None,
         name: str | None = None,
     ) -> None:
+        """初始化生产者。
+
+        Args:
+            output_queue: `funworker.Pipeline` 传入的生产者输出队列。
+            settings: 数据库等配置，用于在 `on_start()` 里现造专属引擎。
+            source_id: 指定时只扫描这一个源（单源触发）；为 None 时按优先级
+                扫描全部启用的源。
+            batch_size: 每轮从数据库按 ID 批量取多少个源来规划任务。
+            limit: 单次运行累计最多规划的任务数上限，None 表示不限。
+            name: 传给 `funworker.BaseProducer` 的线程名。
+        """
         super().__init__(output_queue, name=name)
         self.settings = settings
         self.source_id = source_id
@@ -338,6 +353,7 @@ class _CollectProducer(BaseProducer):
         self.limit = limit
 
     def on_start(self) -> None:
+        """线程启动时现造专属事件循环 + 数据库引擎，并预取待扫描的源 ID 顺序。"""
         self._aio_loop = asyncio.new_event_loop()
         self._engine = create_engine(self.settings)
         self._sessionmaker = async_sessionmaker(
@@ -350,10 +366,12 @@ class _CollectProducer(BaseProducer):
         self._single_done = False
 
     def on_stop(self) -> None:
+        """线程停止时释放数据库引擎并关闭专属事件循环。"""
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
     def produce(self) -> Any:
+        """吐出下一个待处理任务；缓冲区和待扫源都耗尽时抛 `StopIteration` 结束生产。"""
         if not self._buffer and not self._exhausted:
             if self.limit is not None and self._produced >= self.limit:
                 #: 已经规划够 `limit` 个任务了——这一次 collect 到此为止，不再扫
@@ -458,14 +476,26 @@ class _CollectProcessor(BaseProcessor):
     """并发跑 HTTP 抓取 + 解析，不碰数据库。"""
 
     def on_start(self) -> None:
+        """线程启动时现造专属事件循环 + 共享的 HTTP 客户端（不碰数据库）。"""
         self._aio_loop = asyncio.new_event_loop()
         self._client = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
 
     def on_stop(self) -> None:
+        """线程停止时关闭 HTTP 客户端和专属事件循环。"""
         self._aio_loop.run_until_complete(self._client.aclose())
         self._aio_loop.close()
 
     def process(self, item: Any) -> Any:
+        """处理单元线程池的入口：按任务类型分发到对应的异步处理逻辑。
+
+        Args:
+            item: 生产者吐出的任务，可能是 `_ErrorJob`、`_TelegramPageJob` 或
+                `_OpaqueJob`。
+
+        Returns:
+            对应类型的处理结果（`_ErrorJob` 原样透传、`_PageResult` 或
+            `_OpaqueResult`），交给消费者落库。
+        """
         return self._aio_loop.run_until_complete(self._process(item))
 
     async def _process(self, item: Any) -> Any:
@@ -524,6 +554,15 @@ class _CollectConsumer(BaseBatchConsumer):
         flush_interval: float = 10.0,
         name: str | None = None,
     ) -> None:
+        """初始化消费者。
+
+        Args:
+            input_queue: `funworker.Pipeline` 传入的消费者输入队列。
+            settings: 数据库等配置，用于在 `on_start()` 里现造专属引擎。
+            write_batch: 攒够多少条处理结果就批量落库一次。
+            flush_interval: 即便没攒够 `write_batch` 条，最长间隔多少秒也要落库一次。
+            name: 传给 `funworker.BaseBatchConsumer` 的线程名。
+        """
         super().__init__(
             input_queue, batch_size=write_batch, batch_timeout=flush_interval, name=name
         )
@@ -532,6 +571,7 @@ class _CollectConsumer(BaseBatchConsumer):
         self.page_totals = BackfillPageTotals()
 
     def on_start(self) -> None:
+        """线程启动时现造专属事件循环 + 数据库引擎。"""
         self._aio_loop = asyncio.new_event_loop()
         self._engine = create_engine(self.settings)
         self._sessionmaker = async_sessionmaker(
@@ -539,10 +579,17 @@ class _CollectConsumer(BaseBatchConsumer):
         )
 
     def on_stop(self) -> None:
+        """线程停止时释放数据库引擎并关闭专属事件循环。"""
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
     def consume_batch(self, items: list[Any]) -> None:
+        """`BaseBatchConsumer` 攒够一批（或超时）后回调：把这批处理结果一次性落库。
+
+        Args:
+            items: 本批待落库的处理结果，元素类型为 `_ErrorJob`、`_PageResult`
+                或 `_OpaqueResult` 的混合。
+        """
         self._aio_loop.run_until_complete(self._flush_batch(items))
 
     async def _flush_batch(self, items: list[Any]) -> None:

@@ -42,6 +42,30 @@ _BACKFILL_TIME_BUDGET = timedelta(minutes=5)
 
 @dataclass(slots=True)
 class CollectReport:
+    """`collect_source` 一次调用的执行结果汇总，供调用方记录日志/指标。
+
+    追新与补历史的计数分开统计：`fetched`/`created`/`duplicated`/
+    `skipped_empty` 对应追新阶段，`backfilled`/`backfill_created` 对应补
+    历史阶段。`error` 非空表示本轮在某一步失败，此时其余字段可能只是失败
+    前已完成部分的中间状态，而非完整结果。
+
+    Attributes:
+        source_id: 被采集的 Source 主键。
+        fetched: 追新阶段采集器返回的消息总数。
+        created: 追新阶段新写入 raw_document 的条数。
+        duplicated: 追新阶段命中去重、未新建记录的条数。
+        skipped_empty: 追新阶段因正文为空被跳过落库的条数。
+        pages_fetched: 追新阶段消耗的请求/翻页数。
+        truncated: 追新是否因翻页上限提前收工（还有未取到的新消息）。
+        cursor_before: 本轮开始前的高水位（`source.cursor_message_id`）。
+        cursor_after: 本轮结束后的高水位；失败或未推进时与 `cursor_before` 相同。
+        backfilled: 补历史阶段采集器返回的消息总数。
+        backfill_created: 补历史阶段新写入的条数。
+        backfill_cursor: 补历史阶段结束后的低水位。
+        backfill_done: 历史是否已经补完。
+        error: 本轮失败原因；None 表示成功。
+    """
+
     source_id: uuid.UUID
     fetched: int = 0
     created: int = 0
@@ -60,6 +84,7 @@ class CollectReport:
 
     @property
     def ok(self) -> bool:
+        """本轮采集是否成功（即没有记录任何错误）。"""
         return self.error is None
 
 

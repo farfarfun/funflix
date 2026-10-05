@@ -89,6 +89,19 @@ class _VerifyProducer(BaseProducer):
         recheck_all: bool,
         name: str | None = None,
     ) -> None:
+        """初始化生产者。
+
+        Args:
+            output_queue: funworker 的输出队列，翻页读到的待校验资源经此发给
+                处理单元线程池。
+            settings: 数据库等运行配置，`on_start` 建立专属引擎时使用。
+            limit: 本次最多产出的资源条数；None 表示不限，翻页到没有更多
+                待校验资源为止。
+            batch_size: 每次翻页查询的条数。
+            recheck_all: True 时忽略 `next_check_at`，把所有可校验 provider
+                的资源都当成待处理（强制全量复查）；False 时只取到期的。
+            name: 线程名，透传给 `BaseProducer`。
+        """
         super().__init__(output_queue, name=name)
         self.settings = settings
         self.limit = limit
@@ -96,6 +109,7 @@ class _VerifyProducer(BaseProducer):
         self.recheck_all = recheck_all
 
     def on_start(self) -> None:
+        """线程启动时建立专属事件循环、数据库引擎，并重置翻页游标。"""
         self._aio_loop = asyncio.new_event_loop()
         self._engine = create_engine(self.settings)
         self._sessionmaker = async_sessionmaker(
@@ -110,10 +124,19 @@ class _VerifyProducer(BaseProducer):
         self._exhausted = False
 
     def on_stop(self) -> None:
+        """线程退出前释放数据库引擎并关闭事件循环。"""
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
     def produce(self) -> Any:
+        """吐出下一条待校验资源；本地缓冲区空了就同步翻一页。
+
+        Returns:
+            描述一条待校验资源的字典（resource_id/provider/share_id/url/passcode）。
+
+        Raises:
+            StopIteration: 已翻到最后一页且缓冲区为空，流水线生产端结束。
+        """
         if not self._buffer and not self._exhausted:
             self._aio_loop.run_until_complete(self._fetch_page())
         if not self._buffer:
@@ -168,13 +191,21 @@ class _VerifyProcessor(BaseProcessor):
     """并发跑 `probe.check()`，不碰数据库。"""
 
     def __init__(self, *, rate_limiter: BlockingRateLimiter) -> None:
+        """初始化处理单元。
+
+        Args:
+            rate_limiter: 所有处理单元线程共享的同一个限流器实例，用来让
+                "每个网盘每秒最多几次请求"在全局（而非单线程）生效。
+        """
         self.rate_limiter = rate_limiter
 
     def on_start(self) -> None:
+        """线程启动时建立专属事件循环，并初始化本线程的探针缓存。"""
         self._aio_loop = asyncio.new_event_loop()
         self._probe_cache: dict[Provider, LinkProbe | None] = {}
 
     def on_stop(self) -> None:
+        """线程退出前关闭本线程缓存的每个探针持有的 HTTP 连接池。"""
         # 探针的 httpx client 在 on_start 之后惰性建、线程存活期内一直复用
         # （见 base.py::AnonymousHttpProbe），线程退出前得显式关掉，不然连接池泄漏。
         for probe in self._probe_cache.values():
@@ -189,6 +220,18 @@ class _VerifyProcessor(BaseProcessor):
         return self._probe_cache[provider]
 
     def process(self, item: dict[str, Any]) -> Any:
+        """对一条待校验资源执行限流 + 探测。
+
+        没有对应探针时直接判 UNSUPPORTED，不发起请求。探针 `check` 本身已经
+        兜底了自己的异常，这里再加一层防御性 try/except，防止未来新探针
+        漏掉兜底时把整条流水线拖垮。
+
+        Args:
+            item: `_VerifyProducer.produce` 吐出的待校验资源字典。
+
+        Returns:
+            包含 `resource_id`、探测结论 `outcome`、探针标识 `probe_name` 的字典。
+        """
         provider = item["provider"]
         probe = self._probe_for(provider)
         if probe is None:
@@ -234,6 +277,16 @@ class _VerifyConsumer(BaseBatchConsumer):
         flush_interval: float = 10.0,
         name: str | None = None,
     ) -> None:
+        """初始化消费者。
+
+        Args:
+            input_queue: funworker 的输入队列，处理单元的探测结果经此发来。
+            settings: 数据库等运行配置，`on_start` 建立专属引擎时使用。
+            write_batch: 攒够多少条触发一次批量落库。
+            flush_interval: 距上次落库超过多少秒也触发一次批量落库（秒），
+                即便还没攒够 `write_batch` 条。
+            name: 线程名，透传给 `BaseBatchConsumer`。
+        """
         super().__init__(
             input_queue, batch_size=write_batch, batch_timeout=flush_interval, name=name
         )
@@ -241,6 +294,7 @@ class _VerifyConsumer(BaseBatchConsumer):
         self.reports: list[VerifyReport] = []
 
     def on_start(self) -> None:
+        """线程启动时建立专属事件循环和数据库引擎。"""
         self._aio_loop = asyncio.new_event_loop()
         self._engine = create_engine(self.settings)
         self._sessionmaker = async_sessionmaker(
@@ -248,10 +302,16 @@ class _VerifyConsumer(BaseBatchConsumer):
         )
 
     def on_stop(self) -> None:
+        """线程退出前释放数据库引擎并关闭事件循环。"""
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
     def consume_batch(self, items: list[dict[str, Any]]) -> None:
+        """批量落库一批探测结果（同步入口，内部转发给异步实现）。
+
+        Args:
+            items: `_VerifyProcessor.process` 产出的结果字典列表。
+        """
         self._aio_loop.run_until_complete(self._flush_batch(items))
 
     async def _flush_batch(self, items: list[dict[str, Any]]) -> None:
@@ -324,6 +384,7 @@ def run_verify_pipeline(
     rate_limiter = BlockingRateLimiter(rate_per_second=rate)
 
     def processor_factory() -> _VerifyProcessor:
+        """构造处理单元实例，闭包捕获所有线程共享的 `rate_limiter`。"""
         return _VerifyProcessor(rate_limiter=rate_limiter)
 
     pipeline = Pipeline.build(

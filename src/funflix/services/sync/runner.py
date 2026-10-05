@@ -40,6 +40,15 @@ _CHUNK_SIZE = 500
 
 @dataclass(slots=True)
 class TableSyncResult:
+    """单张表一次同步（`_apply_rows`）的结果。
+
+    Attributes:
+        table: 表名。
+        fetched: 按水位从源库拉取到的行数。
+        applied: 成功 upsert 到目标库的行数。
+        skipped_conflicts: 因业务唯一键冲突等原因被跳过、未写入的行数。
+    """
+
     table: str
     fetched: int = 0
     applied: int = 0
@@ -48,14 +57,18 @@ class TableSyncResult:
 
 @dataclass(slots=True)
 class SyncReport:
+    """一次 `pull`/`push` 的汇总结果，按表记录每张表各自的同步情况。"""
+
     tables: list[TableSyncResult] = field(default_factory=list)
 
     @property
     def total_applied(self) -> int:
+        """全部表 `applied` 行数之和。"""
         return sum(t.applied for t in self.tables)
 
     @property
     def total_skipped(self) -> int:
+        """全部表 `skipped_conflicts` 行数之和。"""
         return sum(t.skipped_conflicts for t in self.tables)
 
 

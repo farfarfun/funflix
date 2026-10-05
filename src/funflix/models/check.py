@@ -24,6 +24,12 @@ from funflix.models.base import Base, PkType, UTCDateTime, utcnow, uuid7
 
 
 class LinkCheck(Base):
+    """一次链接校验的留档。只追加不更新，用 `(provider, share_id)` 锚定链接身份。
+
+    没有指向 `resource` 的外键，也不随 resource 重建而删除——校验历史是整条
+    流水线里成本最高的数据（每条都要真实探测网盘接口）。
+    """
+
     __tablename__ = "link_check"
 
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)

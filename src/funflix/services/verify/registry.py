@@ -22,11 +22,25 @@ _REGISTRY: dict[Provider, Callable[[], LinkProbe]] = {
 
 
 def get_probe(provider: Provider) -> LinkProbe | None:
+    """按网盘类型创建对应的探针实例。
+
+    Args:
+        provider: 网盘类型。
+
+    Returns:
+        该网盘注册的探针实例；未注册时返回 `None`（而不是抛异常），由调用方
+        据此把结论判成 UNSUPPORTED。
+    """
     factory = _REGISTRY.get(provider)
     return factory() if factory else None
 
 
 def supported_providers() -> list[Provider]:
+    """列出当前已注册探针、可以被校验的网盘类型。
+
+    Returns:
+        按枚举值排序后的网盘列表。
+    """
     return sorted(_REGISTRY, key=lambda p: p.value)
 
 

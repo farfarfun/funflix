@@ -28,6 +28,12 @@ class SourceCreate(BaseModel):
 
 
 class SourceUpdate(BaseModel):
+    """修改采集源。全部字段可选，只更新显式传了的那些。
+
+    `url` 与 `source_type` 不在其中：改地址等于换一个源，应该新建而不是原地改，
+    否则已采集的历史会挂在一个指向别处的源上。
+    """
+
     title: str | None = None
     enabled: bool | None = None
     fetch_interval_seconds: int | None = Field(default=None, ge=30, le=86400)
@@ -37,6 +43,11 @@ class SourceUpdate(BaseModel):
 
 
 class SourceOut(BaseModel):
+    """采集源出参：配置、水位、调度状态与累计战绩。
+
+    末尾几个计数字段不是 ORM 列，由 API 层拼装（见 `api/v1/sources.py::_with_stats`）。
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID

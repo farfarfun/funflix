@@ -69,7 +69,16 @@ class LinkProbe(Protocol):
     #: 是否需要登录凭证。匿名探针为 False。
     needs_auth: bool
 
-    async def check(self, ref: LinkRef) -> CheckOutcome: ...
+    async def check(self, ref: LinkRef) -> CheckOutcome:
+        """探测给定链接当前是否可用。
+
+        Args:
+            ref: 待校验的链接引用。
+
+        Returns:
+            本次探测得出的结论。
+        """
+        ...
 
 
 class AnonymousHttpProbe:
@@ -105,6 +114,14 @@ class AnonymousHttpProbe:
     method: str = "POST"
 
     def __init__(self, client: Any = None, timeout: float = 15.0) -> None:
+        """初始化探针。
+
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时探针会在首次请求前
+                惰性创建自己的 client，并在 `aclose` 时负责关闭它。
+            timeout: 自建 client 时使用的请求超时（秒）；传入外部 client 时
+                不生效，超时由外部 client 自己的配置决定。
+        """
         self._client = client
         self._owns_client = client is None
         self._timeout = timeout
@@ -147,6 +164,20 @@ class AnonymousHttpProbe:
         raise NotImplementedError
 
     async def check(self, ref: LinkRef) -> CheckOutcome:
+        """发起一次 HTTP 请求并把响应翻译成校验结论。
+
+        处理顺序：HTTP 429 直接判 RATE_LIMITED；响应体不是 JSON 或不是 JSON
+        对象时判 ERROR（多半是错误页/验证码页，不构成关于链接本身的结论）；
+        其余情况交给 `_classify_safely`（进而调用子类的 `classify`）解析。
+        网络异常（`httpx.HTTPError`）以及解析逻辑自身抛出的异常也都兜底成
+        ERROR，绝不升级成 INVALID，避免探针故障把整库资源误杀。
+
+        Args:
+            ref: 待校验的链接引用。
+
+        Returns:
+            本次探测得出的结论，`latency_ms` 字段会被填上本次请求耗时。
+        """
         import httpx
 
         client = self._get_client()

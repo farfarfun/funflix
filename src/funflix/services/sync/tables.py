@@ -42,6 +42,15 @@ JOB_TABLES: dict[str, tuple[str, ...]] = {
 
 @dataclass(slots=True, frozen=True)
 class SyncTable:
+    """一张参与同步的表及其同步所需的反射信息，由 `sync_tables` 生成。
+
+    Attributes:
+        table: 对应的 SQLAlchemy 表对象。
+        watermark_column: 用于增量拉取与 upsert 冲突判定的水位列名，取自
+            `_WATERMARK_CANDIDATES`（updated_at/created_at/checked_at 之一）。
+        mutable: 见下方字段注释。
+    """
+
     table: sa.Table
     watermark_column: str
     #: 有 updated_at 的表按"可变状态"处理：upsert 冲突时按水位线做

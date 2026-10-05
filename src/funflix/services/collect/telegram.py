@@ -75,6 +75,11 @@ class _ChannelPageParser(HTMLParser):
     """
 
     def __init__(self, channel: str) -> None:
+        """初始化解析状态机。
+
+        Args:
+            channel: 频道名（不带 `@`/域名），用于拼回每条消息的 `https://t.me/...` 链接。
+        """
         super().__init__(convert_charrefs=True)
         self.channel = channel
         self.messages: list[CollectedMessage] = []
@@ -133,6 +138,14 @@ class _ChannelPageParser(HTMLParser):
     # --- HTMLParser 回调 ---
 
     def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        """逐标签推进状态机。
+
+        依次识别：消息容器（`data-post`，开启一条新消息，顺带 flush 掉上一条
+        未正常闭合的）；「回复引用」块（内容不计入正文，按开启它的标签名配对
+        闭合）；正文 div（并维护其嵌套深度）；正文内指向站外的 `<a>` 链接
+        （输出 href 本身并抑制其锚文本，直到对应 `</a>`，因为 Telegram 会截断
+        显示长链接）；消息发布时间 `<time datetime>`；以及频道标题容器的开始。
+        """
         attrs = {k: (v or "") for k, v in attrs_list}
 
         if self._a_suppress and tag not in _VOID_TAGS:
@@ -191,12 +204,20 @@ class _ChannelPageParser(HTMLParser):
             self._in_title = True
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """处理自闭合标签：`br` 直接换行，其余委托给 `handle_starttag` 处理。"""
         if tag == "br":
             self._emit("\n")
         else:
             self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
+        """与 `handle_starttag` 对应的收尾处理。
+
+        依次维护：外链锚文本的抑制状态（`</a>` 结束抑制）；标题容器的开关；
+        「回复引用」块的嵌套深度（归零时解除引用状态，若引用块本身是用 div
+        开启的还需联动扣减消息嵌套深度）；以及正文/消息容器的嵌套深度，
+        深度归零时分别关闭正文状态、或调用 `_flush_message` 产出这条消息。
+        """
         if self._a_suppress:
             if tag == "a" and self._a_depth == 0:
                 self._a_suppress = False
@@ -226,11 +247,15 @@ class _ChannelPageParser(HTMLParser):
                 self._flush_message()
 
     def handle_data(self, data: str) -> None:
+        """标题容器内捕获首个非空文本作为频道标题；其余文本若处于正文、且不在
+        回复引用块或被抑制的外链锚文本内，追加进当前消息正文。
+        """
         if self._in_title and self.title is None and data.strip():
             self.title = data.strip()
         self._emit(data)
 
     def close(self) -> None:
+        """解析结束后补 flush 最后一条消息，避免末条因 HTML 未正常闭合而丢失。"""
         super().close()
         self._flush_message()
 
@@ -289,18 +314,38 @@ def plan_backfill_pages(
 
 
 class TelegramChannelCollector(SupportsProgress):
+    """Telegram 频道采集器：走公开 Web 预览页，无需 Bot Token。
+
+    追新按 `?before=` 从最新页往回翻直到追上水位；补历史按 `?before=` 从
+    低水位继续往更早翻。两者共用同一套页面解析逻辑 `parse_channel_page`。
+    """
+
     name = "telegram-web-preview-v1"
     #: 最后问。它的模式能匹配任意裸标识串（"某频道名" 也算命中），
     #: 先问就会把腾讯文档的 URL 一起抢走。
     detect_priority = 900
 
     def __init__(self, client: httpx.AsyncClient | None = None, page_delay: float = 1.0) -> None:
+        """
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时各方法自行创建并关闭。
+            page_delay: 相邻两次翻页请求之间的睡眠秒数，避免过快请求被限流。
+        """
         self._client = client
         self._owns_client = client is None
         self._page_delay = page_delay
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """从 t.me 的各种 URL 写法或裸标识中提取频道名作为 identifier。
+
+        Args:
+            url: 待识别的源地址，支持 `t.me/x`、`t.me/s/x`、`@x`、裸频道名。
+
+        Returns:
+            频道名；`t.me/s/x` 中的路径段 `s` 本身不是频道名会被剔除；
+            都不匹配时返回 None。
+        """
         candidate = url.strip()
         for pattern in _CHANNEL_PATTERNS:
             m = pattern.match(candidate)

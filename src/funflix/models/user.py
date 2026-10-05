@@ -15,6 +15,12 @@ from funflix.models.base import Base, PkType, TimestampMixin, uuid7
 
 
 class User(TimestampMixin, Base):
+    """运维区的登录账号：用户名 + bcrypt 密码哈希 + 启用标记。
+
+    不存明文密码，也不做可逆加密。停用走 `is_active` 而不是删除行，避免
+    session 里的 user_id 变成悬空引用后又被新账号复用。
+    """
+
     __tablename__ = "user"
 
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)

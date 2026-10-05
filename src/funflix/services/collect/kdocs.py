@@ -34,6 +34,7 @@ def cell_to_text(value: Any) -> str:
     parts: list[str] = []
 
     def collect(node: Any) -> None:
+        """递归收集单元格内的文本片段：优先取 `address`（超链接显示文本），否则深入字典/列表。"""
         if isinstance(node, dict):
             address = node.get("address")
             if isinstance(address, str) and address.strip():
@@ -54,6 +55,15 @@ def cell_to_text(value: Any) -> str:
 
 
 def render_record(fields: dict[str, Any], ignored_fields: set[str] | None = None) -> str:
+    """把一条多维表格记录渲染成 `字段名：值` 按行拼接的文本。
+
+    Args:
+        fields: 记录的字段名到原始单元格值的映射。
+        ignored_fields: 要跳过的字段名（如附件类型字段，其值不是可读文本）。
+
+    Returns:
+        渲染后的多行文本；值为空的字段不会单独成行。
+    """
     lines: list[str] = []
     for label, cell in fields.items():
         if ignored_fields and label in ignored_fields:
@@ -65,17 +75,42 @@ def render_record(fields: dict[str, Any], ignored_fields: set[str] | None = None
 
 
 class KDocsCollector(SupportsProgress):
+    """金山文档多维表格（kdocs.cn 的表格类文档）采集器。
+
+    多维表格可以有多个 sheet，每个 sheet 的行 ID 不单调（会被用户随时插入/
+    删除），没法像 Telegram 那样用单一水位判断"有没有新内容"，所以水位状态
+    按 sheet 分别记录：`_OFFSETS_KEY`（未读完的翻页游标）、`_TAILS_KEY`（已
+    读完的 sheet 下次续读的起点）、`_TOTALS_KEY`（上次看到的行数，行数增长
+    说明有新增行）、`_DONE_KEY`（已经读到表尾的 sheet 集合）。
+    """
+
     name = "kdocs-database-v1"
     detect_priority = 15
 
     def __init__(self, client: httpx.AsyncClient | None = None, page_delay: float = 0.1) -> None:
+        """初始化采集器。
+
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时按次创建并在用完后关闭。
+            page_delay: 补历史翻页之间的等待秒数，避免请求过于密集。
+        """
         self._client = client
         self._owns_client = client is None
         self._page_delay = page_delay
+        #: `fetch()` 里拉到的 sheet 元信息缓存，供同一轮 `backfill()` 复用，
+        #: 避免重复请求 `listSheets`。
         self._sheets: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """从 kdocs.cn 分享链接提取文档 ID。
+
+        Args:
+            url: 待识别的地址，需形如 `https://www.kdocs.cn/l/<id>`。
+
+        Returns:
+            识别成功时返回文档 ID；不匹配时返回 None。
+        """
         match = _LINK_RE.match(url.strip())
         return match.group("id") if match else None
 
@@ -228,6 +263,19 @@ class KDocsCollector(SupportsProgress):
         )
 
     async def backfill(self, source: Source) -> FetchResult:
+        """继续翻 `fetch()` 遗留下来的未读完 sheet，直到翻完或撞到页数预算。
+
+        每轮最多翻 `source.max_pages_per_fetch` 页记录（跨 sheet 累计），一个
+        sheet 翻完就从 `offsets` 里摘掉、标记进 `done`，再轮到下一个未读完的
+        sheet；全部摘完后 `backfill_done=True`。
+
+        Args:
+            source: 待补历史的 KDocs 源。
+
+        Returns:
+            本轮翻页取到的消息及更新后的翻页状态；若上轮没有遗留的未读 sheet，
+            直接返回空结果并置 `backfill_done=True`。
+        """
         offsets: dict[str, str] = dict(source.extra.get(_OFFSETS_KEY) or {})
         tails: dict[str, str] = dict(source.extra.get(_TAILS_KEY) or {})
         totals: dict[str, int] = dict(source.extra.get(_TOTALS_KEY) or {})

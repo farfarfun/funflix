@@ -50,6 +50,23 @@ def _one_line(value: Any) -> str:
 
 
 def format_resource(payload: Any) -> str:
+    """把人人影视资源详情 JSON 渲染成「字段：值」的多行文本。
+
+    遍历资源的每个季（`data.list`）、每种格式（`items`）、每个条目的有效
+    下载地址（`files`，要求有 `address`），为每个下载地址各输出一段，包含
+    名称/类型/季集/格式/文件名/大小与下载地址（附提取码）。
+
+    Args:
+        payload: `opendoc` 风格的资源详情响应，须含 `data.info`（标题等）
+            与可选的 `data.list`（分季下载信息）。
+
+    Returns:
+        渲染后的多行文本；资源没有任何有效下载地址时退化为仅含标题和年份的
+        单行文本。
+
+    Raises:
+        ValueError: `payload` 不是预期的字典结构，或解析不出标题。
+    """
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
         raise ValueError("人人影视资源数据格式无效")
     data = payload["data"]
@@ -194,15 +211,40 @@ def _comment_messages(payload: Any, base_url: str) -> tuple[list[CollectedMessag
 
 
 class YYeTsCollector(SupportsProgress):
+    """人人影视历史快照与网友评论采集器，合一处理两种互不相关的源。
+
+    「快照」源是一次性的历史数据库 ZIP（SHA1 校验，版本不变就跳过，没有
+    「补历史」语义）；「评论」源是分页 API，追新按最近出现过的评论 ID 窗口
+    去重，补历史按页码从第 2 页起往后翻，直到翻到的评论数覆盖 API 报出的
+    总数。
+    """
+
     name = "yyets-v1"
     detect_priority = 30
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        """
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时 `_get` 自行创建
+                并在结束后关闭。
+        """
         self._client = client
         self._owns_client = client is None
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """根据 URL 判断是快照地址还是评论接口地址，返回固定 identifier。
+
+        快照、评论接口各自只有一个全局地址（不按单条资源区分），所以
+        identifier 是写死的常量字符串，而不是从 url 里提取的可变片段。
+
+        Args:
+            url: 待识别的源地址。
+
+        Returns:
+            快照固定返回 `"yyets-snapshot-2021-08-22"`，评论固定返回
+            `"yyets-comments"`；都不匹配时返回 None。
+        """
         kind = _source_kind(url)
         if kind == "snapshot":
             return "yyets-snapshot-2021-08-22"
@@ -221,6 +263,26 @@ class YYeTsCollector(SupportsProgress):
                 await client.aclose()
 
     async def fetch(self, source: Source) -> FetchResult:
+        """按源类型分别处理：快照整包下载，评论只拉第一页判新。
+
+        快照：若记录的 SHA1 与当前发布版本一致则直接跳过；否则下载整个 ZIP，
+        校验 SHA1 后解出 sqlite 逐行渲染为消息（见 `_snapshot_messages`）。
+
+        评论：只请求第一页（最新 `_COMMENT_PAGE_SIZE` 条），用已记录的最近
+        评论 ID 窗口过滤出新评论；无论是否有新增，都会用本页全部评论 ID
+        滚动更新该窗口（最多保留 `_MAX_RECENT_COMMENTS` 个）。
+
+        Args:
+            source: 待采集的源，`source.url` 须是快照地址或评论接口地址。
+
+        Returns:
+            FetchResult：快照成功时 `backfill_done=True`（无历史可补）；
+            评论的 `backfill_done` 保持默认 False，由 `backfill` 翻后续页。
+
+        Raises:
+            ValueError: `source.url` 既不是快照也不是评论接口地址。
+            httpx.HTTPStatusError: 请求快照/评论接口失败。
+        """
         kind = _source_kind(source.url)
         if kind == "snapshot":
             if (source.extra or {}).get(_SNAPSHOT_STATE_KEY) == _SNAPSHOT_SHA1:
@@ -258,6 +320,18 @@ class YYeTsCollector(SupportsProgress):
         )
 
     async def backfill(self, source: Source) -> FetchResult:
+        """翻评论接口的下一页；快照没有历史可补，直接返回已完成。
+
+        从记录的页码（默认第 2 页，因为第 1 页由 `fetch` 覆盖）开始翻，
+        每次一页；翻到空页或已翻评论数覆盖 API 报出的总数即视为补完。
+
+        Args:
+            source: 待采集的源。
+
+        Returns:
+            FetchResult：快照源恒为 `backfill_done=True`；评论源返回本页
+            新消息、下一页页码（存入 `state`）与是否已补完。
+        """
         if _source_kind(source.url) != "comments":
             return FetchResult(backfill_done=True)
         try:

@@ -25,6 +25,12 @@ from funflix.services.verify.quark import classify as quark_classify
 
 
 class UCProbe(AnonymousHttpProbe):
+    """UC 网盘匿名探针：接口与业务码和夸克完全一致，直接复用夸克的判定逻辑。
+
+    区别仅在于域名（`pc-api.uc.cn`）和渠道参数（`pr=UCBrowser`），见模块
+    docstring 的实测记录。
+    """
+
     name = "uc-anon-v1"
     provider = Provider.UC
 
@@ -33,7 +39,16 @@ class UCProbe(AnonymousHttpProbe):
     referer = "https://drive.uc.cn/"
 
     def build_payload(self, ref: LinkRef) -> dict[str, Any]:
+        """构造探测请求体：分享 ID 与提取码。
+
+        Args:
+            ref: 待校验的链接引用。
+
+        Returns:
+            包含 `pwd_id`、`passcode` 的请求体。
+        """
         return {"pwd_id": ref.share_id, "passcode": ref.passcode or ""}
 
     def classify(self, payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
+        """复用夸克的 `classify`（接口与业务码与夸克完全一致）。"""
         return quark_classify(payload, http_code)

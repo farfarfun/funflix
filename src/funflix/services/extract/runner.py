@@ -55,6 +55,12 @@ SAVEPOINT_BATCH_SIZE = 20
 
 @dataclass(slots=True)
 class ParseReport:
+    """单条文档解析落库后的结果摘要：最终状态 + 各类新建/复用计数 + 错误信息。
+
+    由 `parse_document`/`persist_extracted` 等函数在落库过程中逐步填充字段，
+    调用方（CLI 进度展示、worker 统计）据此汇总一批文档的处理结果。
+    """
+
     document_id: uuid.UUID
     status: ParseStatus
     is_catalog: bool = False
@@ -72,6 +78,7 @@ class ParseReport:
 
     @property
     def ok(self) -> bool:
+        """本次解析是否成功（没有记录错误信息）。"""
         return self.error is None
 
 

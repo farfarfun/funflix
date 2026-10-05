@@ -165,6 +165,12 @@ class LLMExtractor:
     version = PROMPT_VERSION
 
     def __init__(self, client: LLMClient | None = None) -> None:
+        """构造抽取器。
+
+        Args:
+            client: 注入的 LLM 客户端；为 None 时用 `build_default_client()`
+                按 funsecret 配置构造真实客户端。单测通过传入桩实现绕开网络调用。
+        """
         self._client = client or build_default_client()
 
     @property
@@ -179,6 +185,20 @@ class LLMExtractor:
         return outcome
 
     async def extract(self, content: str) -> ExtractionOutcome:
+        """扫描原文中的链接，连同原文一起交给模型做结构化抽取，并校验模型返回值。
+
+        流程：`scan_links` 确定性地扫出所有候选链接 → 拼成带序号的 user 消息
+        （`build_user_message`）连同原文发给模型 → 模型只能按序号引用链接 →
+        `parse_payload` 校验并丢弃越界/重复归属等不合法输出。
+
+        Args:
+            content: 原始分享文案全文。
+
+        Returns:
+            `ExtractionOutcome`，其中 `extractor_name` 为实际调用的模型名，
+            `extractor_version` 固定为 `PROMPT_VERSION`，并带上本次调用的
+            token 用量与耗时。
+        """
         links = scan_links(content)
         user_message = build_user_message(content, format_link_lines(links))
 

@@ -65,6 +65,18 @@ def data_tables(keep_documents: bool = False, purge_checks: bool = False) -> lis
 
 @dataclass(slots=True)
 class ResetReport:
+    """`reset_pipeline_data` 的执行结果。
+
+    Attributes:
+        tables: 本次实际被清空（TRUNCATE/DELETE）的表名，按外键依赖倒序。
+        before: 清空前的记录数，键为表名；覆盖全部数据表，包括本次未被清空的表
+            （比如 `keep_documents=True` 时的 `raw_document`）。
+        after: 清空并重建完成后的记录数，统计口径同 `before`。
+        cursors_reset: 采集源水位是否被归零。
+        checks_purged: `link_check` 校验历史是否被一并清空。
+        documents_requeued: 因保留原始文本而被重新置回 `PENDING` 待解析状态的文档数。
+    """
+
     tables: list[str] = field(default_factory=list)
     before: dict[str, int] = field(default_factory=dict)
     after: dict[str, int] = field(default_factory=dict)
@@ -145,6 +157,8 @@ async def reset_pipeline_data(
 
 @dataclass(slots=True)
 class RelinkReport:
+    """`relink_checks` 的执行结果：从历史校验记录恢复了校验状态的 resource 数。"""
+
     hydrated: int = 0
 
 
@@ -187,6 +201,16 @@ async def relink_checks(session: AsyncSession) -> RelinkReport:
 
 @dataclass(slots=True)
 class RetagReport:
+    """`retag_all` 的执行结果。
+
+    Attributes:
+        total: 处理前库中标签总数。
+        moved: 维度判定发生变化、目标维度下尚无同名标签，直接改写 `kind` 的标签数。
+        merged: 维度变更后与目标维度下已有同名标签撞上、关联被迁移且自身被删除
+            的标签数。
+        recounted: 合并完成后 `media_count` 被重新计算并修正的标签行数。
+    """
+
     total: int = 0
     moved: int = 0
     merged: int = 0
@@ -262,6 +286,19 @@ async def requeue_now_checkable(session: AsyncSession) -> int:
 
 @dataclass(slots=True)
 class CleanupResourcesReport:
+    """`cleanup_resources` 的执行结果。
+
+    Attributes:
+        other_scanned: 扫描到的 `provider=OTHER` 资源数。
+        ctfile_found: 其中被识别为城通网盘链接的资源数。
+        ctfile_reclassified: 按 share_id 首次出现的那条，被改写为
+            `provider=CTFILE` 的资源数。
+        duplicates_merged: 同一 share_id 下除首次出现者外被判定为重复、
+            关联迁移后删除的资源数。
+        blacklisted_deleted: 被识别为非资源网页链接而删除的资源数。
+        media_recounted: 因资源被合并或删除而重新计算计数器的作品数。
+    """
+
     other_scanned: int = 0
     ctfile_found: int = 0
     ctfile_reclassified: int = 0

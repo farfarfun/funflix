@@ -20,6 +20,13 @@ if TYPE_CHECKING:
 
 
 class Extraction(TimestampMixin, Base):
+    """一次 LLM 抽取的输入标识、输出结果与开销留档。
+
+    `(raw_document_id, model, prompt_version)` 唯一：同一份文本在同一 prompt
+    版本下只会烧一次 token，改了 prompt 就必须升 `prompt_version`，否则会命中
+    旧缓存拿到过时结果。
+    """
+
     __tablename__ = "extraction"
 
     id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)

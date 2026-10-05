@@ -54,6 +54,20 @@ class RuleExtractor:
     version = VERSION
 
     async def extract(self, content: str) -> ExtractionOutcome:
+        """对原文分段，用确定性规则归一出每段的标题、年份、画质等字段并归属链接。
+
+        内部按 `segment_text` 切出候选作品段落，逐段判定是否像目录帖
+        （`_looks_like_catalog`）、清洗标题、从文本中正则提取年份/类型/画质/
+        集数/大小/标签。若全文命中"合集资源："前缀，则所有段落共享同一批链接，
+        不再按段落拆分归属。
+
+        Args:
+            content: 原始分享文案全文。
+
+        Returns:
+            `ExtractionOutcome`，`extractor_name`/`extractor_version` 固定为
+            `"rule"`/`VERSION`，`raw_payload` 留档各段落的标题与链接以便排查。
+        """
         return self._build(content)
 
     def rehydrate(self, payload: dict[str, Any], content: str) -> ExtractionOutcome:

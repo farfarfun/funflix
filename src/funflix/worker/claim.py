@@ -69,6 +69,7 @@ class Claimed(Generic[_T]):
     priors: dict[Any, Any] = field(default_factory=dict)
 
     def __len__(self) -> int:
+        """本次真正领到手的行数（不含被置终态、`abandoned` 掉的那些）。"""
         return len(self.rows)
 
 
@@ -164,6 +165,17 @@ async def claim_documents(
         conditions.append(RawDocument.source_id == source_id)
 
     def decide(status: ParseStatus, attempts: int) -> tuple[dict[str, Any], bool, bool]:
+        """给一条候选文档算出要写入的列，以及它是不是重捞/是否被置终态。
+
+        Args:
+            status: 领取前的抽取状态；`RUNNING` 说明是上一轮崩溃留下的。
+            attempts: 领取前已尝试的次数。
+
+        Returns:
+            `(要写入的列, 是否重捞, 是否置终态)`。重捞且次数已达
+            `MAX_PARSE_ATTEMPTS` 时直接置 FAILED——这类文档往往能稳定复现
+            （超长正文、畸形编码），继续重捞只会让 worker 反复自杀、堵死队列。
+        """
         is_reclaim = status is ParseStatus.RUNNING
         if is_reclaim and attempts + 1 >= MAX_PARSE_ATTEMPTS:
             # 已经崩够次数了。这类文档往往能稳定复现（超长正文、畸形编码），
@@ -248,6 +260,16 @@ async def claim_resources(
         conditions.append(Resource.provider == provider)
 
     def decide(status: CheckStatus, attempts: int) -> tuple[dict[str, Any], bool, bool]:
+        """给一条候选资源算出要写入的列，以及它是不是重捞。
+
+        Args:
+            status: 领取前的校验状态；`CHECKING` 说明是上一轮崩溃留下的。
+            attempts: 领取前已探测的次数。
+
+        Returns:
+            `(要写入的列, 是否重捞, 是否置终态)`。校验永远不置终态——探测很便宜，
+            靠退避（封顶 6 小时）压低重捞频率即可，不会变成热循环。
+        """
         is_reclaim = status is CheckStatus.CHECKING
         values: dict[str, Any] = {"check_status": CheckStatus.CHECKING, "lease_until": until}
         if is_reclaim:
@@ -296,6 +318,17 @@ async def claim_sources(
     ]
 
     def decide(lease_until: datetime | None, failures: int) -> tuple[dict[str, Any], bool, bool]:
+        """给一条候选采集源算出要写入的列，以及它是不是重捞。
+
+        Args:
+            lease_until: 领取前的租约到期时间；非 None 说明上一轮没正常收尾。
+            failures: 领取前的连续失败次数。
+
+        Returns:
+            `(要写入的列, 是否重捞, 是否置终态)`。采集源不置终态，重捞时复用
+            `consecutive_failures` 退避——崩溃和网络失败一样都该让这个源退避，
+            而不是每个周期都去踩同一个坑。
+        """
         # 有过租约又落到候选里，只可能是上一轮没能正常收尾。
         is_reclaim = lease_until is not None
         values: dict[str, Any] = {"lease_until": until}

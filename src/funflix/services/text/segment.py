@@ -47,6 +47,8 @@ class Segment:
 
 @dataclass(slots=True)
 class SegmentedText:
+    """`segment_text` 的切分结果：若干「作品 + 链接」分段，以及未能归属的链接。"""
+
     segments: list[Segment]
     #: 出现在第一个标题之前、无法归属的链接。不丢弃，交给 LLM / 人工处理。
     unattributed_links: list[ScannedLink]
@@ -55,6 +57,7 @@ class SegmentedText:
 
     @property
     def attributed_count(self) -> int:
+        """已归属到某个分段的链接总数。"""
         return sum(len(s.links) for s in self.segments)
 
 

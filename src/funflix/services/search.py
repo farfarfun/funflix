@@ -33,6 +33,9 @@ logger = getLogger("funflix")
 
 @dataclass(slots=True)
 class SearchQuery:
+    """一次搜索请求的筛选条件与分页参数，由 `LikeSearchBackend` 与
+    `PgTrgmSearchBackend` 共用。"""
+
     keyword: str = ""
     media_type: MediaType | None = None
     year: int | None = None
@@ -46,11 +49,33 @@ class SearchQuery:
 
 @runtime_checkable
 class SearchBackend(Protocol):
+    """搜索后端协议。`get_backend` 按数据库方言在实现间二选一，调用方统一走这层接口。"""
+
     name: str
 
-    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]: ...
+    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
+        """按 `query` 的关键词、筛选条件与分页参数查询匹配的作品。
 
-    async def count(self, session: AsyncSession, query: SearchQuery) -> int: ...
+        Args:
+            session: 数据库会话，用于执行查询。
+            query: 关键词、筛选条件与分页参数（`limit`/`offset`）。
+
+        Returns:
+            匹配的作品列表，长度不超过 `query.limit`，具体排序规则由实现决定。
+        """
+        ...
+
+    async def count(self, session: AsyncSession, query: SearchQuery) -> int:
+        """按与 `search` 相同的筛选条件统计匹配总数。
+
+        Args:
+            session: 数据库会话，用于执行查询。
+            query: 关键词与筛选条件；其中的 `limit`/`offset` 不参与统计。
+
+        Returns:
+            匹配的作品总数。
+        """
+        ...
 
 
 def _apply_filters(stmt: Select, query: SearchQuery) -> Select:
@@ -138,7 +163,7 @@ class PgTrgmSearchBackend:
         key = norm_key(query.keyword) or query.keyword
         return key, func.similarity(Media.norm_key, key)
 
-    def _keyword_clause(self, query: SearchQuery, key: str, similarity):
+    def _keyword_clause(self, query: SearchQuery, key: str):
         return or_(
             # 用 `%` 操作符而不是 `similarity(a, b) > 阈值`。
             #
@@ -156,11 +181,21 @@ class PgTrgmSearchBackend:
         )
 
     async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
+        """按查询条件返回匹配的媒体列表，有关键词时按相似度降序排列。
+
+        Args:
+            session: 数据库会话。
+            query: 关键词、筛选条件与分页参数。
+
+        Returns:
+            匹配的作品列表；有关键词时按 `pg_trgm` 相似度降序、再按 id 降序；
+            无关键词时仅按 id 降序。
+        """
         stmt = select(Media)
 
         if query.keyword:
             key, similarity = self._similarity(query)
-            stmt = stmt.where(self._keyword_clause(query, key, similarity))
+            stmt = stmt.where(self._keyword_clause(query, key))
             stmt = _apply_filters(stmt, query)
             stmt = stmt.order_by(similarity.desc(), Media.id.desc())
         else:
@@ -171,10 +206,19 @@ class PgTrgmSearchBackend:
         return list(await session.scalars(stmt))
 
     async def count(self, session: AsyncSession, query: SearchQuery) -> int:
+        """按与 `search` 相同的条件（含关键词的相似度/子串匹配）统计匹配总数。
+
+        Args:
+            session: 数据库会话。
+            query: 关键词与筛选条件；`limit`/`offset` 不参与统计。
+
+        Returns:
+            匹配的作品总数。
+        """
         stmt = select(func.count()).select_from(Media)
         if query.keyword:
             key, similarity = self._similarity(query)
-            stmt = stmt.where(self._keyword_clause(query, key, similarity))
+            stmt = stmt.where(self._keyword_clause(query, key))
         return await session.scalar(_apply_filters(stmt, query)) or 0
 
 
@@ -188,6 +232,15 @@ def get_backend(session_or_bind: Any) -> SearchBackend:
 
 
 async def search_media(session: AsyncSession, query: SearchQuery) -> list[Media]:
+    """按数据库方言自动选择后端（PostgreSQL 用 `pg_trgm`，其余用 `LIKE`）并执行搜索。
+
+    Args:
+        session: 数据库会话，既用于判断方言，也用于实际执行查询。
+        query: 关键词、筛选条件与分页参数。
+
+    Returns:
+        匹配的作品列表，具体排序规则由所选后端决定。
+    """
     backend = get_backend(session)
     logger.debug(f"搜索后端={backend.name} 关键词={query.keyword!r}")
     return await backend.search(session, query)

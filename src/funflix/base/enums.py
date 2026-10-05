@@ -23,6 +23,11 @@ def enum_col(py_enum: type[StrEnum], length: int = 32) -> sa.Enum:
 
 
 class SourceType(StrEnum):
+    """采集源类型，决定 `services/collect/registry.py` 挑哪个采集器。
+
+    `UNKNOWN` 是兜底值：源还没判定出类型时先入库，不阻塞采集队列。
+    """
+
     TELEGRAM = "telegram"
     TENCENT_DOCS = "tencent_docs"  # 腾讯文档 - 智能表格
     TENCENT_DOC = "tencent_doc"  # 腾讯文档 - 文本文档
@@ -37,6 +42,13 @@ class SourceType(StrEnum):
 
 
 class ParseStatus(StrEnum):
+    """原始文本的抽取状态，worker 靠它领取待解析的文本。
+
+    `RUNNING` 是领取后写入的占位值（配合租约防重复领取）；`SKIPPED` 表示
+    判定为无需抽取（例如正文里没有任何网盘链接），与 `FAILED` 区分开，
+    后者才会进重试。
+    """
+
     PENDING = "pending"
     RUNNING = "running"
     DONE = "done"
@@ -45,6 +57,8 @@ class ParseStatus(StrEnum):
 
 
 class MediaType(StrEnum):
+    """作品大类。粒度很粗，细分维度（题材/地区/年代）走 `models/tag.py` 的标签。"""
+
     MOVIE = "movie"
     TV = "tv"
     ANIME = "anime"
@@ -54,6 +68,8 @@ class MediaType(StrEnum):
 
 
 class Quality(StrEnum):
+    """资源清晰度。由 `services/text/normalize.py::extract_quality` 从标题文本归一而来。"""
+
     UHD_4K = "4k"
     FHD_1080P = "1080p"
     HD_720P = "720p"
@@ -91,6 +107,13 @@ CHECKABLE_PROVIDERS: frozenset[Provider] = frozenset(
 
 
 class CheckStatus(StrEnum):
+    """网盘链接的校验结论。
+
+    `CHECKING` 是 worker 领取后写入的占位值（配合租约防重复领取）；
+    `UNSUPPORTED` 表示该 provider 不在 `CHECKABLE_PROVIDERS` 里、根本不会去探；
+    `RATE_LIMITED` 与 `ERROR` 都表示"这次没探出结论"，要重试，不能当成失效。
+    """
+
     UNCHECKED = "unchecked"
     CHECKING = "checking"
     VALID = "valid"

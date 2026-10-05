@@ -64,6 +64,12 @@ def classify(payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
 
 
 class QuarkProbe(AnonymousHttpProbe):
+    """夸克网盘匿名探针：POST 分享页 token 接口判断分享是否可用。
+
+    这是逆向出来的私有接口，判定逻辑见模块级 `classify` 函数；UC 网盘共用
+    同一套接口和业务码，直接复用这里的 `classify`（见 `uc.py`）。
+    """
+
     name = "quark-anon-v1"
     provider = Provider.QUARK
 
@@ -72,7 +78,16 @@ class QuarkProbe(AnonymousHttpProbe):
     referer = "https://pan.quark.cn/"
 
     def build_payload(self, ref: LinkRef) -> dict[str, Any]:
+        """构造探测请求体：分享 ID 与提取码。
+
+        Args:
+            ref: 待校验的链接引用。
+
+        Returns:
+            包含 `pwd_id`、`passcode` 的请求体。
+        """
         return {"pwd_id": ref.share_id, "passcode": ref.passcode or ""}
 
     def classify(self, payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
+        """委托给模块级 `classify` 函数解析响应。"""
         return classify(payload, http_code)

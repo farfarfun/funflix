@@ -100,12 +100,14 @@ def _width(text: str) -> int:
 
 
 def _table(rows: list[list[Any]], headers: list[str]) -> None:
+    """按列宽对齐打印一张表，表头用暗色。列宽按中文占两格计算。"""
     cells = [[str(c) for c in row] for row in rows]
     widths = [
         max([_width(headers[i])] + [_width(row[i]) for row in cells]) for i in range(len(headers))
     ]
 
     def render(values: list[str]) -> str:
+        """把一行单元格按算好的列宽右侧补空格拼成一行。"""
         return "  ".join(v + " " * (widths[i] - _width(v)) for i, v in enumerate(values))
 
     _dim(render(headers))
@@ -1606,6 +1608,7 @@ def _interactive_search() -> None:
         ]
 
         def render(values: list[Any], widths: list[int] = widths) -> str:
+            """把一行单元格按列宽补齐成一行；`widths` 用默认参数绑定当前轮的列宽。"""
             return "  ".join(
                 str(v) + " " * (widths[i] - _width(str(v))) for i, v in enumerate(values)
             )

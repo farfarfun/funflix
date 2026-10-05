@@ -57,6 +57,7 @@ class ExtractionOutcome:
 
     @property
     def attributed_count(self) -> int:
+        """已归属给某部作品的链接总数（跨 `items` 累加各自的 `links` 长度）。"""
         return sum(len(item.links) for item in self.items)
 
 
@@ -73,7 +74,16 @@ class Extractor(Protocol):
     #: 版本号。prompt 或规则有任何改动都要升。
     version: str
 
-    async def extract(self, content: str) -> ExtractionOutcome: ...
+    async def extract(self, content: str) -> ExtractionOutcome:
+        """对一条原始文本做抽取，产出作品列表及各自归属的链接。
+
+        Args:
+            content: 原始分享文案全文。
+
+        Returns:
+            本次抽取的完整产出（`ExtractionOutcome`）。
+        """
+        ...
 
     def rehydrate(self, payload: dict[str, Any], content: str) -> ExtractionOutcome:
         """从留档的 payload 还原产出，不重新调用外部服务。

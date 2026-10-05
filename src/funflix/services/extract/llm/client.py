@@ -46,7 +46,20 @@ class LLMClient(Protocol):
 
     model: str
 
-    async def extract(self, system: str, user: str) -> LLMResult: ...
+    async def extract(self, system: str, user: str) -> LLMResult:
+        """用给定的 system/user 消息调用一次模型，返回结构化产出与用量信息。
+
+        Args:
+            system: system prompt，描述抽取任务与约束。
+            user: user 消息，通常是原文 + 已扫描链接清单。
+
+        Returns:
+            `LLMResult`：模型返回的工具调用参数，连同模型名、token 用量、耗时。
+
+        Raises:
+            LLMCallError: 响应结构不合法（无 choices、未调用工具、参数非法 JSON 等）。
+        """
+        ...
 
 
 def read_llm_secret(key: str) -> str:
@@ -87,6 +100,22 @@ class OpenAICompatClient:
         temperature: float = 0.0,
         max_retries: int = 2,
     ) -> None:
+        """构造客户端，未显式传入的凭证/模型/地址从 funsecret 读取。
+
+        底层 SDK 客户端（`AsyncOpenAI`）延迟到首次 `extract()` 调用时才创建，
+        这样仅构造实例（比如被缓存但始终未被调用）不会强制要求已安装 `openai` 包。
+
+        Args:
+            base_url: OpenAI 兼容网关地址；为 None 时读取 funsecret 的 `base_url`。
+            api_key: API Key；为 None 时读取 funsecret 的 `api_key`。
+            model: 模型名；为 None 时读取 funsecret 的 `model`。
+            timeout: 单次请求超时秒数。
+            temperature: 采样温度，默认 0 以保证抽取结果尽量确定。
+            max_retries: 底层 SDK 的请求失败重试次数。
+
+        Raises:
+            LLMConfigError: 对应的 funsecret 配置项未设置。
+        """
         self.base_url = base_url or read_llm_secret("base_url")
         self.model = model or read_llm_secret("model")
         self._api_key = api_key or read_llm_secret("api_key")
@@ -110,6 +139,22 @@ class OpenAICompatClient:
         return self._client
 
     async def extract(self, system: str, user: str) -> LLMResult:
+        """以强制工具调用的方式请求一次 chat completion，并解析出工具参数。
+
+        `tool_choice` 被硬编码为 `TOOL_SCHEMA` 对应的函数，不给模型"用自然语言
+        回答"的选项，保证返回值要么是合法的工具参数，要么在 `_extract_tool_arguments`
+        里按具体失败原因抛出 `LLMCallError`。
+
+        Args:
+            system: system prompt。
+            user: user 消息。
+
+        Returns:
+            `LLMResult`：解析出的工具参数 payload，连同模型名、输入/输出 token 数、耗时（毫秒）。
+
+        Raises:
+            LLMCallError: 响应中没有 choices、模型未调用工具、或工具参数不是合法 JSON 对象。
+        """
         import time
 
         client = self._ensure_client()

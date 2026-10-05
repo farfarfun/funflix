@@ -13,6 +13,8 @@ from funflix.models.tag import TagKind
 
 
 class TagOut(BaseModel):
+    """标签出参。只给维度、展示名和 ID，归一键 `norm_key` 是内部实现不外露。"""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -48,6 +50,13 @@ class ResourceOut(BaseModel):
 
 
 class ProviderVerifyReportOut(BaseModel):
+    """按网盘分组的一轮校验战报。
+
+    `claimed` 是本轮领到手的条数，`succeeded + failed` 是探出结论的部分；
+    `reclaimed` 来自上一轮租约过期被重捞回来的任务，`abandoned` 是重试
+    超限、直接置终态不再重试的条数——后两个持续大于 0 说明有 worker 在反复崩溃。
+    """
+
     provider: Provider
     claimed: int
     succeeded: int

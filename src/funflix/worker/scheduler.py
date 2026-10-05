@@ -57,6 +57,7 @@ class CycleReport:
         return self.collect.idle and self.parse.idle and self.verify.idle
 
     def summary(self) -> str:
+        """拼成一行可读战报：`采集[...] 解析[...] 校验[...]`，供轮次结束时打日志。"""
         return (
             f"采集[{self.collect.summary()}] "
             f"解析[{self.parse.summary()}] "
@@ -74,6 +75,7 @@ class StaleSummary:
 
     @property
     def total(self) -> int:
+        """三类加总。大于 0 说明上次是崩溃/被 kill 收场的，这些任务本轮会被重新领取。"""
         return self.documents + self.resources + self.sources
 
 
@@ -82,6 +84,7 @@ async def stale_summary(session: AsyncSession) -> StaleSummary:
     now = utcnow()
 
     async def count(model, *conditions) -> int:
+        """数一数某张表里满足给定条件的行数。"""
         stmt = select(func.count()).select_from(model).where(*conditions)
         return int(await session.scalar(stmt) or 0)
 
@@ -113,6 +116,7 @@ class StageCounts:
     done: int = 0
 
     def group(self) -> str:
+        """压成心跳日志里的 `待处理/处理中/已完成` 三段式。"""
         return f"{self.pending}/{self.running}/{self.done}"
 
 
@@ -125,6 +129,7 @@ class ProgressSnapshot:
     verify: StageCounts = field(default_factory=StageCounts)
 
     def line(self) -> str:
+        """拼成一行心跳日志：三条队列各自的 `待处理/处理中/已完成`。"""
         return (
             f"采集[{self.collect.group()}] 解析[{self.parse.group()}] 校验[{self.verify.group()}]"
         )
@@ -171,6 +176,7 @@ async def progress_snapshot(session: AsyncSession) -> ProgressSnapshot:
     collect_enabled, collect_running, collect_pending = (int(v or 0) for v in source_row)
 
     async def group(model: Any, column: Any) -> dict[Any, int]:
+        """按某一列分组计数，返回 `列值 -> 行数`。"""
         rows = await session.execute(
             select(column, func.count()).select_from(model).group_by(column)
         )
@@ -281,6 +287,13 @@ class Worker:
         *,
         session_factory: SessionFactory | None = None,
     ) -> None:
+        """按配置装配限流器与租约时长。
+
+        Args:
+            settings: 配置；留空取全局单例 `get_settings()`。
+            session_factory: 会话工厂，每批任务调一次、用完即关；留空用
+                `base.db.session_scope`。测试靠它注入内存库。
+        """
         self.settings = settings or get_settings()
         self._session_factory = session_factory or session_scope
         self._limiter = RateLimiter(rate_per_second=self.settings.worker_verify_rate)

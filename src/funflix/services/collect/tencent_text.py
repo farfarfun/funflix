@@ -103,6 +103,9 @@ def split_blocks(text: str, max_chars: int = _MAX_BLOCK_CHARS) -> list[str]:
     current: list[str] = []
 
     def flush() -> None:
+        """把当前累积的行拼成一个块，超过 `max_chars` 且找不到换行可切时按
+        字符硬切，切好的块依次追加进外层 `blocks`，并清空累积行供下一块使用。
+        """
         chunk = "\n".join(current).strip()
         current.clear()
         if not chunk:
@@ -125,16 +128,37 @@ def split_blocks(text: str, max_chars: int = _MAX_BLOCK_CHARS) -> list[str]:
 
 
 class TencentTextCollector(SupportsProgress):
+    """腾讯文档「文本文档」（padType=doc）采集器。
+
+    没有分页接口，一次请求即拿到全文，以文档版本号 `rev` 作为水位——版本
+    未变就整篇跳过；版本有变则按空行把全文切块，整批作为本轮消息返回。
+    没有「翻更早历史」的语义（见模块 docstring 的正文重建规则）。
+    """
+
     name = "tencent-doc-v1"
     #: 排在智能表格之后 —— 两者同域名，先问更具体的那个。
     detect_priority = 20
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        """
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时 `fetch` 自行创建
+                并在结束后关闭。
+        """
         self._client = client
         self._owns_client = client is None
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """从 `/doc/<id>` 形式的 URL 中提取文档 ID。
+
+        Args:
+            url: 待识别的源地址。
+
+        Returns:
+            文档 ID；不匹配时返回 None（`/sheet/`、`/smartsheet/` 形式的
+            智能表格交给 `TencentSheetCollector` 处理）。
+        """
         for pattern in _DOC_PATTERNS:
             match = pattern.match(url.strip())
             if match:

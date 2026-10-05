@@ -152,6 +152,17 @@ def _collect_cell_text(node: Any, out: list[str]) -> None:
 
 
 def cell_to_text(cell: Any) -> str:
+    """把一个单元格的原始数据递归抽取为可读文本。
+
+    链接型单元格（`{k3: href, ...}`）取 href 而非展示文本；其余按字符串/数字/
+    容器递归收集，按出现顺序去重（展示文本与 href 可能重复）后用空格拼接。
+
+    Args:
+        cell: 单元格原始数据，可能是 dict/list/str/int/float。
+
+    Returns:
+        拼接后的单元格文本；内容为空时返回空字符串。
+    """
     segments: list[str] = []
     _collect_cell_text(cell, segments)
     # 同一单元格里显示文本和 href 可能重复，去重但保序
@@ -211,6 +222,13 @@ def parse_sheet_chunk(ops: list[Any]) -> tuple[dict[str, str], dict[str, dict[st
 
 
 class TencentSheetCollector(SupportsProgress):
+    """腾讯文档「智能表格」采集器。
+
+    以文档版本号 `ver` 判断某个 sheet（tab）整体有没有变化，变化的 sheet 按
+    固定行数（`_CHUNK_SIZE`）分片拉取；追新只读第 0 片，其余分片交给
+    `backfill` 按每轮预算继续补完（见模块 docstring 的三层解码说明）。
+    """
+
     name = "tencent-docs-smartsheet-v1"
     #: 先于文本文档问：智能表格的 URL 形如 /sheet/ 或 /smartsheet/，
     #: 比文本文档的模式更具体。
@@ -221,6 +239,12 @@ class TencentSheetCollector(SupportsProgress):
         client: httpx.AsyncClient | None = None,
         chunk_delay: float = 0.5,
     ) -> None:
+        """
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时各方法自行创建并关闭。
+            chunk_delay: 相邻两次分片请求之间的睡眠秒数，跟随腾讯前端的节奏
+                以免触发异常检测。
+        """
         self._client = client
         self._owns_client = client is None
         self._chunk_delay = chunk_delay
@@ -228,6 +252,15 @@ class TencentSheetCollector(SupportsProgress):
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """从 `/smartsheet/<id>` 或 `/sheet/<id>` 形式的 URL 中提取文档 ID。
+
+        Args:
+            url: 待识别的源地址。
+
+        Returns:
+            文档 ID；不匹配时返回 None（`/doc/<id>` 形式的文本文档交给
+            `TencentTextCollector` 处理）。
+        """
         candidate = url.strip()
         for pattern in _DOC_PATTERNS:
             match = pattern.match(candidate)

@@ -38,10 +38,14 @@ class _HTMLTextParser(HTMLParser):
     """把 feed 描述里的 HTML 转成文本，同时保留真实链接。"""
 
     def __init__(self) -> None:
+        """初始化文本收集缓冲区 `parts`，并开启字符引用自动解码。"""
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """块级标签换行断句；`<a>` 标签若 href 是 http(s)/magnet 链接，把链接本身
+        （而非锚文本）插入输出，避免下游拿到的是被截断或无意义的显示文字。
+        """
         if tag in {"br", "p", "div", "li", "tr", "td", "th"}:
             self.parts.append("\n")
         if tag == "a":
@@ -50,10 +54,12 @@ class _HTMLTextParser(HTMLParser):
                 self.parts.extend((" ", href, " "))
 
     def handle_endtag(self, tag: str) -> None:
+        """块级标签闭合时再补一次换行，与起始标签的换行共同界定段落边界。"""
         if tag in {"p", "div", "li", "tr", "td", "th"}:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
+        """原样收集文本节点内容。"""
         self.parts.append(data)
 
 
@@ -189,15 +195,39 @@ def _canonical_url(url: str) -> str | None:
 
 
 class RSSCollector(SupportsProgress):
+    """RSS/Atom 采集器：每轮全量拉取 feed，按条目稳定 ID 去重出新增消息。
+
+    不存在「翻更早页」的概念——feed 本身就是全量快照，所以没有行级水位，
+    去重状态是一个滚动保留最近 `_MAX_SEEN` 个 ID 的集合，存在 `Source.extra`
+    里（见模块 docstring）。
+    """
+
     name = "rss-atom-v1"
     detect_priority = 100
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        """
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时 `fetch` 自行创建
+                并在结束后关闭。
+        """
         self._client = client
         self._owns_client = client is None
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """判断 url 是否「像」一个 RSS/Atom feed 地址并返回规范化后的标识。
+
+        规范化只做协议/主机校验与去 fragment（见 `_canonical_url`），
+        随后用扩展名、路径关键字、常见查询参数等启发式规则判断是否为 feed。
+
+        Args:
+            url: 待识别的源地址。
+
+        Returns:
+            规范化后的 feed URL；不像 feed 或协议/主机不合法时返回 None，
+            表示本采集器不认领这个 URL。
+        """
         candidate = _canonical_url(url)
         if candidate is None:
             return None
@@ -215,6 +245,24 @@ class RSSCollector(SupportsProgress):
         return candidate if looks_like_feed else None
 
     async def fetch(self, source: Source) -> FetchResult:
+        """拉取 feed 全量内容，过滤出尚未见过的条目作为本轮新消息。
+
+        无论本轮是否有新消息，都会用这一轮解析出的全部条目 ID 滚动更新去重
+        窗口（与历史已见 ID 合并后只保留最新 `_MAX_SEEN` 个），确保旧 ID 被
+        淘汰后仍不会被误判为「新消息」。
+
+        Args:
+            source: 待采集的源，`source.url` 须是 feed 地址。
+
+        Returns:
+            FetchResult：`messages` 为未见过的新条目，`title` 为 feed 标题，
+            `state` 携带更新后的去重 ID 列表；`backfill_done` 恒为 True，
+            因为 feed 没有「更早的历史」可补。
+
+        Raises:
+            httpx.HTTPStatusError: 请求 feed 失败（如 404/5xx）。
+            xml.etree.ElementTree.ParseError: feed 内容不是合法 XML。
+        """
         client = self._client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         try:
             response = await client.get(source.url, headers={"User-Agent": DEFAULT_UA})
@@ -246,4 +294,5 @@ class RSSCollector(SupportsProgress):
         )
 
     async def backfill(self, source: Source) -> FetchResult:
+        """RSS feed 没有「更早历史」可翻，直接返回已完成。"""
         return FetchResult(backfill_done=True)

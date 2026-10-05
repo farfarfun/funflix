@@ -90,6 +90,17 @@ def _normalize_database_url(value: str) -> str:
 
 
 class Settings(BaseSettings):
+    """全局配置。
+
+    取值顺序由 pydantic-settings 决定：环境变量（前缀 `FUNFLIX_`）> `.env` 文件 >
+    这里的默认值；`database_url` / `remote_database_url` 的默认值还会再往下
+    回落到 funsecret、最后才是本地 SQLite（见 `resolve_database_url`）。
+    未识别的环境变量一律忽略（`extra="ignore"`），不会因为环境里有别的
+    `FUNFLIX_*` 变量而启动失败。
+
+    各字段的取舍理由写在字段上方的 `#:` 注释里，改默认值前先读。
+    """
+
     model_config = SettingsConfigDict(
         env_prefix="FUNFLIX_",
         env_file=".env",
@@ -190,9 +201,24 @@ class Settings(BaseSettings):
 
     @property
     def is_sqlite(self) -> bool:
+        """当前库是不是 SQLite。
+
+        SQLite 不支持 pg_trgm、并发写也受限，建表与搜索后端都要据此分支。
+
+        Returns:
+            `database_url` 以 `sqlite` 开头时为 True。
+        """
         return self.database_url.startswith("sqlite")
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """返回全进程共享的配置单例。
+
+    带 `lru_cache`，所以 funsecret 读取、`.env` 解析只会发生一次；测试里改了
+    环境变量后需要 `get_settings.cache_clear()` 才能生效。
+
+    Returns:
+        解析好的 `Settings` 实例。
+    """
     return Settings()

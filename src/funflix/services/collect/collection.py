@@ -45,21 +45,31 @@ class CollectionError(RuntimeError):
 
 
 class _HTMLTextParser(HTMLParser):
+    """把帖子正文 HTML 抽成纯文本：块级标签转换行，`<a>` 标签把 href 内联进文本。
+
+    供 `_html_text()` 使用；`<a>` 的 href 之所以内联到文本里而不是丢弃，是因为
+    集合页正文里的网盘/磁力链接经常就是靠 `<a href>` 承载的，丢了就等于丢数据。
+    """
+
     def __init__(self) -> None:
+        """初始化底层 `HTMLParser`（启用字符实体转换）并准备收集片段的缓冲区。"""
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """遇到块级标签时插入换行；遇到带 href 的 `<a>` 标签时把链接地址内联进文本。"""
         if tag in {"br", "p", "div", "li", "hr"}:
             self.parts.append("\n")
         if tag == "a" and (href := dict(attrs).get("href")):
             self.parts.extend((" ", href, " "))
 
     def handle_endtag(self, tag: str) -> None:
+        """块级标签结束时再补一次换行，避免相邻块的文本粘连成一行。"""
         if tag in {"p", "div", "li"}:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
+        """把标签之间的纯文本原样追加进缓冲区。"""
         self.parts.append(data)
 
 
@@ -213,16 +223,39 @@ def _target(url: str) -> tuple[str, str]:
 
 
 class CollectionCollector(SupportsProgress):
+    """论坛"集合页"（索引帖 + 多个子讨论）采集器。
+
+    索引帖的正文里罗列着一批指向其它讨论帖（`/d/<id>`）的链接，真正的资源
+    内容在这些被引用的讨论帖里，而不是索引帖本身——所以 `fetch`/`backfill`
+    都是先解析索引帖拿到 ID 列表，再逐个访问子讨论帖取正文。全程通过
+    `https://r.jina.ai/` 代理把目标站点渲染成 Markdown/JSON 再解析，不直连。
+    """
+
     name = "collection-page-v1"
     detect_priority = 25
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        """初始化采集器。
+
+        Args:
+            client: 复用的 `httpx.AsyncClient`；为 None 时按次创建并在用完后关闭。
+        """
         self._client = client
         self._owns_client = client is None
+        #: 本次运行期间从索引帖解析出的子讨论 ID，`fetch`/`backfill` 共享，
+        #: 避免同一轮运行内重复请求索引帖。
         self._ids: list[int] = []
 
     @staticmethod
     def normalize_identifier(url: str) -> str | None:
+        """从集合页 URL 提取稳定标识（`host:讨论ID`，过长时退化为 sha256 摘要）。
+
+        Args:
+            url: 待识别的集合页地址，需形如 `https://host/d/<id>`。
+
+        Returns:
+            识别成功时返回标识字符串；URL 不符合 `/d/<id>` 形式时返回 None。
+        """
         parts = urlsplit(url.strip())
         match = re.fullmatch(r"/d/(\d+)/?", parts.path)
         if parts.scheme.lower() in {"http", "https"} and parts.hostname and match:
@@ -252,6 +285,20 @@ class CollectionCollector(SupportsProgress):
         return messages
 
     async def fetch(self, source: Source) -> FetchResult:
+        """追新：读索引帖拿到全部子讨论 ID，取高水位（`forum_head_id`）之后的新增部分。
+
+        首次采集（没有水位）时只取最新的 `max_pages_per_fetch` 条，避免一次性
+        把整个索引帖的历史全部拉下来。
+
+        Args:
+            source: 待采集的集合页源，`source.url` 须指向索引帖。
+
+        Returns:
+            本轮抓到的消息及更新后的水位状态（`state` 里的 `forum_head_id`）。
+
+        Raises:
+            CollectionError: 索引帖地址无效，或接口返回的数据格式不可解析。
+        """
         origin, index_id = _target(source.url)
         api = f"{_READER_PREFIX}{origin}/api/discussions/"
         client = self._client or httpx.AsyncClient(timeout=60.0, follow_redirects=True)
@@ -279,6 +326,21 @@ class CollectionCollector(SupportsProgress):
         )
 
     async def backfill(self, source: Source) -> FetchResult:
+        """往前补历史：取低水位（`backfill_cursor_id`）之前、还没采到的子讨论。
+
+        索引帖只会在首次调用时重新加载（`self._ids` 为空时），之后复用同一轮
+        `fetch` 已经解析出的 ID 列表，不重复请求索引帖本身。
+
+        Args:
+            source: 待补历史的集合页源。
+
+        Returns:
+            本轮回溯到的消息、新的低水位游标，以及是否已回溯到头
+            （`backfill_done`，即不存在比新游标更旧的子讨论 ID）。
+
+        Raises:
+            CollectionError: 索引帖地址无效，或接口返回的数据格式不可解析。
+        """
         origin, index_id = _target(source.url)
         api = f"{_READER_PREFIX}{origin}/api/discussions/"
         client = self._client or httpx.AsyncClient(timeout=60.0, follow_redirects=True)

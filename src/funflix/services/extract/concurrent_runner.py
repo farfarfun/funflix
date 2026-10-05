@@ -104,6 +104,17 @@ class _ParseProducer(BaseProducer):
         force: bool,
         name: str | None = None,
     ) -> None:
+        """保存构造参数；数据库引擎、事件循环等资源留到 `on_start()` 里按线程现造。
+
+        Args:
+            output_queue: funworker 注入的输出队列，生产的条目从这里喂给处理单元。
+            settings: 数据库等配置，用于 `on_start()` 里创建专属 `AsyncEngine`。
+            extractor_override: 强制指定抽取器名；为 None 时按文档来源类型选默认值。
+            limit: 本次最多处理的文档数；None 表示不限。
+            batch_size: 每次翻页读取的文档数上限。
+            force: 为 True 时跳过缓存查询，强制让每条文档都重新抽取。
+            name: 线程名，透传给 `BaseProducer`。
+        """
         super().__init__(output_queue, name=name)
         self.settings = settings
         self.extractor_override = extractor_override
@@ -112,6 +123,7 @@ class _ParseProducer(BaseProducer):
         self.force = force
 
     def on_start(self) -> None:
+        """在生产者线程内创建专属 `AsyncEngine`/事件循环，并初始化翻页游标与缓冲区。"""
         self._aio_loop = asyncio.new_event_loop()
         self._engine = create_engine(self.settings)
         self._sessionmaker = async_sessionmaker(
@@ -126,6 +138,7 @@ class _ParseProducer(BaseProducer):
         self._exhausted = False
 
     def on_stop(self) -> None:
+        """释放本线程专属的 `AsyncEngine` 并关闭事件循环。"""
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
@@ -135,6 +148,14 @@ class _ParseProducer(BaseProducer):
         return self._extractor_cache[kind]
 
     def produce(self) -> Any:
+        """吐出一条待处理条目；缓冲区空时先翻一页，翻到底则抛 `StopIteration` 结束生产。
+
+        Returns:
+            含 `doc_id`/`content`/`extractor_kind`/`cached_output` 的字典，供处理单元消费。
+
+        Raises:
+            StopIteration: 数据库里已无更多待解析文档。
+        """
         if not self._buffer and not self._exhausted:
             self._aio_loop.run_until_complete(self._fetch_page())
         if not self._buffer:
@@ -202,14 +223,16 @@ class _ParseProducer(BaseProducer):
 class _ParseProcessor(BaseProcessor):
     """并发跑 `extract()`（或缓存命中时 `rehydrate()`），不碰数据库。"""
 
-    def __init__(self, *, extractor_override: str | None) -> None:
-        self.extractor_override = extractor_override
+    # 没有 __init__：每个条目用哪个抽取器由生产者解析好写进 `extractor_kind`，
+    # 处理单元只按条目取，不需要再持有一份 extractor_override。
 
     def on_start(self) -> None:
+        """在处理单元线程内创建专属事件循环，供同步调用 `extractor.extract()` 用。"""
         self._aio_loop = asyncio.new_event_loop()
         self._extractor_cache: dict[str, Extractor] = {}
 
     def on_stop(self) -> None:
+        """关闭本线程专属的事件循环。"""
         self._aio_loop.close()
 
     def _extractor_for(self, kind: str) -> Extractor:
@@ -218,6 +241,16 @@ class _ParseProcessor(BaseProcessor):
         return self._extractor_cache[kind]
 
     def process(self, item: dict[str, Any]) -> Any:
+        """在处理单元线程里跑一条文本的抽取（命中缓存则改走 `rehydrate()`）。
+
+        Args:
+            item: 生产者产出的条目，含 `doc_id`/`content`/`extractor_kind`/`cached_output`。
+
+        Returns:
+            含 `doc_id`/`extractor_kind` 的字典：成功时带 `outcome` 与
+            `from_cache`，抽取抛异常时带 `error`（`类型名: 消息`）。异常在这里
+            就地转成数据而不是向上抛，否则一条畸形文本会掀掉整个工作线程。
+        """
         extractor = self._extractor_for(item["extractor_kind"])
         try:
             if item["cached_output"] is not None:
@@ -255,6 +288,15 @@ class _ParseConsumer(BaseBatchConsumer):
         flush_interval: float = 10.0,
         name: str | None = None,
     ) -> None:
+        """保存构造参数并把攒批策略交给基类；数据库引擎留到 `on_start()` 按线程现造。
+
+        Args:
+            input_queue: funworker 注入的输入队列，处理单元的产出从这里送来。
+            settings: 数据库等配置，用于 `on_start()` 里创建专属 `AsyncEngine`。
+            write_batch: 攒够多少条就触发一次 `consume_batch` 落库。
+            flush_interval: 即便未攒够 `write_batch` 条，最多等待多少秒也强制落库一次。
+            name: 线程名，透传给 `BaseBatchConsumer`。
+        """
         super().__init__(
             input_queue, batch_size=write_batch, batch_timeout=flush_interval, name=name
         )
@@ -262,6 +304,7 @@ class _ParseConsumer(BaseBatchConsumer):
         self.reports: list[ParseReport] = []
 
     def on_start(self) -> None:
+        """在消费者线程内创建专属 `AsyncEngine`/事件循环，供批量落库用。"""
         self._aio_loop = asyncio.new_event_loop()
         self._engine = create_engine(self.settings)
         self._sessionmaker = async_sessionmaker(
@@ -270,6 +313,7 @@ class _ParseConsumer(BaseBatchConsumer):
         self._extractor_cache: dict[str, Extractor] = {}
 
     def on_stop(self) -> None:
+        """释放本线程专属的 `AsyncEngine` 并关闭事件循环。"""
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
@@ -279,6 +323,12 @@ class _ParseConsumer(BaseBatchConsumer):
         return self._extractor_cache[kind]
 
     def consume_batch(self, items: list[dict[str, Any]]) -> None:
+        """把攒够的一批处理结果（或缓存命中结果）同步落库。
+
+        Args:
+            items: 处理单元产出的条目列表，每条含 `doc_id`/`extractor_kind`，
+                以及 `outcome`+`from_cache`（成功）或 `error`（抽取阶段失败）。
+        """
         self._aio_loop.run_until_complete(self._flush_batch(items))
 
     async def _flush_batch(self, items: list[dict[str, Any]]) -> None:
@@ -385,7 +435,8 @@ def run_parse_pipeline(
     settings = settings or get_settings()
 
     def processor_factory() -> _ParseProcessor:
-        return _ParseProcessor(extractor_override=extractor_name)
+        """构造一个 `_ParseProcessor` 实例，供 `Pipeline.build` 为每个线程池工作线程各建一个。"""
+        return _ParseProcessor()
 
     pipeline = Pipeline.build(
         _ParseProducer,

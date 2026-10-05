@@ -87,12 +87,14 @@ async def collect_stats(session: AsyncSession) -> PipelineStats:
     """
 
     async def count(model: Any, *conditions: Any) -> int:
+        """对 `model` 执行一次 `COUNT(*)`，`conditions` 作为 WHERE 子句附加。"""
         stmt = select(func.count()).select_from(model)
         if conditions:
             stmt = stmt.where(*conditions)
         return await session.scalar(stmt) or 0
 
     async def group(model: Any, column: Any) -> dict[str, int]:
+        """按 `column` 对 `model` 分组计数，返回 {字段字面值: 数量}。"""
         rows = await session.execute(
             select(column, func.count()).select_from(model).group_by(column)
         )

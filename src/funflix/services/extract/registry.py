@@ -35,6 +35,7 @@ def get_extractor(kind: str) -> Extractor:
 
 
 def supported_extractors() -> list[str]:
+    """列出当前已注册的抽取器名称（升序），供 CLI 校验/提示可选项用。"""
     return sorted(_REGISTRY)
 
 
@@ -52,6 +53,14 @@ DEFAULT_EXTRACTOR = "rule"
 
 
 def default_extractor_for(source_type: SourceType | None) -> str:
+    """按文档来源类型选默认抽取器：表格源用 "sheet"，其余（含 None）用 "rule"。
+
+    Args:
+        source_type: 文档来源类型；None 表示来源未知。
+
+    Returns:
+        默认抽取器名称。
+    """
     if source_type is None:
         return DEFAULT_EXTRACTOR
     return _DEFAULT_BY_SOURCE.get(source_type, DEFAULT_EXTRACTOR)

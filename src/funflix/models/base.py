@@ -46,6 +46,19 @@ class UTCDateTime(sa.types.TypeDecorator):
     cache_ok = True
 
     def process_bind_param(self, value: datetime | None, dialect: Any) -> datetime | None:
+        """写库前把值统一转成 UTC。
+
+        Args:
+            value: 待写入的 datetime，必须是 tz-aware 的。
+            dialect: SQLAlchemy 方言对象，这里用不到。
+
+        Returns:
+            转成 UTC 的 datetime；`value` 为 None 时原样返回 None。
+
+        Raises:
+            ValueError: 传入 naive datetime。宁可当场报错，也不猜它是哪个时区——
+                猜错会让时间悄悄偏移几小时且永远查不出来。
+        """
         if value is None:
             return None
         if value.tzinfo is None:
@@ -55,6 +68,15 @@ class UTCDateTime(sa.types.TypeDecorator):
         return value.astimezone(UTC)
 
     def process_result_value(self, value: datetime | None, dialect: Any) -> datetime | None:
+        """读库后补齐 tzinfo，保证无论哪个数据库取出来都是 UTC-aware 的。
+
+        Args:
+            value: 从数据库取出的 datetime，SQLite 上是 naive 的。
+            dialect: SQLAlchemy 方言对象，这里用不到。
+
+        Returns:
+            UTC-aware 的 datetime；`value` 为 None 时原样返回 None。
+        """
         if value is None:
             return None
         if value.tzinfo is None:
@@ -93,9 +115,17 @@ BigIntType = sa.BigInteger()
 
 
 class Base(DeclarativeBase):
+    """所有 ORM 模型的基类。
+
+    统一挂上带命名约定的 `MetaData`：索引、唯一键、外键的名字由约定生成而不是
+    数据库自动分配，否则 alembic 在 SQLite 与 PostgreSQL 上会生成不同的约束名，
+    迁移脚本没法通用。
+    """
+
     metadata = sa.MetaData(naming_convention=NAMING_CONVENTION)
 
     def __repr__(self) -> str:
+        """调试用的简短表示：`<类名 id=主键>`，不展开任何字段值。"""
         pk = getattr(self, "id", None)
         return f"<{type(self).__name__} id={pk}>"
 

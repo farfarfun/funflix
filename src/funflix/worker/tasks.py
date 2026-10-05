@@ -59,9 +59,11 @@ class BatchReport:
 
     @property
     def idle(self) -> bool:
+        """这一批有没有真的干活。领取数和放弃数都为 0 才算空轮，调度据此决定要不要睡。"""
         return self.claimed == 0 and self.abandoned == 0
 
     def summary(self) -> str:
+        """拼成一行可读战报：领取/成功/失败/重捞/放弃五个计数。"""
         return (
             f"领取 {self.claimed} 成功 {self.succeeded} 失败 {self.failed} "
             f"重捞 {self.reclaimed} 放弃 {self.abandoned}"
