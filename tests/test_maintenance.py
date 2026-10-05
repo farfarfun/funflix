@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 from sqlalchemy import select
 
@@ -19,6 +21,7 @@ from funflix.models import (
     Source,
     Tag,
     TagKind,
+    Work,
     media_resource,
     media_tag,
     utcnow,
@@ -53,8 +56,27 @@ def _doc(n: int = 1) -> RawDocument:
     )
 
 
+#: 每行 media 都要有自己的 Work（`norm_key` 是唯一键，不能共用一个）。
+_WORKS = itertools.count()
+
+
 def _media(title: str = "剧集1") -> Media:
-    return Media(title=title, norm_key=title, media_type=MediaType.MOVIE, year=2024, aliases=[])
+    """一行 media 连带它所属的作品。
+
+    `media.work_id` 是 NOT NULL —— 一季必须属于某部作品（见 models/media.py），
+    所以这里顺手把 Work 也造出来。这些测试关心的是资源/标签关联的维护，
+    作品归属对它们来说只是过关条件。
+    """
+    work = Work(
+        title=title,
+        norm_key=f"{title}-{next(_WORKS)}",
+        aliases=[],
+        media_type=MediaType.MOVIE,
+        year=2024,
+    )
+    return Media(
+        title=title, norm_key=title, media_type=MediaType.MOVIE, year=2024, aliases=[], work=work
+    )
 
 
 def _resource(n: int = 1) -> Resource:

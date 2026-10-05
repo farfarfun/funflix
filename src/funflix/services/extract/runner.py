@@ -28,15 +28,19 @@ from funflix.models import (
     Resource,
     Tag,
     TagKind,
+    Work,
     media_resource,
     media_tag,
     utcnow,
 )
-from funflix.models.media import UNKNOWN_YEAR
+from funflix.models.base import uuid7
+from funflix.models.canon import TitleCanon
+from funflix.models.media import NO_SEASON, UNKNOWN_YEAR
+from funflix.services.canon.lookup import CanonTarget, pending_row, resolve_target
 from funflix.services.counters import refresh_media_counters
 from funflix.services.extract.base import ExtractedItem, ExtractionOutcome, Extractor
 from funflix.services.text.linkscan import ScannedLink
-from funflix.services.text.normalize import tag_norm_key
+from funflix.services.text.normalize import series_norm_key, tag_norm_key
 
 logger = getLogger("funflix")
 
@@ -91,9 +95,14 @@ class BatchCache:
     正确性与不传 cache 时完全一致，只是把重复查询摊掉。
     """
 
-    media_by_key: dict[tuple[str, MediaType, int], Media] = field(default_factory=dict)
-    #: (norm_key, year) → 候选列表，用于类型放宽匹配
-    media_by_relaxed: dict[tuple[str, int], list[Media]] = field(default_factory=dict)
+    #: (work_id, season) → Media。这就是 media 的身份，见 `models/media.py`。
+    media_by_key: dict[tuple[uuid.UUID, int], Media] = field(default_factory=dict)
+    #: Work.norm_key → Work
+    work_by_key: dict[str, Work] = field(default_factory=dict)
+    #: ExtractedItem.norm_key → 裁决行。**值为 None 表示"查过，库里没有"** ——
+    #: 和"没查过"必须区分开，否则同一批里的同一个新键会被反复 SELECT，
+    #: 而且 `_upsert_media` 会给它插好几行 pending（撞主键）。
+    canon_by_key: dict[str, TitleCanon | None] = field(default_factory=dict)
     resource_by_key: dict[tuple[str, str], Resource] = field(default_factory=dict)
     tag_by_key: dict[tuple[str, str], Tag] = field(default_factory=dict)
     media_resource_pairs: set[tuple[uuid.UUID, uuid.UUID]] = field(default_factory=set)
@@ -112,7 +121,8 @@ def _snapshot_cache(cache: BatchCache) -> tuple:
     """
     return (
         dict(cache.media_by_key),
-        {key: list(value) for key, value in cache.media_by_relaxed.items()},
+        dict(cache.work_by_key),
+        dict(cache.canon_by_key),
         dict(cache.resource_by_key),
         dict(cache.tag_by_key),
         set(cache.media_resource_pairs),
@@ -124,7 +134,8 @@ def _restore_cache(cache: BatchCache, snapshot: tuple) -> None:
     """把 `cache` 的容器换回 `_snapshot_cache` 之前的状态。"""
     (
         cache.media_by_key,
-        cache.media_by_relaxed,
+        cache.work_by_key,
+        cache.canon_by_key,
         cache.resource_by_key,
         cache.tag_by_key,
         cache.media_resource_pairs,
@@ -185,20 +196,27 @@ async def _preload_batch_cache(
 ) -> BatchCache:
     """按整批抽取产出用到的去重键，各发一次 IN 查询，填出 `BatchCache`。
 
-    media/resource/tag 各一次查询，外加"这些已存在的 media 都关联了哪些
-    resource/tag"再各一次——五次往返覆盖整批（可能几百条文档），
+    canon/work/media/resource/tag 各一次查询，外加"这些已存在的 media 都
+    关联了哪些 resource/tag"再各一次——七次往返覆盖整批（可能几百条文档），
     而不是每条文档各查一遍。
+
+    **work 必须在 media 之前预读**：media 的身份是 `(work_id, season)`，
+    没有 work_id 就无从按身份去查 media。而 work 的候选键有两个来源 ——
+    `title_canon` 裁决出的作品键，以及规则现算的 `series_norm_key` ——
+    所以 canon 又得排在 work 前面。这个顺序和 `_upsert_media` 里的决策顺序
+    是同一条链，不能打乱。
     """
     cache = BatchCache()
 
-    norm_years: set[tuple[str, int]] = set()
+    item_keys: set[str] = set()
+    item_titles: set[str] = set()
     provider_shares: set[tuple[str, str]] = set()
     tag_keys: set[tuple[str, str]] = set()
 
     for outcome in outcomes:
         for item in outcome.items:
-            year = item.year if item.year is not None else UNKNOWN_YEAR
-            norm_years.add((item.norm_key, year))
+            item_keys.add(item.norm_key)
+            item_titles.add(item.title)
             for kind, name in item.tags:
                 key = tag_norm_key(name)
                 if key:
@@ -208,13 +226,34 @@ async def _preload_batch_cache(
         for link in outcome.unattributed_links:
             provider_shares.add((link.provider, link.share_id))
 
-    if norm_years:
-        rows = await session.scalars(
-            select(Media).where(tuple_(Media.norm_key, Media.year).in_(norm_years))
-        )
+    if item_keys:
+        rows = await session.scalars(select(TitleCanon).where(TitleCanon.norm_key.in_(item_keys)))
+        for canon in rows:
+            cache.canon_by_key[canon.norm_key] = canon
+        # 没查到的键显式记成 None —— 见 `BatchCache.canon_by_key` 的说明。
+        for key in item_keys:
+            cache.canon_by_key.setdefault(key, None)
+
+    work_keys = {series_norm_key(title) for title in item_titles}
+    work_keys |= {
+        canon.work_norm_key
+        for canon in cache.canon_by_key.values()
+        if canon is not None and canon.work_norm_key
+    }
+    work_keys.discard("")
+    if work_keys:
+        rows = await session.scalars(select(Work).where(Work.norm_key.in_(work_keys)))
+        for work in rows:
+            cache.work_by_key[work.norm_key] = work
+
+    work_ids = [work.id for work in cache.work_by_key.values()]
+    if work_ids:
+        # 一次把这些作品**所有**的季拉回来，不按 `(work_id, season)` 逐对查。
+        # 一部剧的季数是个位数，整组拉回来比拼一个大 tuple IN 便宜，也省得
+        # 规则和裁决对季号判断不一致时漏命中。
+        rows = await session.scalars(select(Media).where(Media.work_id.in_(work_ids)))
         for media in rows:
-            cache.media_by_key[(media.norm_key, media.media_type, media.year)] = media
-            cache.media_by_relaxed.setdefault((media.norm_key, media.year), []).append(media)
+            cache.media_by_key[(media.work_id, media.season or NO_SEASON)] = media
 
     if provider_shares:
         rows = await session.scalars(
@@ -251,76 +290,125 @@ async def _preload_batch_cache(
     return cache
 
 
+async def _lookup_canon(
+    session: AsyncSession, norm_key: str, cache: BatchCache | None
+) -> TitleCanon | None:
+    """查这个抽取键的归一裁决。查不到返回 None。"""
+    if cache is not None and norm_key in cache.canon_by_key:
+        return cache.canon_by_key[norm_key]
+    canon = await session.get(TitleCanon, norm_key)
+    if cache is not None:
+        cache.canon_by_key[norm_key] = canon
+    return canon
+
+
+async def _upsert_work(
+    session: AsyncSession, target: CanonTarget, cache: BatchCache | None
+) -> Work:
+    """按 `work_norm_key` get-or-create 作品。
+
+    新建时**显式给 id**（`uuid7()`），不靠 ORM 默认值 —— 默认值要到 flush
+    才生效，而紧接着就要用 `(work_id, season)` 当 media 的缓存键。为了拿一个
+    id 去 flush 会把「一批文档只 flush 一次」的优化整个作废。
+
+    已存在的作品只补空字段，不覆盖已有值：库里的值可能来自 LLM 裁决或人工
+    修订，都比单条分享现判的更可信。
+    """
+    if cache is not None:
+        work = cache.work_by_key.get(target.work_norm_key)
+    else:
+        work = await session.scalar(select(Work).where(Work.norm_key == target.work_norm_key))
+
+    if work is None:
+        work = Work(
+            id=uuid7(),
+            title=target.work_title[:500] or target.work_norm_key[:500],
+            norm_key=target.work_norm_key,
+            media_type=target.media_type,
+            year=target.year,
+            aliases=[],
+        )
+        session.add(work)
+        if cache is not None:
+            cache.work_by_key[target.work_norm_key] = work
+        return work
+
+    if work.media_type is MediaType.UNKNOWN and target.media_type is not MediaType.UNKNOWN:
+        work.media_type = target.media_type
+    if work.year == UNKNOWN_YEAR and target.year != UNKNOWN_YEAR:
+        work.year = target.year
+    return work
+
+
 async def _upsert_media(
     session: AsyncSession, item: ExtractedItem, cache: BatchCache | None = None
-) -> tuple[Media, bool]:
-    """按 (norm_key, media_type, year) 找已有作品，找不到才新建。
+) -> tuple[Media | None, bool]:
+    """按 `title_canon` 的裁决把抽取项落到某个作品的某一季。
 
-    多了一步「类型放宽」的回退：同一部作品在不同分享里可能一次被判成 tv、
-    一次判成 unknown。若严格按三元组匹配，它们会变成两部作品。
-    所以先精确匹配，再按 (norm_key, year) 放宽，并顺手把 unknown 升级成已知类型。
+    返回 `(None, False)` 表示裁决判定这个标题根本不是作品 —— 调用方应把它的
+    链接转成未归属资源。
 
-    传了 `cache` 时优先查内存、未命中才落到 SELECT——批内新建的 media 也会
-    写回 cache，同批后续文档引用同一部作品不会再查一次库。
+    流程是「查裁决 → 定作品键和季 → get-or-create Work → get-or-create
+    (work_id, season)」。**原来那套「类型放宽」的回退删掉了**：它存在的理由
+    是身份三元组里有 `media_type`，同一部剧被判成 tv 和 unknown 就会裂成两行。
+    现在 media 的身份是 `(work_id, season)`，类型退化成属性，裂不了，
+    回退也就没有存在意义。
+
+    传了 `cache` 时优先查内存、未命中才落到 SELECT——批内新建的 work/media
+    也会写回 cache，同批后续文档引用同一部作品不会再查一次库。
     """
-    year = item.year if item.year is not None else UNKNOWN_YEAR
-    exact_key = (item.norm_key, item.media_type, year)
-    relaxed_key = (item.norm_key, year)
+    canon = await _lookup_canon(session, item.norm_key, cache)
+    target = resolve_target(
+        title=item.title, media_type=item.media_type, year=item.year, canon=canon
+    )
+    if target.is_junk:
+        return None, False
+
+    if target.needs_pending_row:
+        # 新键：写一行 pending 让 `canon resolve` 下次捞走。写回 cache 是为了
+        # 同一批里的同一个键不会被插第二行（撞主键会把整个 SAVEPOINT 带崩）。
+        canon = pending_row(item.norm_key, target)
+        session.add(canon)
+        if cache is not None:
+            cache.canon_by_key[item.norm_key] = canon
+
+    if not target.work_norm_key:
+        # 规则把标题洗成空了（纯噪声）。这种项在抽取器层本该已经被
+        # `looks_like_junk_title` 拦掉，兜一下避免建出空键 Work。
+        return None, False
+
+    work = await _upsert_work(session, target, cache)
+    identity = (work.id, target.season)
 
     if cache is not None:
-        media = cache.media_by_key.get(exact_key)
-        if media is None:
-            for candidate in cache.media_by_relaxed.get(relaxed_key, []):
-                if (
-                    candidate.media_type is MediaType.UNKNOWN
-                    and item.media_type is not MediaType.UNKNOWN
-                ):
-                    candidate.media_type = item.media_type
-                    media = candidate
-                    cache.media_by_key[exact_key] = media
-                    break
-                if item.media_type is MediaType.UNKNOWN:
-                    media = candidate
-                    break
+        media = cache.media_by_key.get(identity)
     else:
         media = await session.scalar(
-            select(Media).where(
-                Media.norm_key == item.norm_key,
-                Media.media_type == item.media_type,
-                Media.year == year,
-            )
+            select(Media).where(Media.work_id == work.id, Media.season == target.season)
         )
-        if media is None:
-            candidates = list(
-                await session.scalars(
-                    select(Media).where(Media.norm_key == item.norm_key, Media.year == year)
-                )
-            )
-            for candidate in candidates:
-                if (
-                    candidate.media_type is MediaType.UNKNOWN
-                    and item.media_type is not MediaType.UNKNOWN
-                ):
-                    candidate.media_type = item.media_type  # 用更确定的类型升级旧记录
-                    media = candidate
-                    break
-                if item.media_type is MediaType.UNKNOWN:
-                    media = candidate  # 本次判不出类型，沿用已有的
-                    break
 
     if media is not None:
         if item.title not in media.aliases and item.title != media.title:
             media.aliases = [*media.aliases, item.title]
         if media.original_title is None and item.original_title:
             media.original_title = item.original_title
+        if media.media_type is MediaType.UNKNOWN and target.media_type is not MediaType.UNKNOWN:
+            media.media_type = target.media_type
+        if media.year == UNKNOWN_YEAR and target.year != UNKNOWN_YEAR:
+            media.year = target.year
         return media, False
 
     media = Media(
+        work_id=work.id,
+        season=target.season,
         title=item.title,
-        norm_key=item.norm_key,
+        # `norm_key` 落**作品键**，不再是这一条分享自己的脏键。它已经不参与
+        # 身份判定（见 `models/media.py`），留着是为了排查时能一眼看出
+        # 这一季挂在哪个作品下。
+        norm_key=target.work_norm_key,
         original_title=item.original_title,
-        media_type=item.media_type,
-        year=year,
+        media_type=target.media_type,
+        year=target.year,
         aliases=[],
     )
     session.add(media)
@@ -328,8 +416,7 @@ async def _upsert_media(
     # resource、Extraction 一起，由调用方（`_persist`）一次性 flush，
     # 把「一条文档有 N 个链接就要 N 次数据库往返」降到固定次数。
     if cache is not None:
-        cache.media_by_key[exact_key] = media
-        cache.media_by_relaxed.setdefault(relaxed_key, []).append(media)
+        cache.media_by_key[identity] = media
     return media, True
 
 
@@ -538,8 +625,15 @@ async def _persist_phase1(
     resource_by_link: list[tuple[Media, Resource]] = []
     resources: dict[tuple, Resource] = {}
 
+    # 被归一裁决判成「不是作品」的项，它的链接降级成未归属资源，和抽取器
+    # 丢弃目录页时的处理一致 —— 链接本身是真的，只是没有可挂的作品。
+    orphaned: list[ScannedLink] = []
+
     for item in outcome.items:
         media, created = await _upsert_media(session, item, cache)
+        if media is None:
+            orphaned.extend(item.links)
+            continue
         report.media_created += int(created)
         report.media_reused += int(not created)
         tags = await _resolve_tags(session, item, cache)
@@ -556,11 +650,11 @@ async def _persist_phase1(
             resource_by_link.append((media, resource))
 
     # 没归属到作品的链接照样入库（无任何关联），进人工/二次归属队列，绝不丢弃
-    for link in outcome.unattributed_links:
+    for link in [*outcome.unattributed_links, *orphaned]:
         _, is_new = await _upsert_resource(session, link, doc=doc, item=None, cache=cache)
         report.resources_created += int(is_new)
         report.resources_updated += int(not is_new)
-    report.unattributed_links = len(outcome.unattributed_links)
+    report.unattributed_links = len(outcome.unattributed_links) + len(orphaned)
 
     return _PersistState(media_by_item=media_by_item, resource_by_link=resource_by_link)
 

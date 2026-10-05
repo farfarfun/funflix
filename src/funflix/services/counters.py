@@ -18,7 +18,7 @@ from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import CheckStatus
-from funflix.models import Media, Resource, Tag, media_resource, media_tag
+from funflix.models import Media, Resource, Tag, Work, media_resource, media_tag
 
 
 async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[uuid.UUID]) -> int:
@@ -75,6 +75,65 @@ async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[uuid
                 ),
                 valid_resource_count=case(
                     {mid: valid for mid, (_total, valid) in counted.items()}, value=Media.id
+                ),
+            )
+        )
+    return len(ids)
+
+
+async def refresh_work_counters(session: AsyncSession, work_ids: Iterable[uuid.UUID]) -> int:
+    """按下属各季重算作品的季数与资源计数。
+
+    **从 `media` 的冗余列上汇总，不重新 join 到 `resource`** —— 季级计数由
+    `refresh_media_counters` 维护，这里再往上滚一层。两级都是重算，所以
+    「先刷季、再刷作品」跑完就一定自洽；反过来先刷作品的话作品数会停在
+    旧的季级计数上，不会报错但会悄悄对不上，所以调用方必须按这个顺序。
+
+    与 `refresh_media_counters` 不同，这里**不删空作品**：一个作品的季全删完
+    通常意味着归并过程中间态（季被并到别的作品上去了），而不是"这部剧没了"。
+    真正的孤儿作品由 `canon` 流程收尾时统一清理。
+    """
+    ids = {i for i in work_ids if i is not None}
+    if not ids:
+        return 0
+
+    rows = (
+        await session.execute(
+            select(
+                Media.work_id,
+                func.count(),
+                func.coalesce(func.sum(Media.resource_count), 0),
+                func.coalesce(func.sum(Media.valid_resource_count), 0),
+            )
+            .where(Media.work_id.in_(ids))
+            .group_by(Media.work_id)
+        )
+    ).all()
+    counted = {wid: (seasons, int(total), int(valid)) for wid, seasons, total, valid in rows}
+
+    # 一条 CASE 把整批写完，理由同 refresh_media_counters：远端库往返很贵。
+    # 没有任何季的作品要显式归零 —— 它不会出现在 GROUP BY 结果里，
+    # 不补这一笔的话计数会停在旧值上。
+    empty = ids - counted.keys()
+    if empty:
+        await session.execute(
+            update(Work)
+            .where(Work.id.in_(empty))
+            .values(season_count=0, resource_count=0, valid_resource_count=0)
+        )
+    if counted:
+        await session.execute(
+            update(Work)
+            .where(Work.id.in_(counted))
+            .values(
+                season_count=case(
+                    {wid: seasons for wid, (seasons, _t, _v) in counted.items()}, value=Work.id
+                ),
+                resource_count=case(
+                    {wid: total for wid, (_s, total, _v) in counted.items()}, value=Work.id
+                ),
+                valid_resource_count=case(
+                    {wid: valid for wid, (_s, _t, valid) in counted.items()}, value=Work.id
                 ),
             )
         )

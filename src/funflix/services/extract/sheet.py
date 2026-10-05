@@ -26,6 +26,7 @@ from funflix.services.text.normalize import (
     extract_year,
     guess_media_type,
     looks_like_catalog,
+    looks_like_junk_title,
     norm_key,
 )
 
@@ -47,9 +48,55 @@ _NOTE_LABELS = frozenset(
     {"备注", "失效留言", "序号", "整理日期", "更新日期", "说明", "网盘", "来源"}
 )
 
-#: 网盘列名。这些列装的是链接，不能被当成标题。
+#: 网盘列名 / 链接列名。这些列装的是链接，不能被当成标题。
+#:
+#: 这张表**不全就会出事**：`find_title` 的回退是「第一个非链接非备注的文本列」，
+#: 一旦某个链接列没列在这里、而它的值又不是 `http` 开头（比如值就是网盘名本身、
+#: 或者是「查看资源」这种按钮文案），回退就会把它当成剧名。
+#: 生产库里 `夸克` 45888 行、`链接` 10771 行、`查看资源` 6177 行假作品就是这么来的。
 _LINK_LABELS = frozenset(
-    {"夸克", "百度", "阿里", "阿里云盘", "UC", "uc", "天翼", "115", "迅雷", "原链接", "链接"}
+    {
+        "夸克",
+        "夸克网盘",
+        "夸克链接",
+        "百度",
+        "百度网盘",
+        "百度云",
+        "度盘",
+        "阿里",
+        "阿里云盘",
+        "阿里网盘",
+        "UC",
+        "uc",
+        "UC网盘",
+        "天翼",
+        "天翼云盘",
+        "115",
+        "115网盘",
+        "迅雷",
+        "迅雷云盘",
+        "移动云盘",
+        "光鸭云盘",
+        "云盘",
+        "网盘链接",
+        "原链接",
+        "链接",
+        "社区链接",
+        "下载链接",
+        "分享链接",
+        "磁力",
+        "磁力下载",
+        "磁力链接",
+        "种子",
+        "查看资源",
+        "资源链接",
+        "地址",
+        "下载地址",
+        "提取码",
+        "访问码",
+        "分享码",
+        "密码",
+    }
 )
 
 #: 未命名列的默认名。腾讯文档里作者没起名的列就叫「文本 1」「文本 2」。
@@ -81,6 +128,21 @@ def _looks_like_link(value: str) -> bool:
     return value.lower().startswith(("http://", "https://", "magnet:"))
 
 
+#: 所有「不是标题」的列名，回退时一律跳过。
+_NON_TITLE_LABELS = (
+    _LINK_LABELS | _NOTE_LABELS | _YEAR_LABELS | _QUALITY_LABELS | _EPISODE_LABELS | _TYPE_LABELS
+)
+
+
+def _is_header_echo(label: str, value: str) -> bool:
+    """值跟自己的列名一样 —— 这是表头行被当成数据行采进来了。
+
+    采集层翻页时偶尔会把标题行连同数据一起渲染成 `夸克：夸克`、`大小：大小`、
+    `提取码：提取码`。这种行一个字段都不能信，更不能拿来当剧名。
+    """
+    return label.strip().casefold() == value.strip().casefold()
+
+
 def find_title(fields: dict[str, str]) -> str | None:
     """找出标题列。
 
@@ -88,17 +150,19 @@ def find_title(fields: dict[str, str]) -> str | None:
     同一个文档里不同 sheet 的列布局并不一致，有的 sheet 的标题列
     压根没起名（叫「文本 1」）。写死列名表在单 sheet 上够用，
     在真实的多 sheet 文档上会让整行归属失败。
+
+    回退这条路很容易把垃圾抓成标题，所以把三道闸都设在这里：
+    列名在 `_NON_TITLE_LABELS` 里的跳过、值是链接的跳过、值等于列名
+    （表头行回显）的跳过。最后一道兜底在 `_build` 里的 `looks_like_junk_title`。
     """
-    known = _first(fields, _TITLE_LABELS)
-    if known:
-        return known
+    for label, value in fields.items():
+        if label in _TITLE_LABELS and not _is_header_echo(label, value):
+            return value
 
     for label, value in fields.items():
-        if label in _LINK_LABELS or label in _NOTE_LABELS:
+        if label in _NON_TITLE_LABELS:
             continue
-        if label in _YEAR_LABELS or label in _QUALITY_LABELS or label in _EPISODE_LABELS:
-            continue
-        if _looks_like_link(value):
+        if _looks_like_link(value) or _is_header_echo(label, value):
             continue
         # 未命名列或作者自定义的列名，只要值不是链接就可以当标题候选
         return value
@@ -167,9 +231,10 @@ class SheetExtractor:
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
 
-        if not key:
-            # 没有剧名列就无从归属。链接不丢，全部记为未归属，
-            # 落库后 media_id=None，进人工队列。
+        if looks_like_junk_title(title):
+            # 没有剧名列，或者抓到的「剧名」其实是网盘名/按钮文案/提取码。
+            # 链接不丢，全部记为未归属，落库后 media_id=None，进人工队列。
+            stats["is_junk_title"] = bool(key)
             stats["links_attributed"] = 0
             stats["links_unattributed"] = len(links)
             stats["items_kept"] = 0

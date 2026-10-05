@@ -99,6 +99,8 @@ class OpenAICompatClient:
         timeout: float = 120.0,
         temperature: float = 0.0,
         max_retries: int = 2,
+        tool_schema: dict[str, Any] | None = None,
+        tool_name: str | None = None,
     ) -> None:
         """构造客户端，未显式传入的凭证/模型/地址从 funsecret 读取。
 
@@ -122,6 +124,12 @@ class OpenAICompatClient:
         self._timeout = timeout
         self._temperature = temperature
         self._max_retries = max_retries
+        # 工具 schema 可换，默认是抽取用的那套。归一服务（`services/canon`）
+        # 要的输出结构完全不同，但协议、重试、凭证读取这些都一样 ——
+        # 与其复制一个客户端，不如把 schema 变成构造参数。
+        # `extract()` 的签名不动，`LLMClient` 协议因此保持原样。
+        self._tool_schema = tool_schema or TOOL_SCHEMA
+        self._tool_name = tool_name or TOOL_NAME
         self._client: Any = None
 
     def _ensure_client(self) -> Any:
@@ -166,9 +174,9 @@ class OpenAICompatClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            tools=[TOOL_SCHEMA],
+            tools=[self._tool_schema],
             # 强制走工具，不给模型"用自然语言回答"的选项
-            tool_choice={"type": "function", "function": {"name": TOOL_NAME}},
+            tool_choice={"type": "function", "function": {"name": self._tool_name}},
         )
         latency_ms = int((time.monotonic() - started) * 1000)
 

@@ -34,7 +34,9 @@ db_app = typer.Typer(help="数据库迁移与检查", no_args_is_help=True)
 source_app = typer.Typer(help="采集源管理与采集", no_args_is_help=True)
 sync_app = typer.Typer(help="本地库与远端库同步（自建 self-hosted runner）", no_args_is_help=True)
 user_app = typer.Typer(help="登录账号管理", no_args_is_help=True)
+canon_app = typer.Typer(help="搜索结果归一（Work 实体 + 季子层）", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+app.add_typer(canon_app, name="canon")
 app.add_typer(source_app, name="source")
 app.add_typer(sync_app, name="sync")
 app.add_typer(user_app, name="user")
@@ -584,6 +586,234 @@ def db_relink_checks(
     report = _run(_do)
     _table([["恢复状态", report.hydrated]], ["项", "数量"])
     _ok("校验状态恢复完成")
+
+
+_CanonKeyOption = Annotated[
+    str | None,
+    typer.Option("--key", help="只处理这一个作品归一键（series_norm_key），用于单组演练"),
+]
+#: 归一命令**默认 dry-run**。这几条命令会不可逆地删改几十万行 media，
+#: 默认空跑、要写库必须显式 `--apply`，这样手滑敲错命令的后果是看一眼报告。
+_CanonApplyOption = Annotated[
+    bool, typer.Option("--apply", help="真正写库。不传则只统计和抽样（dry-run）")
+]
+
+
+def _canon_samples(samples: list[str], heading: str) -> None:
+    if not samples:
+        return
+    _heading(heading)
+    for line in samples:
+        _dim(f"  {line}")
+
+
+@canon_app.command("purge")
+def canon_purge(
+    apply: _CanonApplyOption = False,
+    key: _CanonKeyOption = None,
+    limit: Annotated[int | None, typer.Option("--limit", help="最多删多少行，用于小步试探")] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """删掉根本不是作品的 media 行（页面文案、提取码、分享 ID、磁力链、安装包）。
+
+    resource 行**不删** —— 链接是真的，只是归属错了，删掉关联之后它们变成
+    未归属资源。这一步碰不到 resource / link_check / raw_document。
+
+    先空跑看报告，确认无误再加 `--apply`。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.canon import purge_junk_media
+
+    if apply and not yes and not typer.confirm("将**不可逆地删除**命中的 media 行，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await purge_junk_media(session, dry_run=not apply, key=key, limit=limit)
+
+    report = _run(_do)
+    _table(
+        [
+            ["扫描 media", report.scanned],
+            ["判为垃圾", report.junk],
+            ["实际删除", report.deleted],
+            ["断开资源关联", report.links_detached],
+            ["断开标签关联", report.tags_detached],
+            ["修正标签计数", report.tags_recounted],
+        ],
+        ["项", "数量"],
+    )
+    _canon_samples(report.samples, "命中样例")
+    if report.dry_run:
+        _warn("dry-run：没有写库。确认报告无误后加 --apply 执行")
+    else:
+        _ok("垃圾行清理完成")
+
+
+@canon_app.command("rebuild")
+def canon_rebuild(
+    apply: _CanonApplyOption = False,
+    key: _CanonKeyOption = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """按当前规则重算归一键，建 Work，回填 media 归属，合并撞车的季。
+
+    零 LLM 调用 —— 这一步靠规则就能搬掉绝大部分重复。跑完之后剩下的
+    残局（同一部剧因为别名、演员列、季号歧义而没并上的）交给 `canon resolve`。
+
+    建议顺序：先 `canon purge`，再这一条。垃圾行没清掉的话会凭空造出
+    十几万个垃圾 Work（这里会跳过它们，但单组演练时容易看花眼）。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.canon import rebuild_works
+
+    if apply and not yes and not typer.confirm("将重算全部 media 的归属并合并重复季，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await rebuild_works(session, dry_run=not apply, key=key)
+
+    report = _run(_do)
+    _table(
+        [
+            ["扫描 media", report.scanned],
+            ["跳过垃圾行", report.skipped_junk],
+            ["作品归一键", report.keys],
+            ["新建 Work", report.works_created],
+            ["复用 Work", report.works_existing],
+            ["回填 media", report.media_updated],
+            ["撞车的季", report.season_conflicts],
+            ["合并删除 media", report.media_merged],
+            ["迁移资源关联", report.links_moved],
+            ["丢弃重复关联", report.links_dropped],
+            ["换位腾挪", report.parked],
+            ["重算 Work 计数", report.works_recounted],
+        ],
+        ["项", "数量"],
+    )
+    _canon_samples(report.samples, "最大的归一组")
+    if report.dry_run:
+        _warn("dry-run：没有写库。确认报告无误后加 --apply 执行")
+    else:
+        _ok("归一键重算完成")
+
+
+@canon_app.command("resolve")
+def canon_resolve(
+    apply: _CanonApplyOption = False,
+    key: Annotated[
+        str | None,
+        typer.Option("--key", help="只处理这一个候选块（block_key），用于单组演练"),
+    ] = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="最多送多少个块，用于小额预算试探")
+    ] = None,
+    concurrency: Annotated[int, typer.Option("--concurrency", help="并发调用数")] = 8,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """把规则搞不定的残局送 LLM 裁决，结果写 `title_canon`。
+
+    这一步**不动 media 一个字段** —— 只往 `title_canon` 写裁决。要落到库上得
+    再跑 `canon merge`。分两步是故意的：裁决是花钱买来的，先落盘、再人工抽查，
+    确认没有误并才应用。
+
+    只送候选项 ≥2 的候选块（实测约 4,900 个）。单候选项的块没有可并的对象，
+    送过去纯烧钱。已经是 `decided` 的键会被跳过，所以中断后重跑只打残局，
+    不重复付费。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.canon import resolve_canon
+
+    if apply and not yes and not typer.confirm("将发起真实 LLM 调用并产生费用，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await resolve_canon(
+                session,
+                dry_run=not apply,
+                key=key,
+                limit=limit,
+                concurrency=concurrency,
+            )
+
+    report = _run(_do)
+    _table(
+        [
+            ["扫描 media", report.scanned],
+            ["候选块总数", report.blocks],
+            ["够格送裁决", report.blocks_eligible],
+            ["本次送出", report.blocks_sent],
+            ["调用次数", report.calls],
+            ["调用失败", report.calls_failed],
+            ["写入裁决", report.decided],
+            ["其中判为垃圾", report.junk],
+            ["校验不通过", report.rejected],
+            ["模型漏答", report.missing],
+            ["输入 token", report.input_tokens],
+            ["输出 token", report.output_tokens],
+        ],
+        ["项", "数量"],
+    )
+    _canon_samples(report.samples, "待裁决的候选块（同块内的候选项）")
+    if report.dry_run:
+        _warn("dry-run：一次调用都没发。确认要送的块无误后加 --apply 执行")
+    else:
+        _ok("裁决完成，接下来用 canon merge 应用")
+
+
+@canon_app.command("merge")
+def canon_merge(
+    apply: _CanonApplyOption = False,
+    key: Annotated[
+        str | None,
+        typer.Option("--key", help="只应用这一条裁决（title_canon.norm_key）"),
+    ] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """把 `title_canon` 里已裁决的结果落到 media / work 上。
+
+    `is_junk` 的键走和 `canon purge` 完全一样的删除路径（resource 行保留）。
+    其余键把 media 重挂到裁决出的 Work 上；裁决给了具体季号的覆盖季号，
+    给 null 的**不动**规则逐行判出的季号 —— null 的意思是"这个键没锁定某一季"，
+    不是"第 0 季"。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.canon import apply_canon_decisions
+
+    if apply and not yes and not typer.confirm("将按裁决重挂 media 并合并撞车的季，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await apply_canon_decisions(session, dry_run=not apply, key=key)
+
+    report = _run(_do)
+    _table(
+        [
+            ["已裁决条数", report.decisions],
+            ["判为垃圾的键", report.junk_keys],
+            ["删除 media", report.junk_media_deleted],
+            ["断开资源关联", report.links_detached],
+            ["新建 Work", report.works_created],
+            ["复用 Work", report.works_existing],
+            ["重挂 media", report.media_rehomed],
+            ["覆盖季号", report.seasons_overridden],
+            ["撞车的季", report.season_conflicts],
+            ["合并删除 media", report.media_merged],
+            ["迁移资源关联", report.links_moved],
+            ["丢弃重复关联", report.links_dropped],
+            ["换位腾挪", report.parked],
+            ["重算 Work 计数", report.works_recounted],
+        ],
+        ["项", "数量"],
+    )
+    _canon_samples(report.samples, "将要应用的裁决")
+    if report.dry_run:
+        _warn("dry-run：没有写库。确认报告无误后加 --apply 执行")
+    else:
+        _ok("裁决应用完成")
 
 
 @db_app.command("info")

@@ -57,13 +57,22 @@ class ParseStatus(StrEnum):
 
 
 class MediaType(StrEnum):
-    """作品大类。粒度很粗，细分维度（题材/地区/年代）走 `models/tag.py` 的标签。"""
+    """作品类型。
+
+    `BOOK` 及之后的几个是**非影视**类型。采集源里混着大量小说、漫画、
+    课程、软件的分享（`大主宰 我荒古圣体当为天帝 作者:墨之所想 txt` 是小说，
+    不是那部动漫），删掉可惜 —— 它们是真资源，只是不该出现在影视搜索结果里。
+    所以保留但**默认不进搜索**，见 `services/search.py` 的 `VIDEO_MEDIA_TYPES`。
+    """
 
     MOVIE = "movie"
     TV = "tv"
     ANIME = "anime"
     VARIETY = "variety"
     DOCUMENTARY = "documentary"
+    BOOK = "book"
+    COMIC = "comic"
+    OTHER = "other"
     UNKNOWN = "unknown"
 
 

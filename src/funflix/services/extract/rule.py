@@ -22,6 +22,7 @@ from funflix.services.text.normalize import (
     extract_year,
     guess_media_type,
     looks_like_catalog,
+    looks_like_junk_title,
     norm_key,
 )
 from funflix.services.text.segment import segment_text
@@ -81,12 +82,17 @@ class RuleExtractor:
 
         items: list[ExtractedItem] = []
         catalog_votes = 0
+        junk_votes = 0
 
         for segment in segmented.segments:
             raw_title = segment.title_raw or ""
             title = clean_title(raw_title)
             key = norm_key(title)
-            if not title or not key:
+            # 标题不是作品名（`夸克`、`查看资源`、`提取码`、纯数字、分享 ID……）
+            # 就整段丢掉。段里的链接会自动落进 `unattributed_links` ——
+            # 链接是真的，只是不知道归属谁，跟目录帖的处理方式一致。
+            if looks_like_junk_title(title):
+                junk_votes += 1
                 continue
 
             if not shared_links and _looks_like_catalog(
@@ -135,6 +141,7 @@ class RuleExtractor:
                 "links_attributed": len(attributed),
                 "links_unattributed": len(unattributed),
                 "catalog_votes": catalog_votes,
+                "junk_votes": junk_votes,
             },
             latency_ms=int((time.monotonic() - started) * 1000),
         )

@@ -129,3 +129,76 @@ class TestTagsSurviveExtractorChoice:
         outcome = parse_payload(payload, links, text)
         assert all(not i.tags for i in outcome.items)
         assert outcome.stats.get("tags_skipped_multi_item") is True
+
+
+class TestJunkTitlesAreDroppedByBothExtractors:
+    """两个确定性抽取器都必须拦住「不是作品名」的标题。
+
+    这是生产库 92 万行 media 里十万多行假作品的来源：表格的网盘列名
+    （`夸克`）、页面按钮文案（`查看资源`、`磁力下载`）、表头行回显
+    （`大小：大小`）被当成剧名建了条目。
+    只在一个抽取器里拦等于没拦 —— 同一份文档换个来源类型就又漏进来了。
+    """
+
+    JUNK_TITLES = ["夸克", "查看资源", "磁力下载", "社区链接", "提取码", "84"]
+
+    @pytest.mark.parametrize("title", JUNK_TITLES)
+    async def test_sheet_drops_it_and_keeps_the_link(self, title: str) -> None:
+        from funflix.services.extract.sheet import SheetExtractor
+
+        content = f"文本 1：{title}\n夸克：https://pan.quark.cn/s/abcdef123456"
+        outcome = await SheetExtractor().extract(content)
+
+        assert outcome.items == [], f"sheet 把 {title!r} 当成了作品"
+        # 链接是真的，只是不知道归属谁 —— 不能跟着标题一起丢
+        assert len(outcome.unattributed_links) == 1
+
+    @pytest.mark.parametrize("title", JUNK_TITLES)
+    async def test_rule_drops_it_and_keeps_the_link(self, title: str) -> None:
+        content = f"{title}\nhttps://pan.quark.cn/s/abcdef123456"
+        outcome = await RuleExtractor().extract(content)
+
+        assert outcome.items == [], f"rule 把 {title!r} 当成了作品"
+        assert len(outcome.unattributed_links) == 1
+
+    async def test_real_title_still_extracted(self) -> None:
+        """拦垃圾不能把正常行一起拦掉。"""
+        from funflix.services.extract.sheet import SheetExtractor
+
+        content = "剧名：大主宰\n夸克：https://pan.quark.cn/s/abcdef123456"
+        outcome = await SheetExtractor().extract(content)
+
+        assert [item.title for item in outcome.items] == ["大主宰"]
+        assert outcome.unattributed_links == []
+
+
+class TestSheetHeaderRowIsNotAWork:
+    """表头行被当成数据行采进来时，一个字段都不能信。
+
+    采集层翻页偶尔会把标题行连同数据一起渲染成 `夸克：夸克`、`大小：大小`。
+    这种行里每个值都等于自己的列名，`find_title` 的回退必须认出来并跳过，
+    否则就会落出一部叫《夸克》的作品。
+    """
+
+    async def test_header_echo_row_yields_no_item(self) -> None:
+        from funflix.services.extract.sheet import SheetExtractor
+
+        content = "剧名：剧名\n夸克：夸克\n大小：大小\n提取码：提取码"
+        outcome = await SheetExtractor().extract(content)
+
+        assert outcome.items == []
+
+    def test_find_title_skips_the_echo(self) -> None:
+        from funflix.services.extract.sheet import find_title
+
+        # 表头回显的列要跳过，真正的剧名在后面那列
+        assert find_title({"夸克": "夸克", "文本 1": "大主宰"}) == "大主宰"
+        assert find_title({"剧名": "剧名", "文本 1": "大主宰"}) == "大主宰"
+
+    def test_a_work_whose_name_equals_its_column_name(self) -> None:
+        """《名称》这种片名理论上会被回显规则误伤，但代价可接受 ——
+        漏掉一部极罕见的片，换掉十万行假作品。这里只是把取舍钉死，
+        将来若要改回来，得先想清楚怎么区分表头行。"""
+        from funflix.services.extract.sheet import find_title
+
+        assert find_title({"剧名": "剧名"}) is None
