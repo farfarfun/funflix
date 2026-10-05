@@ -265,30 +265,20 @@ grep 过 src 和 tests，五个都零引用：
 5.3 那份共享词表也就有了明显的落脚点。保留 `normalize.py` 作 re-export 壳，
 调用方不用动。
 
-### 5.6 DESIGN.md 多处与代码矛盾
+### 5.6 `LinkProbe` 没有 `patterns`，新增网盘要改四处
 
-- **§6.1 描述了一个不存在的扩展点**（唯一不算 cosmetic 的一条）：
-  写着 `LinkProbe` 有 `patterns` 和 `parse()`，`linkscan` 用所有 probe 的
-  patterns 并集扫原文，「新增一个网盘 = 新增一个文件」。
-  实际 `LinkProbe` 只有 `name/provider/needs_auth/check()`，URL 正则独立住在
-  `linkscan.py` 的 `_PROVIDER_PATTERNS` 里。**新增一个网盘要改四处**，
-  而漏掉 linkscan 那处不会有任何报错 —— 链接会被静默记成 `Provider.OTHER` 永不校验。
-  要么改文档，要么把 patterns 收回探针上。
-- §8 目录结构基本全错（`src/` 布局、`base/`、`services/extract/` 而非 `parse/`、
-  `repository/` 从未存在、`ratelimit.py` 不存在、漏了 `collect/`、`counters.py`、
-  `maintenance.py`、`models/source.py`、`models/tag.py` 等）
-- §10 里程碑表已过时
-- §3.1 缺 `next_parse_at`、§3.5 缺 `latency_ms`、§3.0 缺 `extra`
-- §7.2 的 `GET /search` 实际是 `GET /api/v1/media`，且少了
-  `provider` / `quality` / `sort(latest|hot)` 三个筛选维度，
-  `check_status` 默认值与文档相反（文档说默认只返 valid，实际默认全返），
-  列表项也没有 inline 的 `resources[]`（客户端拿到 20 条得再发 20 次详情请求）。
-  `Resource.seen_count` 采了但没有任何排序用到它，`sort=hot` 无从实现。
-- §7.1 的 `POST /raw/{id}/reparse` 和 `POST /resources/{id}/recheck` 都不存在
-  （`base/config.py` 的注释还在给这两个端点做承诺）。CLI 有等价能力，
-  缺的是 HTTP 面。补的时候注意：一旦有了 recheck，人工触发就会和 worker
-  并发打同一行，那时才真的需要单飞（现在靠 `UNIQUE(provider, share_id)` +
-  租约结构性地回避掉了）。
+这一条原本是「DESIGN.md 多处与代码矛盾」，文档侧已在 farfarfun/todo-list#831
+一轮里全部改正（§1 主键/抽取器/搜索后端、§3.0/§3.1/§3.5 字段、§6.1 探针接口、
+§7 API、§8 目录结构、§10 里程碑）。剩下的是代码侧的那半边：
+
+URL 识别与探测分居两处 —— `LinkProbe` 只有 `name/provider/needs_auth/check()`，
+URL 正则住在 `services/text/linkscan.py` 的 `_PROVIDER_PATTERNS` 里。新增一个
+网盘要改四处（`Provider` 枚举、`_PROVIDER_PATTERNS`、探针文件、`registry`），
+**漏掉 `_PROVIDER_PATTERNS` 那处不会有任何报错** —— 链接被静默记成
+`Provider.OTHER`，从此不进校验队列。
+
+把 `patterns` 收回探针上、让 `linkscan` 取所有已注册探针的并集，就能让四处变回
+一处，漏改会直接表现为「这个网盘压根识别不出来」而不是静默丢数据。
 
 ---
 

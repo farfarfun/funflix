@@ -46,10 +46,10 @@ source ──采集──> raw_document ──LLM 抽取──> extraction
 ## 快速开始
 
 ```bash
-funbuild install   # 本地构建并安装，清理旧构建、反映当前代码（生产发布用 funbuild build）
+pip install funflix        # 或 uv tool install funflix
 
 # 建库
-alembic upgrade head
+funflix db upgrade
 
 # 登记一个 Telegram 频道并采集一次
 funflix source add https://t.me/s/<频道名>

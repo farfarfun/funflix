@@ -15,6 +15,22 @@ uv run ruff format .       # 格式化
 uv run alembic revision --autogenerate -m "描述"
 ```
 
+## 本地安装与发布
+
+组织约定（SPEC §4.4）用 `funbuild` 做构建、版本递增、发布与打标签，不手写发布脚本。
+它是**独立安装的开发者工具**，不在本项目的 `dependencies` 或 `dev` extra 里 ——
+只用 funflix 的人不需要它，`pip install funflix` 就够了。
+
+```bash
+pip install funbuild        # 或 uv tool install funbuild
+
+funbuild install            # 本地构建并安装，清理旧构建，反映当前工作树的代码
+funbuild build              # 正式发布（递增版本 → 构建 → 校验 → 上传 → 打标签）
+```
+
+发布后记得在 [CHANGELOG.md](../CHANGELOG.md) 补上这个版本的条目（SPEC §14.3：
+按版本倒序，只记真实发布过的版本）。
+
 ## 跑 PostgreSQL 那部分测试
 
 默认测试全在 SQLite 上，走的是 `LikeSearchBackend`；而**生产上真正跑的是

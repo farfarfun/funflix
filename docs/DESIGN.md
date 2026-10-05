@@ -6,11 +6,11 @@
 
 | 维度 | 选择 | 说明 |
 | --- | --- | --- |
-| Web | FastAPI | 全异步，Pydantic v2 |
+| Web | FastAPI | 全异步，Pydantic v2；**不在本仓库**，见 funflix-api |
 | ORM | SQLAlchemy 2.0（Declarative + `Mapped[]`） | 异步 session |
 | DB | SQLite 起步，`DATABASE_URL` 可切 PostgreSQL | schema 只用两库共有类型 |
 | 迁移 | Alembic（`render_as_batch=True`） | SQLite 的 ALTER 限制 |
-| 抽取 | 全量 LLM（Claude，结构化输出） | 每条原始文本一次调用 |
+| 抽取 | 规则 / 表格 / LLM 三类抽取器（`extractor_kind` 选） | LLM 走 OpenAI 兼容协议（`llm` extra），非 anthropic SDK |
 | 网盘 | fundrive 2.0 + 自研 HTTP 探针 | 见 §6 |
 | 后台 | 库内状态机 + 租约领取 + `asyncio` 常驻循环 | 见 §5 |
 | 凭证 | funsecret（fundrive 原生配置方式） | 不入库不入 git |
@@ -19,9 +19,12 @@
 
 - 用 `sa.JSON`，不用 `JSONB`；PG 上通过 `.with_variant(JSONB, "postgresql")` 自动升级。
 - 所有 `DateTime(timezone=True)`，应用侧统一写 UTC-aware。
-- 主键统一 `BigInteger` 自增（SQLite 上退化为 INTEGER，Alembic variant 处理）。
+- 主键统一 **UUIDv7**（`sa.Uuid(as_uuid=True)`，客户端 `uuid7()` 生成）：毫秒时间戳
+  前缀保证字典序等于生成顺序，且多机并发写入不会撞号 —— 这是本地库拉取/推送同步
+  （`services/sync/`）的前提，自增整数做不到。非主键的大整数（`size_bytes`）才用 `BigInteger`。
 - 不用 PG 独有的 `ARRAY` / 部分索引 / `ON CONFLICT ... WHERE`；去重靠普通唯一索引 + 应用层 upsert。
-- 模糊搜索：SQLite 走 FTS5 虚拟表；PG 走 `pg_trgm`。抽象成 `SearchBackend` 协议，两套实现，见 §7.3。
+- 模糊搜索抽象成 `SearchBackend` 协议，按方言自动选实现，见 §7.3。PG 走 `pg_trgm`；
+  SQLite 目前只有 `LIKE` 兜底，规划中的 FTS5 后端还没落地。
 
 ---
 
@@ -85,6 +88,7 @@
 | `last_fetched_at` / `last_success_at` / `next_fetch_at` / `lease_until` | 调度状态 |
 | `consecutive_failures` / `last_error` | 健康度，用于退避与告警 |
 | `total_collected` | 累计产出的新 RawDocument 数 |
+| `extra` | JSON，各采集器自己的状态（如表格类源的 sheet 偏移），结构由采集器定义 |
 
 唯一索引 `(source_type, identifier)` —— 同一个源被登记两次会各持一份水位，把同批消息采两遍。
 索引 `(enabled, next_fetch_at)` 供调度器领取。
@@ -102,10 +106,11 @@
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `id` | BigInt PK | |
+| `id` | UUID PK | `uuid7()`，客户端生成、时间有序 |
 | `content` | Text | 原始文本全文，不做任何加工 |
 | `content_hash` | String(64) **UNIQUE** | `sha256(normalize_ws(content))`，入口去重 |
-| `source_type` | Enum | `telegram` / `tencent_docs` / `tencent_doc` / `rss` / `manual` / `api` |
+| `source_id` | UUID FK 可空 | 来自哪个 `source`（手工导入时为空） |
+| `source_type` | Enum | `SourceType`：`telegram` / `tencent_docs` / `tencent_doc` / `kdocs` / `rss` / `forum` / `web` / `api` / `manual` 等 |
 | `source_name` | String(128) | 频道名 / 站点名 |
 | `source_url` | String(1024) | 可空，原帖链接 |
 | `source_msg_id` | String(128) | 可空，来源侧消息 ID |
@@ -116,6 +121,8 @@
 | `parse_attempts` | Int | 重试计数 |
 | `parse_error` | Text | 最后一次失败原因 |
 | `lease_until` | DateTime(tz) | 任务租约，见 §5 |
+| `next_parse_at` | DateTime(tz) | 可空，重试退避到点时间（`base/backoff.py`）；没到点不领 |
+| `last_parsed_at` | DateTime(tz) | 可空，最后一次解析完成时间 |
 
 索引：`content_hash`(uniq)、`(parse_status, lease_until)`、`(source_type, source_name, published_at)`。
 
@@ -178,7 +185,11 @@
 
 ### 3.5 `link_check` — 校验历史（只追加）
 
-`id`, `resource_id` FK, `checked_at`, `status`, `http_code`, `detail`(Text), `probe`(String，用了哪个探针实现)
+`id`(UUID), `resource_id` FK, `provider`, `share_id`, `url`, `checked_at`, `status`,
+`http_code`, `probe`(String，用了哪个探针实现), `detail`(Text), `latency_ms`(Int，单次探测耗时)
+
+`provider` / `share_id` / `url` 在这里冗余存一份：resource 行可能被清理或改写，
+而失效率统计要能回答"当时打的是哪个地址"。
 
 保留时序，用于回答"这条链接什么时候挂的""某网盘最近整体失效率"。可按保留期归档。
 
@@ -298,31 +309,49 @@ LLM 出错代价最高的是链接，所以链接走**双轨**：
 ### 6.1 抽象
 
 ```python
-class LinkRef(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class LinkRef:
     provider: Provider
     share_id: str
     url: str
-    passcode: str | None
+    passcode: str | None = None
 
 
-class CheckOutcome(NamedTuple):
+@dataclass(slots=True)
+class CheckOutcome:
     status: CheckStatus
-    http_code: int | None
-    detail: str
-    title: str | None  # 网盘侧返回的资源名，可回填校正
-    size_bytes: int | None
+    http_code: int | None = None
+    detail: str | None = None
+    title: str | None = None       # 网盘侧返回的资源名，可回填校正
+    size_bytes: int | None = None
+    sharer_id / sharer_name / sharer_avatar_url: str | None = None
+    latency_ms: int | None = None
+
+    @property
+    def is_conclusive(self) -> bool: ...   # 只有 VALID/INVALID/NEED_PASSWORD 算结论
 
 
 class LinkProbe(Protocol):
+    name: str                      # 写进 link_check.probe，换实现后能区分历史数据
     provider: Provider
-    patterns: tuple[re.Pattern, ...]  # 识别 + 抽 share_id
     needs_auth: bool
 
-    def parse(self, url: str) -> LinkRef | None: ...
     async def check(self, ref: LinkRef) -> CheckOutcome: ...
 ```
 
-`registry.py` 按 provider 注册，`linkscan.py` 用所有 probe 的 `patterns` 并集扫原文 → 天然做到"新增一个网盘 = 新增一个文件"。
+**URL 识别不在探针上。** `LinkProbe` 只负责「这条链接现在还能不能用」；
+「这是哪家网盘、share_id 是哪一段」由 `services/text/linkscan.py` 的
+`_PROVIDER_PATTERNS` 单独维护。所以新增一个网盘实际要改四处：
+
+1. `base/enums.py` 的 `Provider` 加枚举值（以及 `CHECKABLE_PROVIDERS`）；
+2. `services/text/linkscan.py` 的 `_PROVIDER_PATTERNS` 加 URL 正则；
+3. `services/verify/<provider>.py` 写探针（匿名 HTTP 的继承 `AnonymousHttpProbe`，
+   只写 `endpoint` / `build_payload` / `classify`）；
+4. `services/verify/registry.py` 的 `_REGISTRY` 注册。
+
+**漏掉第 2 步不会有任何报错** —— 链接会被静默记成 `Provider.OTHER`，
+从此不进校验队列。把 patterns 收回探针上能让这四处变回一处，
+是个尚未做的重构，见 `docs/TODO.md` §5.6。
 
 ### 6.2 各网盘实现路径
 
@@ -358,40 +387,74 @@ class LinkProbe(Protocol):
 
 ## 7. API 设计
 
-前缀 `/api/v1`。
+HTTP 面不在本仓库，由独立的 [funflix-api](https://github.com/farfarfun/funflix-api)
+提供（它依赖本包，复用这里的模型、schema 与 `services/`）。本节描述的是**当前真实
+实现**的接口形态；本仓库只提供 CLI（`funflix ...`）与 worker。
+
+路由前缀由 funflix-api 的 `api_prefix` 配置决定，默认 `/api/v1`。除 `auth` 外
+多数接口要求已登录（session cookie）。
 
 ### 7.1 写入
 
-- `POST /raw` — body: `{content, source_type, source_name, source_url?, published_at?, extra?}`；支持数组批量。
-  返回 `{id, content_hash, duplicated: bool}`。`duplicated=true` 时直接返回已有记录，不重复消耗 LLM。
-- `POST /raw/{id}/reparse` — 强制重跑抽取（可指定 `prompt_version`）。
-- `POST /resources/{id}/recheck` — 立即重校验。
+- `POST /raw` — 单条入库，body 为 `RawDocumentCreate`，返回 `{id, content_hash, duplicated}`。
+  `duplicated=true` 时直接返回已有记录，不重复消耗 LLM。
+- `POST /raw/bulk` — 批量入库，返回 `BatchIngestResult`。
+- `POST /sources` — 登记采集源；`POST /sources/{id}/collect`、`POST /sources/{id}/parse`
+  手动触发单个源的采集 / 解析；`POST /sources/{id}/reset-parse` 重置解析水位。
+- `POST /resources/providers/{provider}/verify` — 按网盘批量重校验。
+
+暂未实现：按单条重跑的 `POST /raw/{id}/reparse` 与 `POST /resources/{id}/recheck`。
+CLI 有等价能力，缺的只是 HTTP 面；补的时候注意人工触发会和 worker 并发打同一行，
+那时才真的需要单飞（现在靠 `UNIQUE(provider, share_id)` + 租约结构性地回避掉了）。
 
 ### 7.2 查询
 
-- `GET /search` — 主查询接口
-  参数：`q`（剧名模糊）、`media_type`、`year`、`provider`、`check_status`（默认只返 `valid`）、`quality`、`sort`（`latest`/`hot`）、`page`/`size`
-  返回：按 `media` 聚合，每个 media 带 `resources[]`。
-- `GET /media/{id}` — 作品详情 + 全部资源（含失效的，标注状态）。
-- `GET /resources/{id}` — 单条资源详情 + 最近几次 `link_check` 历史。
-- `GET /raw/{id}` — 原始文本 + 抽取结果，用于排查。
+- `GET /media` — 主查询接口（不是 `/search`）。
+  参数：`keyword`（剧名关键词，留空按入库时间倒序）、`media_type`、`year`、
+  `valid_only`（**默认 `false`，即默认返回全部状态**）、`provider`、`page`/`size`。
+  返回 `Page[MediaSummary]`，**列表项不内联 `resources[]`**，要详情得再请求详情页。
+- `GET /media/{id}` — 作品详情 + 资源 + 标签，关联对象一律预加载
+  （异步会话下懒加载会在序列化时抛 `MissingGreenlet`）；资源最多返回 200 条，
+  `resource_count` 仍是真实总数。
+- `GET /resources` — 按 `provider` / `check_status` 翻页，按 `id` 倒序（不是
+  `last_seen_at`，后者会被 ingest 改写导致翻页时行在页间来回移动）。
+- `GET /resources/{id}`、`GET /raw`、`GET /raw/{id}`、`GET /sources`、`GET /sources/{id}`。
+
+尚未支持的筛选 / 排序维度：`quality`、`sort=latest|hot`。`Resource.seen_count`
+采了但没有任何排序用到它，`sort=hot` 目前无从实现。
 
 ### 7.3 搜索后端抽象
 
+定义在本仓库 `src/funflix/services/search.py`：
+
 ```python
+@runtime_checkable
 class SearchBackend(Protocol):
-    async def search_media(self, q: str, limit: int) -> list[int]: ...
+    name: str
+
+    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]: ...
+    async def count(self, session: AsyncSession, query: SearchQuery) -> int: ...
 ```
 
-- `SqliteFtsBackend`：`media_fts` FTS5 虚拟表，索引 `title + aliases`，触发器同步。
-- `PgTrgmBackend`：`pg_trgm` GIN 索引 + `similarity()` 排序。
-- `LikeBackend`：兜底，`LIKE %q%`，小数据量够用。
+筛选条件收敛在 `SearchQuery` 这个 dataclass 里（`keyword` / `media_type` / `year` /
+`valid_only` / `provider` / `limit` / `offset`），而不是散成一串位置参数。
 
-由 `DATABASE_URL` 的方言自动选择。
+实际只有两个实现，由 `get_backend()` 按数据库方言自动选择：
+
+- `PgTrgmSearchBackend`：`pg_trgm` GIN 索引，关键词子句必须写成 `a % b`
+  而不是 `similarity(a, b) > 阈值` —— 两者结果一样，只有前者走索引。
+- `LikeSearchBackend`：兜底，`LIKE %q%`，小数据量够用。
+
+规划中但**尚未实现**的 `SqliteFtsBackend`（`media_fts` FTS5 虚拟表 + 触发器同步）
+见 `docs/TODO.md` P6；在它落地之前，SQLite 一律回落到全表扫描的 `LIKE`。
 
 ### 7.4 运维
 
-`GET /healthz`、`GET /api/v1/admin/stats`（各状态计数、各网盘失效率、LLM token 消耗）。管理接口用 API Key header 保护。
+- `GET /healthz`（无前缀，不需要登录）。
+- `GET /api/v1/stats` — 流水线各状态计数（不是 `/api/v1/admin/stats`，也没有
+  单独的 API Key header 保护，走和其他接口一样的 session 鉴权）。
+
+LLM token 消耗与各网盘失效率目前不在这个接口里。
 
 ---
 
@@ -399,47 +462,50 @@ class SearchBackend(Protocol):
 
 ```
 funflix/
-├── pyproject.toml
-├── README.md
-├── docs/DESIGN.md
-├── alembic.ini
-├── migrations/versions/
-├── funflix/
-│   ├── config.py                 # pydantic-settings
-│   ├── db.py                     # async engine / session / Base
-│   ├── enums.py
-│   ├── models/                   # SQLAlchemy 2.0
-│   │   ├── raw.py  media.py  resource.py  check.py  extraction.py
-│   ├── schemas/                  # Pydantic I/O
-│   ├── repository/               # 数据访问，含 claim/lease 逻辑
+├── pyproject.toml  README.md  CHANGELOG.md
+├── docs/           DESIGN.md  TODO.md  DEVELOPMENT.md
+├── alembic.ini  migrations/versions/
+├── scripts/setup.sh              # worker 生命周期（SPEC §6.1）
+├── src/funflix/
+│   ├── compat.py                 # 3.11+ 名字（StrEnum / UTC）的版本垫片
+│   ├── security.py               # 登录密码哈希
+│   ├── cli.py                    # typer 入口 + 交互式菜单
+│   ├── base/
+│   │   ├── config.py             # pydantic-settings
+│   │   ├── db.py                 # async engine / session
+│   │   ├── enums.py              # Provider / CheckStatus / ParseStatus ...
+│   │   ├── backoff.py            # 三条流水线共用的指数退避
+│   │   ├── http.py               # 公共请求头
+│   │   └── commit_batcher.py     # 按条数/时间节流提交
+│   ├── models/                   # SQLAlchemy 2.0：raw/media/resource/check/
+│   │   └──                       # extraction/source/tag/user/association/base
+│   ├── schemas/                  # Pydantic I/O：common/media/raw/source/stats
 │   ├── services/
-│   │   ├── ingest.py
-│   │   ├── parse/
-│   │   │   ├── llm.py            # Claude 调用 + 结构化输出
-│   │   │   ├── prompts.py        # 带 PROMPT_VERSION 常量
-│   │   │   ├── linkscan.py       # 正则扫链接 + URL 规范化
-│   │   │   └── pipeline.py       # 抽取→校正→归一→落库
-│   │   ├── normalize.py          # norm_key 纯函数
-│   │   ├── search/               # SearchBackend 三实现
-│   │   └── verify/
-│   │       ├── base.py  registry.py  ratelimit.py
-│   │       ├── fundrive_probe.py # 通用 fundrive 适配器
-│   │       ├── quark.py  alipan.py  baidu.py  lanzou.py  pan115.py  tianyi.py
-│   ├── worker/
-│   │   ├── claim.py              # 租约领取
-│   │   ├── scheduler.py          # asyncio 常驻扫描
-│   │   └── tasks.py              # parse_document / check_resource
-│   ├── api/
-│   │   ├── app.py  deps.py
-│   │   └── v1/ raw.py media.py resources.py search.py admin.py
-│   └── cli.py                    # typer: import / reparse / recheck / worker
-└── tests/
-    ├── test_normalize.py         # 剧名归一，表驱动，重点覆盖
-    ├── test_linkscan.py          # 各网盘 URL 正则，含畸形样例
-    ├── test_probes.py            # respx mock HTTP
-    └── test_api.py
+│   │   ├── ingest.py             # 原始文本入库 + content_hash 去重
+│   │   ├── counters.py  stats.py  maintenance.py
+│   │   ├── search.py             # SearchQuery + Like/PgTrgm 两个后端
+│   │   ├── collect/              # 采集器：telegram/rss/web/collection/kdocs/
+│   │   │                         # tencent_sheet/tencent_text/yyets + registry
+│   │   │                         # + runner / concurrent_runner / priority
+│   │   ├── extract/              # 抽取：rule / sheet / llm（client/extractor/
+│   │   │                         # prompts）+ registry + runner/concurrent_runner
+│   │   ├── text/                 # 纯函数层：linkscan / normalize / segment
+│   │   ├── verify/               # 探针：quark/uc/alipan/pan123/ctfile
+│   │   │                         # + base（AnonymousHttpProbe）+ registry
+│   │   │                         # + runner（限流）/ concurrent_runner
+│   │   └── sync/                 # 跨库同步：runner / tables
+│   └── worker/
+│       ├── claim.py              # 租约领取
+│       ├── scheduler.py          # asyncio 常驻扫描
+│       └── tasks.py              # 单轮采集/解析/校验
+└── tests/                        # 与上面一一对应，另有 test_compat.py
+                                  # 与 test_setup_script.py 两个约定测试
 ```
 
+注意几处与早期规划的差异：包是 `src/` 布局；没有独立的 `repository/` 层
+（claim/lease 逻辑在 `worker/claim.py`）；解析目录叫 `extract/` 不是 `parse/`；
+限流在 `verify/runner.py` 里而不是单独的 `ratelimit.py`；HTTP 层（`api/`）
+整个在 funflix-api 仓库。
 ---
 
 ## 9. 打包
@@ -468,8 +534,8 @@ funflix/
 | M3 ✅ | LLM 抽取 + `extraction` 缓存 + 落库 pipeline | 端到端出结构化数据 |
 | M4 ✅ | verify 抽象 + quark/alipan 两个匿名探针 + 限流 | 校验闭环 |
 | M5 ✅ | worker claim/lease + 周期扫描 + `funflix worker` | 可靠性 |
-| M6 🚧 | `/search` + SearchBackend + media 聚合 | 服务层与 CLI 已有；缺 HTTP 路由与 SqliteFtsBackend |
-| M7 🚧 | 其余网盘探针、admin stats、CLI 批量导入 | 批量导入已有；缺其余探针与 admin 接口 |
+| M6 🚧 | 查询 + SearchBackend + media 聚合 | 服务层、CLI 与 funflix-api 的 `GET /media` 已有；缺 `SqliteFtsBackend`（SQLite 仍走 `LIKE` 全表扫描）与 `quality`/`sort` 筛选 |
+| M7 🚧 | 其余网盘探针、运维接口、CLI 批量导入 | 批量导入与 `GET /api/v1/stats` 已有；缺百度/蓝奏/天翼等探针，缺按条重跑的 `reparse`/`recheck` HTTP 面 |
 
 ---
 
