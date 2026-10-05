@@ -11,8 +11,8 @@
 source ──采集──> raw_document ──LLM 抽取──> extraction
 （频道/水位）      （原始文本）                  │
                                               ▼
-                                    media + resource ──校验──> link_check
-                                   （作品）  （网盘链接）
+                             work → media + resource ──校验──> link_check
+                            （剧） （季）  （网盘链接）
 ```
 
 每一层各自幂等、可单独重跑。当前进度：
@@ -106,7 +106,7 @@ HTTP API 服务由独立的 `funflix-api` 包提供（依赖本包），见
 | `funflix worker` | 常驻后台 worker：周期性地采集、解析、校验（`--once` 只跑一轮就退出） |
 | `funflix probes` | 列出可用的网盘校验探针 |
 | `funflix extractors` | 列出可用的抽取器 |
-| `funflix search <keyword>` | 按剧名搜索作品及其资源 |
+| `funflix search <keyword>` | 按剧名搜索作品，一部剧一条、季是子层（`--links` 调每季列几条链接） |
 | `funflix doc <doc_id>` | 查看一条原始文本及其解析状态 |
 | `funflix ingest <path>` | 从文件导入原始文本（`.txt` / `.jsonl`） |
 
@@ -182,13 +182,15 @@ funflix source collect
 
 ## 接口
 
-HTTP API（`/api/v1/sources`、`/raw`、`/media`、`/resources`、`/stats`、鉴权等）由
+HTTP API（`/api/v1/sources`、`/raw`、`/works`、`/resources`、`/stats`、鉴权等）由
 独立的 `funflix-api` 包提供，见
 [funflix-api](https://github.com/farfarfun/funflix-api) 的 README。CLI（`funflix
 user` / `funflix source` 等）直连数据库，不走 HTTP，不受影响。
 
-`/media` 的关键词匹配走 `services/search.py` 的后端抽象：PostgreSQL 上用 `pg_trgm`
-容错匹配并按相似度排序，其余方言回落 `LIKE`，调用方无感知。
+`/works` 的关键词匹配走 `services/search.py` 的后端抽象：PostgreSQL 上用 `pg_trgm`
+容错匹配并按相似度排序，其余方言回落 `LIKE`，调用方无感知。搜索的主体是 `work`
+（一部剧）而不是 `media`（一季）—— 搜「大主宰」给的是一条「大主宰（3 季 / 78
+资源）」，而不是几百条同名行。
 
 PostgreSQL 上的三条实测结论（`tests/test_search_pg.py`，5 万行）：
 
@@ -201,7 +203,7 @@ PostgreSQL 上的三条实测结论（`tests/test_search_pg.py`，5 万行）：
 > 📌 **批量导入后记得 VACUUM**。GIN 索引默认开着 fastupdate，新行先进一个待合并
 > 列表；合并前规划器认为索引很贵（实测位图扫描启动代价 2515 vs 合并后 64），
 > 于是绕开它走全表扫描。autovacuum 会自动处理，赶时间就手动
-> `VACUUM ANALYZE media;`。
+> `VACUUM ANALYZE work;`。
 
 > ⚠️ DESIGN §7.3 还规划了 `SqliteFtsBackend`（FTS5 虚拟表），目前**尚未实现**。
 > 也就是说 SQLite 部署上关键词搜索仍是 `LIKE %x%` 全表扫描 —— 几千条无所谓，

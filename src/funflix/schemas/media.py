@@ -152,4 +152,8 @@ class WorkDetail(WorkSummary):
     imdb_id: str | None
     created_at: datetime
     updated_at: datetime
+    #: 各季标签去重后的并集。标签在库里挂在季上（`media_tag`），但「国漫」「悬疑」
+    #: 这种题材/地区标签描述的是整部剧，所以在作品这一层汇总展示。
+    #: `Work` 上没有对应的关系属性，由接口层查出来再塞进来（`v1/works.py`）。
+    tags: list[TagOut] = Field(default_factory=list)
     seasons: list[SeasonDetail] = Field(default_factory=list)

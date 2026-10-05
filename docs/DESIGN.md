@@ -139,23 +139,65 @@
 
 唯一索引 `(raw_document_id, model, prompt_version)` → 天然做**结果缓存**，重复提交同一文本不会二次烧 token。
 
-### 3.3 `media` — 归一后的作品实体
+### 3.3 `work` + `media` — 作品与季（两层）
+
+作品实体是**两层**的：`work` 是一部剧，`media` 是它的一季。搜索和浏览的主体
+是 `work` —— 搜「大主宰」要给一条「大主宰（3 季 / 78 资源）」，而不是几百条
+同名行。
+
+早先只有单层 `media`，身份是 `(norm_key, media_type, year)`。这个身份太脆：
+同一部剧在不同分享里年份被识别成 0/2023/2025、类型被判成 anime/tv/unknown，
+于是裂成多行 —— 生产库 92 万行 media 对应 89 万个不同 norm_key，等于归一层
+完全失效。收口之后**身份里不再有 `year` 和 `media_type`**，它们退化成「取已知
+的最佳值」的属性。
+
+#### `work`
 
 | 字段 | 说明 |
 | --- | --- |
 | `id` | |
 | `title` | 展示用主标题 |
-| `norm_key` | String(255)，归一键，见 §4.2 |
+| `norm_key` | String(255) **UNIQUE** —— 作品的身份就是它，见 §4.3 |
 | `original_title` | 可空，外语原名 |
-| `media_type` | `movie` / `tv` / `anime` / `variety` / `documentary` / `unknown` |
-| `year` | Int 可空 |
+| `media_type` | 见下方枚举 |
+| `year` | Int，首播年份；`0` = 未知（`UNKNOWN_YEAR`） |
 | `aliases` | JSON `list[str]`，收集到的各种叫法 |
 | `tmdb_id` / `douban_id` / `imdb_id` | 可空，预留外部富化 |
 | `poster_url` / `overview` | 可空 |
-| `resource_count` / `valid_resource_count` | 冗余计数，查询列表页用 |
+| `season_count` / `resource_count` / `valid_resource_count` | 冗余计数，列表页用 |
 | `created_at` / `updated_at` | |
 
-唯一索引 `(norm_key, media_type, year)`。`year` 为空时用哨兵值 `0` 参与唯一约束（SQLite/PG 对 NULL 在唯一索引里的行为不一致，必须避开 NULL）。
+`media_type` 枚举：`movie` / `tv` / `anime` / `variety` / `documentary` /
+`unknown` / `book` / `comic` / `other`。后三个是**非影视** —— 采集源里混着大量
+小说、漫画、课程的分享（`大主宰 我荒古圣体当为天帝 作者:墨之所想 txt` 是小说，
+不是那部动漫），它们是真资源，所以保留但**默认不进搜索结果**，见 §7.3 的
+`VIDEO_MEDIA_TYPES`。`unknown` 不在此列：它是「还没判出类型」而不是「不是
+影视」，库里 40 多万部作品是这个值，排掉等于把它们整体藏起来。
+
+#### `media`（一行 = 一季）
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | |
+| `work_id` FK | NOT NULL，所属作品 |
+| `season` | Int NOT NULL；`0` = 无季概念（电影/单季剧/综艺，`NO_SEASON`） |
+| `title` | 这一季的展示名，如「大主宰 第2季」 |
+| `norm_key` / `media_type` / `year` | 保留：调试、兼容、以及季自己的播出年份 |
+| `aliases` / `poster_url` / `overview` / 外部 ID | 同 `work`，季级覆盖 |
+| `resource_count` / `valid_resource_count` | 冗余计数 |
+
+唯一索引 `(work_id, season)` —— 季的身份。原来的 `uq_media_identity` 已删除。
+
+两级计数都是**重算而非增减**，并且有严格的调用顺序：`refresh_media_counters`
+先按关联表重算季级计数（并物理删除零资源的季），`refresh_work_counters` 再把
+`media.resource_count` 往上滚一层。顺序反了作品会停在旧的季级计数上，不报错
+但悄悄对不上。改过关联或校验状态的路径统一走
+`refresh_counters_for_media`（它按正确顺序刷两级，且在删季**之前**问出作品
+归属 —— 行删掉之后就再也查不到它曾属于哪部作品）。见
+`services/counters.py`。
+
+归一流水线（垃圾清理 → 确定性建 Work → LLM 裁决 → 应用裁决）见
+`services/canon/`，裁决缓存在 `title_canon` 表。
 
 ### 3.4 `resource` — 一条网盘资源（核心表）
 
@@ -195,7 +237,10 @@
 
 ### 3.6 关系
 
-`raw_document 1─n extraction`、`raw_document 1─n resource`、`media 1─n resource`、`resource 1─n link_check`。
+`work 1─n media`（一部剧 n 季）、`raw_document 1─n extraction`、
+`raw_document 1─n resource`、`media n─n resource`（经 `media_resource`，同一条
+链接可以属于多部作品/多季，合集分享很常见）、`media n─n tag`（经 `media_tag`）、
+`resource 1─n link_check`。
 
 ---
 
@@ -260,7 +305,17 @@ LLM 出错代价最高的是链接，所以链接走**双轨**：
 4. 繁体 → 简体（`opencc`，可选依赖，缺失时降级跳过）。
 5. 去除所有空白与标点，小写化 → `norm_key`。
 
-归并策略：`(norm_key, media_type, year)` 命中已有 `media` 则复用并把原始标题追加进 `aliases`；否则新建。
+`series_norm_key()` 在上面的基础上再剥掉季号与外文原名 token，产出**作品级**的
+归一键 —— 它是 `work.norm_key`，也是归一流水线的分块键。`extract_season()` 只在
+高置信写法（`第N季`、`年番N`、独立罗马数字）上给出季号，拿不准就返回 `None` 交给
+LLM：真实数据上激进的正则抽季误报率不可接受（同一组里会抽出 2/4/6/8/10，其中
+4 和 10 是 `S01E04` 之类的误命中）。
+
+归并策略：先查 `title_canon`（LLM 裁决的缓存），命中就落到它指定的 Work/季；
+未命中则按 `series_norm_key` get-or-create `Work`，再按 `(work_id, season)`
+get-or-create 季，并把原始标题追加进 `aliases`，同时写一条
+`title_canon(status=pending)` 等待裁决。身份里**不含** `media_type` 和 `year`
+（§3.3 说明了原因），所以不需要早先那套「类型放宽」回退。
 
 ---
 
@@ -409,13 +464,24 @@ CLI 有等价能力，缺的只是 HTTP 面；补的时候注意人工触发会�
 
 ### 7.2 查询
 
-- `GET /media` — 主查询接口（不是 `/search`）。
+- `GET /works` — 主查询接口（不是 `/search`，也不再是 `/media`）。查询的主体是
+  **作品**，一部剧一行。
   参数：`keyword`（剧名关键词，留空按入库时间倒序）、`media_type`、`year`、
   `valid_only`（**默认 `false`，即默认返回全部状态**）、`provider`、`page`/`size`。
-  返回 `Page[MediaSummary]`，**列表项不内联 `resources[]`**，要详情得再请求详情页。
-- `GET /media/{id}` — 作品详情 + 资源 + 标签，关联对象一律预加载
-  （异步会话下懒加载会在序列化时抛 `MissingGreenlet`）；资源最多返回 200 条，
-  `resource_count` 仍是真实总数。
+  返回 `Page[WorkSummary]`，**列表项既不内联季也不内联资源** —— 季数/资源数读
+  `work` 上的冗余计数，要明细再请求详情页。
+  不传 `media_type` 时只返回影视类型，非影视（`book`/`comic`/`other`）要显式传
+  才看得到，见 §7.3。
+- `GET /works/{id}` — 作品详情：季列表嵌套，每季带若干资源，标签跨季取并集
+  （标签挂在季上，但题材/地区描述的是整部剧）。关联对象一律预加载（异步会话下
+  懒加载会在序列化时抛 `MissingGreenlet`）。
+  每季最多返回 50 条资源、可用的排前面，季上的 `resource_count` 仍是真实总数。
+  上限是**按季**而不是按作品：热门剧某一季能有近千条分享，一个全局上限会让后面
+  的季一条链接都拿不到。截断用 `set_committed_value` 写回关系属性 —— 直接赋值
+  会被 ORM 当成「这就是全部关联」，flush 时把没列进来的关联行删掉，截断展示就
+  变成了截断数据。
+- `GET /media/{id}` — **季**级详情 + 该季全部资源 + 标签，资源最多返回 200 条。
+  作品详情页给的那一把不够看时才用得上。
 - `GET /resources` — 按 `provider` / `check_status` 翻页，按 `id` 倒序（不是
   `last_seen_at`，后者会被 ingest 改写导致翻页时行在页间来回移动）。
 - `GET /resources/{id}`、`GET /raw`、`GET /raw/{id}`、`GET /sources`、`GET /sources/{id}`。
@@ -432,12 +498,24 @@ CLI 有等价能力，缺的只是 HTTP 面；补的时候注意人工触发会�
 class SearchBackend(Protocol):
     name: str
 
-    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]: ...
+    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Work]: ...
     async def count(self, session: AsyncSession, query: SearchQuery) -> int: ...
 ```
 
+返回的是 `Work` 而不是 `Media` —— 搜索的主体是一部剧（§3.3）。资源筛选
+（`valid_only` / `provider`）因此要多穿一层：`work → media → media_resource →
+resource` 走完四张表，用 EXISTS 而不是 JOIN（后者会因为一部作品有多条资源而
+产生重复行，还得再 DISTINCT）。
+
 筛选条件收敛在 `SearchQuery` 这个 dataclass 里（`keyword` / `media_type` / `year` /
-`valid_only` / `provider` / `limit` / `offset`），而不是散成一串位置参数。
+`valid_only` / `provider` / `with_seasons` / `limit` / `offset`），而不是散成一串
+位置参数。两个与默认行为有关的点：
+
+- `media_type` 留空时只返回 `VIDEO_MEDIA_TYPES`（影视 + `unknown`）。新增影视
+  类型时记得加进这个集合，否则它会默认不可见。
+- `with_seasons` 控制是否顺带预加载季列表，默认关。它放在 `SearchQuery` 上而不
+  是让调用方自己加 `options()`：构造语句的是后端，调用方插不进去；而异步会话下
+  懒加载会抛 `MissingGreenlet`，不是悄悄多发几条查询。
 
 实际只有两个实现，由 `get_backend()` 按数据库方言自动选择：
 
@@ -445,7 +523,7 @@ class SearchBackend(Protocol):
   而不是 `similarity(a, b) > 阈值` —— 两者结果一样，只有前者走索引。
 - `LikeSearchBackend`：兜底，`LIKE %q%`，小数据量够用。
 
-规划中但**尚未实现**的 `SqliteFtsBackend`（`media_fts` FTS5 虚拟表 + 触发器同步）
+规划中但**尚未实现**的 `SqliteFtsBackend`（`work_fts` FTS5 虚拟表 + 触发器同步）
 见 `docs/TODO.md` P6；在它落地之前，SQLite 一律回落到全表扫描的 `LIKE`。
 
 ### 7.4 运维

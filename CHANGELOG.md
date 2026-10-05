@@ -6,6 +6,32 @@
 
 ### 新增
 
+- **作品实体改成两层：`work`（一部剧）+ `media`（一季）**。搜「大主宰」原先返回
+  448 行 media（同一部作品的噪声变体），现在是一条「大主宰（3 季 / 78 资源）」。
+  根因是旧身份 `(norm_key, media_type, year)` 太脆 —— 同一部剧在不同分享里年份被
+  识别成 0/2023/2025、类型被判成 anime/tv/unknown 就会裂成多行，生产库 92 万行
+  media 对应 89 万个不同 norm_key。新身份：`work.norm_key` 唯一，
+  `media` 是 `(work_id, season)` 唯一，`year`/`media_type` 退化成属性。
+- `services/canon/`：归一流水线 —— `purge`（删页面文案/提取码/纯数字那类假作品，
+  resource 行保留）、`rebuild`（规则重算 + 确定性建 Work）、`resolver`（LLM 裁决
+  残局）、`merge`（应用裁决）。各阶段都支持 `--dry-run` / `--key` / `--limit`、
+  按组提交可中断续跑。裁决结果落 `title_canon` 表，是完整审计记录，重跑 parse
+  或新数据入库都不会把已经并好的东西重新拆开。
+- `services/counters.refresh_work_counters()` 与 `refresh_counters_for_media()`：
+  后者是**两级联动的默认入口**。搜索列表读的是 `work` 上的计数，季级刷完不往上
+  滚一层的话，新入库的资源在结果里看不见而且不报任何错。作品归属必须在刷季
+  **之前**问出来 —— 刷季会顺手物理删除零资源的季，行删掉就再也查不到它曾属于
+  哪部作品。
+- `MediaType` 新增 `book` / `comic` / `other` 三个**非影视**类型。采集源里混着大量
+  小说、漫画、课程的分享，它们是真资源，所以保留但默认不进搜索结果
+  （`services/search.VIDEO_MEDIA_TYPES`）；要查就显式传 `media_type`。
+  `unknown` **留在**默认可见集合里：它是「还没判出类型」而不是「不是影视」，
+  库里 40 多万部作品是这个值。
+- `services/text/normalize`：`series_norm_key()` / `extract_season()` /
+  `strip_season()` / `looks_like_junk_title()` / `strip_scrape_labels()`，以及噪声
+  词表的大幅补齐（`更至03`、`每周自动更新`、`4K高码率版`、`《》「」`、URL 碎片、
+  抓取字段标签等）。`extract_season` 只在高置信写法上给出季号，拿不准返回 `None`
+  交给 LLM —— 真实数据上激进的正则抽季误报率不可接受。
 - `src/funflix/compat.py`：按解释器版本择一导出 `enum.StrEnum` 与 `datetime.UTC`
   （都是 Python 3.11 才进标准库的名字），3.10 上的 `StrEnum` fallback 复刻标准库
   语义（成员是 `str`、`str()`/`format()` 取成员值、`auto()` 取小写成员名）。
@@ -17,6 +43,19 @@
 
 ### 变更
 
+- **搜索的主体从 `Media` 改成 `Work`**（`services/search.py`）：两个后端都返回
+  `list[Work]`，`search_media`/`count_media` 改名为 `search_works`/`count_works`。
+  资源筛选（`valid_only` / `provider`）因此要多穿一层，走完
+  `work → media → media_resource → resource` 四张表。`SearchQuery` 新增
+  `media_type` 与 `with_seasons`。
+- `funflix search` 改成一部剧一条、季是子层的两级展示，新增 `--links` 控制每季
+  列几条链接（默认 5）—— 热门剧某一季有 793 条分享，全列出来是几百屏噪声。
+- `schemas/media.py` 新增 `WorkSummary` / `WorkDetail` / `SeasonSummary` /
+  `SeasonDetail`，年份哨兵的处理抽成共享基类 `_YearBlanked`。
+- `extract/runner.py`、`maintenance.py` 的计数刷新路径统一改走
+  `refresh_counters_for_media`。
+- `docs/DESIGN.md` §3.3 / §3.6 / §4.3 / §7.2 / §7.3 与 README 的流水线图、接口段
+  按两层模型重写。
 - **Python 下限由 `>=3.12` 降到 `>=3.10`**（SPEC §3 的组织基线）：6 处 PEP 695 类型参数
   语法改写为 `typing.TypeVar`，`enum.StrEnum`/`datetime.UTC` 改从 `funflix.compat` 取；
   classifiers 补齐 3.10~3.13，Ruff `target-version` 改为 `py310`。测试在 3.10 与 3.13
