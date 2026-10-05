@@ -114,11 +114,17 @@ HTTP API 服务由独立的 `funflix-api` 包提供（依赖本包），见
 `status` 不区分环境，不带参数）：
 
 ```bash
-scripts/setup.sh start dev
-scripts/setup.sh status
+scripts/setup.sh start dev    # 后台启动（dev 走 uv run，跑工作树里的源码）
+scripts/setup.sh status       # 不区分环境；未运行时返回非 0
 scripts/setup.sh stop dev
-scripts/setup.sh run prod
+scripts/setup.sh restart dev
+scripts/setup.sh run prod     # 前台运行（prod 跑已安装的 funflix 正式包）
 ```
+
+`dev` 用 `uv run funflix worker`，`prod` 用 PATH 里已安装的 `funflix` 正式包；
+`prod` 下找不到 `funflix` 命令会直接报错退出，不会回退到源码。`start` 会等待
+约 2 秒（`FUNFLIX_START_WAIT` 可调）确认进程确实活着才写 PID 文件并报告成功，
+启动即退出会打印日志尾部并返回非 0；对已经在运行的 worker 重复 `start` 也返回非 0。
 
 运行状态、PID 和日志位于 `.run/`。
 

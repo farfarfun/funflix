@@ -55,6 +55,26 @@ if [ "$action" = "status" ]; then
   exit 0
 fi
 
+# SPEC §6.1：prod 只能跑已安装的正式包，缺失就报错退出，绝不回退到源码。
+# 这里在 start/run 真正拉起进程之前先校验入口可用，而不是等后台进程失败后
+# 才从日志里发现——后者会让脚本先打印"已启动"，再留下一个空壳 PID 文件。
+require_prod_entrypoint() {
+  if ! command -v funflix >/dev/null 2>&1; then
+    echo "错误：prod 环境要求已安装 funflix 正式包，但 PATH 里找不到 funflix 命令。" >&2
+    echo "      请先 pip install funflix（或 uv tool install funflix）后重试；" >&2
+    echo "      不要用 dev 环境代替——dev 走 uv run，跑的是工作树里的源码。" >&2
+    exit 1
+  fi
+}
+
+require_dev_toolchain() {
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "错误：dev 环境要用 uv 运行工作树里的源码，但 PATH 里找不到 uv 命令。" >&2
+    echo "      安装方式见 https://docs.astral.sh/uv/getting-started/installation/" >&2
+    exit 1
+  fi
+}
+
 [ "$#" -eq 2 ] || usage
 env_name=$2
 case "$env_name" in
@@ -63,10 +83,23 @@ case "$env_name" in
   *) usage ;;
 esac
 
+# 只有真要拉起进程的动作才做环境校验；restart 由它自己 exec 出去的 start 负责。
+if [ "$action" = "start" ] || [ "$action" = "run" ]; then
+  case "$env_name" in
+    dev) require_dev_toolchain ;;
+    prod) require_prod_entrypoint ;;
+  esac
+fi
+
 case "$action" in
   start)
     case "$(pid_state)" in
-      running) echo "worker 已运行（PID $(cat "$pid_file")）"; exit 0 ;;
+      # SPEC §6.1：拒绝重复启动——要以失败状态拒绝，调用方（CI、supervisor、
+      # 人工 && 串联）才能发现"这次没真的启动"，exit 0 会把它伪装成成功。
+      running)
+        echo "错误：worker 已在运行（PID $(cat "$pid_file")），拒绝重复启动。" >&2
+        exit 1
+        ;;
       stale) clear_stale_pid_file ;;
     esac
     mkdir -p "$run_dir"
@@ -74,8 +107,18 @@ case "$action" in
     trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
     cd "$root"
     nohup "${command[@]}" >>"$log_file" 2>&1 &
-    echo $! >"$pid_file"
-    echo "worker 已启动（PID $(cat "$pid_file")）"
+    child_pid=$!
+    # 启动失败（入口缺失、配置错误、数据库连不上）几乎都发生在头一两秒内。
+    # 不等就写 PID 文件并打印"已启动"，会把一个已经退出的进程报成运行中。
+    sleep "${FUNFLIX_START_WAIT:-2}"
+    if ! pid_is_worker "$child_pid"; then
+      echo "错误：worker 启动后立即退出（PID $child_pid），最后 20 行日志：" >&2
+      tail -n 20 "$log_file" >&2 || true
+      echo "完整日志：$log_file" >&2
+      exit 1
+    fi
+    echo "$child_pid" >"$pid_file"
+    echo "worker 已启动（PID $child_pid），日志：$log_file"
     ;;
   stop)
     case "$(pid_state)" in
