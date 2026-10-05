@@ -140,6 +140,31 @@ async def refresh_work_counters(session: AsyncSession, work_ids: Iterable[uuid.U
     return len(ids)
 
 
+async def refresh_counters_for_media(session: AsyncSession, media_ids: Iterable[uuid.UUID]) -> int:
+    """刷一批季的计数，顺带把它们所属的作品也刷上 —— **两级联动的默认入口**。
+
+    除了归并流水线（`canon/*` 自己按组分别刷两级，顺序见那里的说明），
+    其余所有改动过关联或校验状态的路径都该用这个，而不是直接调
+    `refresh_media_counters`：搜索列表展示的是 `Work` 上的计数，季级刷完
+    不往上滚一层的话，作品会一直停在旧值 —— 入库了新资源却显示不出来，
+    而且不会报任何错。
+
+    作品归属必须在刷季**之前**问出来：`refresh_media_counters` 的契约是顺手
+    物理删除零资源的季，行删掉之后就再也查不到它曾属于哪部作品了
+    （`canon/purge.py` 的删除路径栽在同一件事上）。
+
+    Returns:
+        实际处理的季数，与 `refresh_media_counters` 一致。
+    """
+    ids = {i for i in media_ids if i is not None}
+    if not ids:
+        return 0
+    work_ids = set(await session.scalars(select(Media.work_id).where(Media.id.in_(ids))))
+    touched = await refresh_media_counters(session, ids)
+    await refresh_work_counters(session, work_ids)
+    return touched
+
+
 async def refresh_for_resource(session: AsyncSession, resource_id: uuid.UUID) -> int:
     """重算与某条资源相关联的全部作品的计数。
 
@@ -151,4 +176,4 @@ async def refresh_for_resource(session: AsyncSession, resource_id: uuid.UUID) ->
             select(media_resource.c.media_id).where(media_resource.c.resource_id == resource_id)
         )
     )
-    return await refresh_media_counters(session, media_ids)
+    return await refresh_counters_for_media(session, media_ids)

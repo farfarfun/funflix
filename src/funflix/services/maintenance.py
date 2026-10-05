@@ -25,7 +25,7 @@ from funflix.models import (
     media_tag,
     utcnow,
 )
-from funflix.services.counters import refresh_media_counters
+from funflix.services.counters import refresh_counters_for_media
 from funflix.services.text.linkscan import identify_provider, is_non_resource_url
 from funflix.services.text.normalize import classify_tag
 from funflix.services.verify.base import CheckOutcome
@@ -416,7 +416,7 @@ async def cleanup_resources(session: AsyncSession) -> CleanupResourcesReport:
     report.blacklisted_deleted = len(blacklisted)
 
     for chunk in _chunks(list(affected_media_ids)):
-        report.media_recounted += await refresh_media_counters(session, chunk)
+        report.media_recounted += await refresh_counters_for_media(session, chunk)
     await session.commit()
     return report
 

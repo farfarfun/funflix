@@ -203,11 +203,12 @@ class TestTrgmSearch:
             await _add_season(pg_session, works[0], season=season)
 
         backend = PgTrgmSearchBackend()
-        query = SearchQuery(keyword="误杀2", limit=100)
+        query = SearchQuery(keyword="误杀", limit=100)
         rows = await backend.search(pg_session, query)
 
-        assert [w.title for w in rows] == ["误杀2"]
-        assert await backend.count(pg_session, query) == 1
+        # 《误杀2》有 3 季，但它在结果里只占一行。打在 media 上的话是 3 行。
+        assert sorted(w.title for w in rows) == ["误杀2", "误杀瞒天记"]
+        assert await backend.count(pg_session, query) == 2
 
     async def test_seasons_are_loaded_on_demand(self, pg_session) -> None:
         """`with_seasons` 打开时季要随查询一起回来。
@@ -250,10 +251,10 @@ class TestResourceFiltersCrossSeasons:
     async def test_provider_filter_crosses_the_season_hop(self, pg_session) -> None:
         works = await _seed(pg_session)
         await _add_season(pg_session, works[0], season=1, provider=Provider.QUARK)
-        await _add_season(pg_session, works[2], season=1, provider=Provider.ALIYUN)
+        await _add_season(pg_session, works[2], season=1, provider=Provider.ALIPAN)
 
         backend = PgTrgmSearchBackend()
-        query = SearchQuery(keyword="误杀", provider=Provider.ALIYUN, limit=100)
+        query = SearchQuery(keyword="误杀", provider=Provider.ALIPAN, limit=100)
         rows = await backend.search(pg_session, query)
 
         assert [w.title for w in rows] == ["误杀瞒天记"]

@@ -734,7 +734,7 @@ class TestRunnerParseBatch:
         assert tags[0].media_count >= 1
 
     @pytest.mark.asyncio
-    async def test_refresh_media_counters_runs_once_for_the_whole_batch(
+    async def test_counter_refresh_runs_once_for_the_whole_batch(
         self, session, monkeypatch
     ) -> None:
         from funflix.services.extract import runner as runner_module
@@ -745,13 +745,13 @@ class TestRunnerParseBatch:
         await session.commit()
 
         calls = []
-        real_refresh = runner_module.refresh_media_counters
+        real_refresh = runner_module.refresh_counters_for_media
 
         async def _spy(session, media_ids):
             calls.append(set(media_ids))
             return await real_refresh(session, media_ids)
 
-        monkeypatch.setattr(runner_module, "refresh_media_counters", _spy)
+        monkeypatch.setattr(runner_module, "refresh_counters_for_media", _spy)
 
         await parse_batch(session, docs, RuleExtractor())
         await session.commit()

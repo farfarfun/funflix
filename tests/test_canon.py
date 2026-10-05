@@ -31,7 +31,11 @@ from funflix.services.canon import (
 from funflix.services.canon.merge import absorb_attributes, pick_survivor
 from funflix.services.canon.purge import is_junk_media_title
 from funflix.services.canon.resolver import CanonEntry, validate_decisions
-from funflix.services.counters import refresh_media_counters, refresh_work_counters
+from funflix.services.counters import (
+    refresh_counters_for_media,
+    refresh_media_counters,
+    refresh_work_counters,
+)
 from funflix.services.text.normalize import series_norm_key
 
 #: 给每行夹具造一个独占的「旧归属」Work，norm_key 必须互不相同（它是唯一键）。
@@ -619,6 +623,64 @@ class TestRefreshWorkCounters:
         assert work.season_count == 0
         assert work.resource_count == 0
         assert await session.scalar(select(func.count()).select_from(Work)) == 1
+
+    @pytest.mark.asyncio
+    async def test_combined_entry_rolls_both_levels(self, session) -> None:
+        """`refresh_counters_for_media` 必须把两级一起刷上。
+
+        搜索列表读的是 `Work` 上的计数，而抽取/清理/校验那几条路径手里只有
+        media_id。只刷季不往上滚一层的话，新入库的资源在搜索结果里看不见，
+        而且不会报任何错 —— 和 `valid_resource_count` 当年没有写入点是同一类缺陷。
+        """
+        work = Work(
+            title="大主宰", norm_key="大主宰", aliases=[], media_type=MediaType.ANIME, year=0
+        )
+        session.add(work)
+        await session.flush()
+        season = _media("大主宰 第1季", work_id=work.id, season=1)
+        resources = [_resource(i) for i in range(2)]
+        session.add_all([season, *resources])
+        await session.flush()
+        for r in resources:
+            await _link(session, season, r)
+        await session.commit()
+
+        assert await refresh_counters_for_media(session, [season.id]) == 1
+        await session.commit()
+
+        await session.refresh(season)
+        await session.refresh(work)
+        assert (season.resource_count, season.valid_resource_count) == (2, 0)
+        assert (work.season_count, work.resource_count) == (1, 2)
+
+    @pytest.mark.asyncio
+    async def test_combined_entry_zeroes_the_work_when_its_last_season_dies(self, session) -> None:
+        """季被物理删掉时，作品归属必须在删之前问出来。
+
+        `refresh_media_counters` 的契约是顺手删掉零资源的季 —— 行没了就再也
+        查不到它曾属于哪部作品，作品计数会永远停在旧值上。
+        """
+        work = Work(
+            title="大主宰",
+            norm_key="大主宰",
+            aliases=[],
+            media_type=MediaType.ANIME,
+            year=0,
+            season_count=1,
+            resource_count=5,
+        )
+        session.add(work)
+        await session.flush()
+        season = _media("大主宰 第1季", work_id=work.id, season=1)
+        session.add(season)
+        await session.commit()
+
+        await refresh_counters_for_media(session, [season.id])
+        await session.commit()
+
+        assert await session.get(Media, season.id) is None, "零资源的季要被删掉"
+        await session.refresh(work)
+        assert (work.season_count, work.resource_count) == (0, 0)
 
 
 class TestResolveValidation:

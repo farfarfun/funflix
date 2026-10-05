@@ -37,7 +37,7 @@ from funflix.models.base import uuid7
 from funflix.models.canon import TitleCanon
 from funflix.models.media import NO_SEASON, UNKNOWN_YEAR
 from funflix.services.canon.lookup import CanonTarget, pending_row, resolve_target
-from funflix.services.counters import refresh_media_counters
+from funflix.services.counters import refresh_counters_for_media
 from funflix.services.extract.base import ExtractedItem, ExtractionOutcome, Extractor
 from funflix.services.text.linkscan import ScannedLink
 from funflix.services.text.normalize import series_norm_key, tag_norm_key
@@ -767,7 +767,7 @@ async def parse_document(
 
             report.is_catalog = outcome.is_catalog
             touched = await _persist(session, doc, outcome, report)
-            await refresh_media_counters(session, touched)
+            await refresh_counters_for_media(session, touched)
 
         # 目录帖不代表一部作品，标为 skipped 而非 done —— 让它在统计里可区分
         doc.parse_status = ParseStatus.SKIPPED if report.is_catalog else ParseStatus.DONE
@@ -869,7 +869,7 @@ async def persist_extracted(
         )
 
     if all_touched:
-        await refresh_media_counters(session, all_touched)
+        await refresh_counters_for_media(session, all_touched)
 
     return [reports[doc.id] for doc in docs]
 
@@ -999,7 +999,7 @@ async def parse_batch(
 
     1. 缓存查询、media/resource/tag 去重查询批量预读（见 `BatchCache`），
        单条文档落库时只剩 SAVEPOINT + 真正需要的 INSERT，不再逐条查库。
-    2. `refresh_media_counters` 在整批结束后对本批触碰到的所有作品统一调用
+    2. `refresh_counters_for_media` 在整批结束后对本批触碰到的所有季统一调用
        一次，而不是每条文档各调用一次。
 
     落库部分见 `persist_extracted`；这里只负责抽取（命中缓存走 `rehydrate`，
