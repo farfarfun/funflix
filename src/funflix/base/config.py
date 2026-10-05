@@ -15,9 +15,11 @@ logger = getLogger("funflix")
 #: funsecret 里都没有、环境变量也没给时的兜底。
 #: 用本地 SQLite 而不是报错 —— 让"刚 clone 下来就能跑起来"成立。
 #:
-#: 固定放在 `~/.cache/farfarfun/funflix/` 下（而不是 CWD 相对路径），
+#: 固定放在 `~/.farfarfun/funflix/` 下（而不是 CWD 相对路径），
 #: 这样不论从哪个目录执行 `funflix`，读写的都是同一份库。
-DEFAULT_DATABASE_PATH = Path.home() / ".cache" / "farfarfun" / "funflix" / "funflix.db"
+#: `~/.farfarfun/<包名>/` 是本组织统一的状态目录约定，funflix-api 的
+#: `api/`、funflix-web 的 `web/` 都挂在这个目录下。
+DEFAULT_DATABASE_PATH = Path.home() / ".farfarfun" / "funflix" / "funflix.db"
 DEFAULT_DATABASE_URL = f"sqlite+aiosqlite:///{DEFAULT_DATABASE_PATH}"
 
 #: 同步驱动 → 异步驱动的映射。

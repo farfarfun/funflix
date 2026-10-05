@@ -32,11 +32,9 @@
   词表的大幅补齐（`更至03`、`每周自动更新`、`4K高码率版`、`《》「」`、URL 碎片、
   抓取字段标签等）。`extract_season` 只在高置信写法上给出季号，拿不准返回 `None`
   交给 LLM —— 真实数据上激进的正则抽季误报率不可接受。
-- `src/funflix/compat.py`：按解释器版本择一导出 `enum.StrEnum` 与 `datetime.UTC`
-  （都是 Python 3.11 才进标准库的名字），3.10 上的 `StrEnum` fallback 复刻标准库
-  语义（成员是 `str`、`str()`/`format()` 取成员值、`auto()` 取小写成员名）。
-- `tests/test_compat.py`：垫片行为、全仓库禁用 PEP 695 语法与 3.11+ 名字的直接导入、
-  `pyproject.toml` 三处版本声明自洽。
+- `tests/test_packaging.py`：`requires-python`、classifiers、Ruff `target-version`
+  三处版本声明必须自洽。改一处漏两处不会有任何报错，而 Ruff 落后尤其阴险 ——
+  它按旧版本的语法上限检查，新语法能用却被标成错误（本次就是这么发现的）。
 - `tests/test_setup_script.py`：把 `scripts/setup.sh` 复制到临时目录、用只含必需命令的
   干净 PATH 驱动，覆盖 `bash -n`、用法、prod/dev 入口缺失、启动即退出、重复启动被拒、
   `status` 返回非 0、陈旧 PID 文件清理。
@@ -56,13 +54,19 @@
   `refresh_counters_for_media`。
 - `docs/DESIGN.md` §3.3 / §3.6 / §4.3 / §7.2 / §7.3 与 README 的流水线图、接口段
   按两层模型重写。
-- **Python 下限由 `>=3.12` 降到 `>=3.10`**（SPEC §3 的组织基线）：6 处 PEP 695 类型参数
-  语法改写为 `typing.TypeVar`，`enum.StrEnum`/`datetime.UTC` 改从 `funflix.compat` 取；
-  classifiers 补齐 3.10~3.13，Ruff `target-version` 改为 `py310`。测试在 3.10 与 3.13
-  下都是全绿。
-- `drives` extra（fundrive）补注释说明：fundrive 自身要求 Python ≥3.12，这个 extra 在
-  3.10/3.11 上装不上；且 `src/` 下目前没有任何模块 import 它，它是给 `docs/DESIGN.md` §6
-  规划的 `FundriveProbe` 预留的。
+- SQLite 兜底库路径从 `~/.cache/farfarfun/funflix/funflix.db` 改为
+  `~/.farfarfun/funflix/funflix.db`，与组织统一的 `~/.farfarfun/<包名>/` 约定对齐
+  （funflix-api 的 `api/`、funflix-web 的 `web/` 也都挂在这个目录下）。放在
+  `.cache` 下本来就不妥：那是「丢了可以重建」的语义，而这是数据库。
+- README 里 `FUNFLIX_DATABASE_URL` 的默认值原先写的是 `sqlite+aiosqlite:///./funflix.db`
+  （CWD 相对路径），与代码里的绝对路径兜底不符，改成真实值。
+- **Python 下限统一为 `>=3.12`**（与 funflix-api 一致）。此前短暂降到 `>=3.10` 的那套
+  3.10 兼容层整体撤掉：删掉 `src/funflix/compat.py`，`enum.StrEnum` / `datetime.UTC`
+  改回从标准库直接导入，5 处 `typing.TypeVar` 回到 PEP 695 的 `def f[T]()` / `class C[T]`
+  写法。Ruff 的 `target-version` 当时留在 `py310` 没跟着改回来，是这次唯一真的不一致的
+  地方 —— 三处声明现在由 `tests/test_packaging.py` 守着。
+- `drives` extra（fundrive）补注释说明：`src/` 下目前没有任何模块 import 它，
+  它是给 `docs/DESIGN.md` §6 规划的 `FundriveProbe` 预留的。
 - `docs/DESIGN.md` §9「打包」原文照抄的 toml 片段写着 `requires-python = ">=3.12"` 和
   fastapi/uvicorn/anthropic 等本仓库根本没有的依赖，改为说明真实约定并指向 `pyproject.toml`。
 

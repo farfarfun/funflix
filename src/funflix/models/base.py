@@ -9,14 +9,12 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-from funflix.compat import UTC
 
 # 约束统一命名。SQLite 不支持 ALTER 约束，Alembic 只能用 batch 模式重建表，
 # 而重建表要求约束有确定的名字 —— 缺了这个命名约定，后续迁移会直接失败。
@@ -89,7 +87,7 @@ def uuid7() -> uuid.UUID:
     随机数。字典序等于生成顺序，全局唯一且多机并发生成不会冲突——这是本地库
     拉取/推送同步方案的前提（自增整数主键在多机各自写入时必然撞号）。
 
-    标准库要到 3.14 才有 `uuid.uuid7()`，项目下限是 `>=3.10`，这里自己实现。
+    标准库要到 3.14 才有 `uuid.uuid7()`，项目下限是 `>=3.12`，这里自己实现。
     时间前缀是为了保留现有代码依赖的"id 与入库先后同序"语义——
     `api/v1/resources.py` 等列表接口靠 `order_by(id.desc())` 做"最新优先"排序，
     换成纯随机的 UUIDv4 会打乱这个顺序。

@@ -5,14 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from funflix.compat import UTC
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 from funflix.services.text.linkscan import scan_known_links

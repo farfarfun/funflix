@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import func, select
 
 from funflix.base.enums import SourceType
-from funflix.compat import UTC
 from funflix.models import RawDocument, Source
 from funflix.services.collect.base import CollectedMessage, FetchResult
 from funflix.services.collect.runner import collect_source

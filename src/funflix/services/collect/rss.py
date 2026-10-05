@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from urllib.parse import quote, urldefrag, urlsplit, urlunsplit
@@ -19,7 +19,6 @@ import httpx
 from farlog import getLogger
 
 from funflix.base.http import DEFAULT_UA
-from funflix.compat import UTC
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 

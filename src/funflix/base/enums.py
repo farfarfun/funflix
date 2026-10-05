@@ -6,9 +6,9 @@
 
 from __future__ import annotations
 
-import sqlalchemy as sa
+from enum import StrEnum
 
-from funflix.compat import StrEnum
+import sqlalchemy as sa
 
 
 def enum_col(py_enum: type[StrEnum], length: int = 32) -> sa.Enum:

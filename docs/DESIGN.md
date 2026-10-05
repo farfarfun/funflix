@@ -545,7 +545,6 @@ funflix/
 ├── alembic.ini  migrations/versions/
 ├── scripts/setup.sh              # worker 生命周期（SPEC §6.1）
 ├── src/funflix/
-│   ├── compat.py                 # 3.11+ 名字（StrEnum / UTC）的版本垫片
 │   ├── security.py               # 登录密码哈希
 │   ├── cli.py                    # typer 入口 + 交互式菜单
 │   ├── base/
@@ -576,7 +575,7 @@ funflix/
 │       ├── claim.py              # 租约领取
 │       ├── scheduler.py          # asyncio 常驻扫描
 │       └── tasks.py              # 单轮采集/解析/校验
-└── tests/                        # 与上面一一对应，另有 test_compat.py
+└── tests/                        # 与上面一一对应，另有 test_packaging.py
                                   # 与 test_setup_script.py 两个约定测试
 ```
 
@@ -590,14 +589,16 @@ funflix/
 
 以 `pyproject.toml` 为准，本节只说明几个容易踩的约定：
 
-- `requires-python = ">=3.10"`（SPEC §3 的组织下限）。源码里不用 PEP 695 类型参数
-  语法（3.12），`enum.StrEnum` 与 `datetime.UTC`（都是 3.11 新增）统一从
-  `funflix.compat` 取，该模块按解释器版本择一导出。
+- `requires-python = ">=3.12"`，与 funflix-api 一致。这个值要和 classifiers、
+  Ruff 的 `target-version` 三处同时改（`tests/test_packaging.py` 守着）——
+  Ruff 落后尤其阴险：它会按旧版本的语法上限检查，新语法能用却被标成错误。
+  下限是 3.12 意味着 PEP 695 类型参数（`def f[T]()`）、`enum.StrEnum`、
+  `datetime.UTC` 都可以直接用，不需要兼容垫片。
 - HTTP 服务端（FastAPI/uvicorn）不在本仓库：funflix 只提供 `funflix` CLI
   （`[project.scripts]`），对外 HTTP 接口由 funflix-api 承载。
 - LLM 抽取走 OpenAI 兼容协议（`llm` extra 装 `openai`），不直接依赖 anthropic SDK。
 - `drives` extra（fundrive）目前没有任何模块 import，是给 §6 的 `FundriveProbe`
-  预留的；fundrive 自身要求 Python ≥3.12，所以这个 extra 在 3.10/3.11 上装不上。
+  预留的。
 - `migrations/` 与 `alembic.ini` 通过 `[tool.hatch.build.targets.wheel.force-include]`
   打进 wheel，否则装完包跑 `funflix db upgrade` 会找不到 `script_location`。
 

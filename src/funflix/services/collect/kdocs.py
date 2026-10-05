@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -12,7 +12,6 @@ import httpx
 from farlog import getLogger
 
 from funflix.base.http import DEFAULT_UA
-from funflix.compat import UTC
 from funflix.models import Source
 from funflix.services.collect.base import CollectedMessage, FetchResult, SupportsProgress
 
