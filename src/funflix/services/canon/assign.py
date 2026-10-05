@@ -180,8 +180,12 @@ async def assign_identities(
         return stats
 
     # 搬离前的旧归属也要记下来：那些 Work 的季数/资源数会变小，不刷就停在旧值。
+    # 过滤 NULL —— 迁移 B 之前 `work_id` 还是可空的，第一次 `canon rebuild` 时
+    # **每一行**的旧归属都是 NULL（那正是这一步要回填的东西）。放进去的话收尾
+    # `sorted(touched_works)` 会拿 None 和 UUID 比大小，直接 TypeError。
     for work_id in await session.scalars(select(Media.work_id).where(Media.id.in_(list(targets)))):
-        stats.touched_works.add(work_id)
+        if work_id is not None:
+            stats.touched_works.add(work_id)
 
     titles = extra_titles or {}
     remaining = targets

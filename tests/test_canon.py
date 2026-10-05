@@ -206,6 +206,32 @@ class TestPurgeKeepsResources:
         assert tag.media_count == 0
 
     @pytest.mark.asyncio
+    async def test_work_counts_are_recomputed(self, session) -> None:
+        """删掉垃圾行之后它所属 Work 的季数也必须跟着降。
+
+        回归：真库上跑完整条流水线之后，剩下一个「声称有 1 季、实际 0 季」的
+        Work（`#大主宰 #leoziyuan #动画 #动作冒险`）—— 它唯一的那行 media 被
+        `apply` 的 junk 路径删了，而删除路径当时只重算标签、不重算作品。
+        行删掉之后就再也查不出它曾属于哪部作品，所以这件事只能在删之前记下
+        归属、由删除函数自己收尾。
+        """
+        junk = _media("磁力下载")
+        session.add(junk)
+        await session.flush()
+        work_id = junk.work_id
+        work = await session.get(Work, work_id)
+        assert work is not None
+        work.season_count, work.resource_count = 1, 7
+        await session.commit()
+
+        report = await purge_junk_media(session, dry_run=False)
+        assert report.deleted == 1
+        assert report.works_recounted == 1
+        await session.refresh(work)
+        assert (work.season_count, work.resource_count) == (0, 0)
+        assert await session.get(Work, work_id) is not None, "空 Work 不删，只把计数刷成 0"
+
+    @pytest.mark.asyncio
     async def test_limit_caps_deletions_but_not_the_count(self, session) -> None:
         """`--limit` 是小步试探用的闸，报告里仍要看到全表命中数。"""
         session.add_all([_media("夸克"), _media("链接"), _media("磁力下载")])
@@ -463,6 +489,68 @@ class TestRebuildWorks:
         assert second.media_updated == 0
         assert second.media_merged == 0
         assert len(await _live_works(session)) == 1
+
+    @pytest.mark.asyncio
+    async def test_decided_keys_are_left_to_apply(self, session) -> None:
+        """已裁决的键重跑时必须原样不动 —— 否则规则会把 LLM 的判定推翻。
+
+        回归：真库上跑完 `canon merge` 再跑一遍 `canon rebuild`，三本小说
+        被从 `book` 作品里拽回规则算出来的键上（`大主宰:我荒古圣体…作者:墨之
+        所想` 又成了一部独立"作品"），`canon merge` 再跑又搬回去 —— 两个阶段
+        来回拉锯，而付过的 token 白付。`title_canon` 的全部意义就是不回退。
+        """
+        novel = _media("大主宰:我荒古圣体,当为天帝! 作者:墨之所想")
+        resource = _resource(0)
+        session.add_all([novel, resource])
+        await session.flush()
+        await _link(session, novel, resource)
+        # LLM 判过了：这是小说，归到自己的作品下
+        decided = Work(
+            title="大主宰（小说）",
+            norm_key="大主宰小说",
+            aliases=[],
+            media_type=MediaType.BOOK,
+            year=UNKNOWN_YEAR,
+        )
+        session.add(decided)
+        await session.flush()
+        novel.work_id = decided.id
+        session.add(
+            TitleCanon(
+                norm_key=series_norm_key(novel.title),
+                work_norm_key="大主宰小说",
+                work_title="大主宰（小说）",
+                season=None,
+                media_type=MediaType.BOOK,
+                year=UNKNOWN_YEAR,
+                status=CanonState.DECIDED,
+            )
+        )
+        await session.commit()
+
+        report = await rebuild_works(session, dry_run=False)
+
+        assert report.skipped_decided == 1
+        assert report.works_created == 0, "不该为已裁决的键造规则版 Work"
+        await session.refresh(novel)
+        assert novel.work_id == decided.id, "裁决被规则推翻了"
+        assert await _work_by_key(session, novel.title) is None
+
+    @pytest.mark.asyncio
+    async def test_pending_keys_are_still_rebuilt(self, session) -> None:
+        """只有 `decided` 才算裁决。pending 是"还没判"，规则照常分组。"""
+        media = _media("大主宰")
+        resource = _resource(0)
+        session.add_all([media, resource])
+        await session.flush()
+        await _link(session, media, resource)
+        session.add(TitleCanon(norm_key=series_norm_key("大主宰"), status=CanonState.PENDING))
+        await session.commit()
+
+        report = await rebuild_works(session, dry_run=False)
+
+        assert report.skipped_decided == 0
+        assert report.works_created == 1
 
     @pytest.mark.asyncio
     async def test_resources_survive_the_whole_rebuild(self, session) -> None:

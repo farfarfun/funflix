@@ -65,20 +65,13 @@ class ProviderVerifyReportOut(BaseModel):
     abandoned: int
 
 
-class MediaSummary(BaseModel):
-    """列表项。资源计数走 media 表上的冗余字段，不做聚合查询。"""
+class _YearBlanked(BaseModel):
+    """共享 `year` 哨兵处理。`Work` 和 `Media` 都用 0 表示年份未知。"""
 
     model_config = ConfigDict(from_attributes=True)
 
-    id: uuid.UUID
-    title: str
-    original_title: str | None
-    media_type: MediaType
     #: 0 表示年份未知，出参里统一转成 null
     year: int | None
-    poster_url: str | None
-    resource_count: int
-    valid_resource_count: int
 
     @field_validator("year", mode="after")
     @classmethod
@@ -88,8 +81,20 @@ class MediaSummary(BaseModel):
         return None if value == UNKNOWN_YEAR else value
 
 
+class MediaSummary(_YearBlanked):
+    """一季的列表项。资源计数走 media 表上的冗余字段，不做聚合查询。"""
+
+    id: uuid.UUID
+    title: str
+    original_title: str | None
+    media_type: MediaType
+    poster_url: str | None
+    resource_count: int
+    valid_resource_count: int
+
+
 class MediaDetail(MediaSummary):
-    """详情：带别名、简介、外部 ID 与全部资源。"""
+    """季级详情：带别名、简介、外部 ID 与资源。"""
 
     norm_key: str
     aliases: list[str]
@@ -101,3 +106,50 @@ class MediaDetail(MediaSummary):
     updated_at: datetime
     tags: list[TagOut] = Field(default_factory=list)
     resources: list[ResourceOut] = Field(default_factory=list)
+
+
+class SeasonSummary(MediaSummary):
+    """作品详情里的一季。
+
+    `season` 是 0 时表示「无季概念」（电影、单季剧、综艺），
+    见 `models/media.py` 的 `NO_SEASON` —— 展示层该把它渲染成「正片」而不是「第0季」。
+    """
+
+    season: int
+
+
+class SeasonDetail(SeasonSummary):
+    """带资源的一季。资源**可能是截断的**，真实总数看 `resource_count`。"""
+
+    resources: list[ResourceOut] = Field(default_factory=list)
+
+
+class WorkSummary(_YearBlanked):
+    """作品列表项 —— 搜索结果的一行。
+
+    这是搜索的主体：一部剧一条，季数和资源数都是跨季汇总后的反规范化计数
+    （`services/counters.refresh_work_counters`），列表页不做聚合查询。
+    """
+
+    id: uuid.UUID
+    title: str
+    original_title: str | None
+    media_type: MediaType
+    poster_url: str | None
+    season_count: int
+    resource_count: int
+    valid_resource_count: int
+
+
+class WorkDetail(WorkSummary):
+    """作品详情：带别名、简介、外部 ID 与季列表（季下挂资源）。"""
+
+    norm_key: str
+    aliases: list[str]
+    overview: str | None
+    tmdb_id: int | None
+    douban_id: str | None
+    imdb_id: str | None
+    created_at: datetime
+    updated_at: datetime
+    seasons: list[SeasonDetail] = Field(default_factory=list)

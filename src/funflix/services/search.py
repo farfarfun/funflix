@@ -1,5 +1,9 @@
 """作品搜索。
 
+搜索的主体是 **`Work`（一部剧）**，不是 `Media`（一季）—— 用户搜「大主宰」
+要的是一条「大主宰（4 季 / 1496 条资源）」，而不是 448 条同名行。季级数据
+从 `Work.seasons` 展开，见 `models/work.py`。
+
 按数据库方言选实现：PostgreSQL 用 `pg_trgm` 做模糊匹配并按相似度排序，
 其余方言回落到 `LIKE`。两者返回同样的结构，调用方无感知。
 
@@ -15,12 +19,30 @@ from typing import Any, Protocol, runtime_checkable
 from farlog import getLogger
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from funflix.base.enums import CheckStatus, MediaType, Provider
-from funflix.models import Media, Resource, media_resource
+from funflix.models import Media, Resource, Work, media_resource
 from funflix.services.text.normalize import norm_key
 
 logger = getLogger("funflix")
+
+#: 默认进搜索结果的类型。非影视（`BOOK` / `COMIC` / `OTHER`）要显式传
+#: `media_type` 才看得到 —— 小说和漫画是真资源，但搜「大主宰」的人要的是动漫。
+#:
+#: `UNKNOWN` **在这个集合里**。它是「还没判出类型」而不是「不是影视」，
+#: 库里 40 多万部作品是这个值，排掉等于把它们整体藏起来。
+#: 新增影视类型时记得加进来，否则它会默认不可见。
+VIDEO_MEDIA_TYPES = frozenset(
+    {
+        MediaType.MOVIE,
+        MediaType.TV,
+        MediaType.ANIME,
+        MediaType.VARIETY,
+        MediaType.DOCUMENTARY,
+        MediaType.UNKNOWN,
+    }
+)
 
 #: 相似度阈值不在这里 —— 它由 `pg_trgm.similarity_threshold` 这个 GUC 提供，
 #: 随连接参数下发（`Settings.search_trgm_threshold` → base/db.py）。
@@ -37,6 +59,8 @@ class SearchQuery:
     `PgTrgmSearchBackend` 共用。"""
 
     keyword: str = ""
+    #: 显式指定类型。留空时只返回 `VIDEO_MEDIA_TYPES` 里的类型；
+    #: 传 `book` / `comic` / `other` 可以专门查非影视资源。
     media_type: MediaType | None = None
     year: int | None = None
     #: 只返回至少有一条可用资源的作品
@@ -45,6 +69,13 @@ class SearchQuery:
     provider: Provider | None = None
     limit: int = 20
     offset: int = 0
+    #: 顺带预加载季列表。放在这里而不是让调用方自己加 `options()` ——
+    #: 构造语句的是后端，调用方插不进去；而异步会话下懒加载会抛
+    #: `MissingGreenlet`，不是悄悄多发几条查询。
+    #:
+    #: 默认关。列表页展示的季数/资源数读 `Work` 上的反规范化计数
+    #: （`season_count` / `resource_count`），不需要季行本身。
+    with_seasons: bool = False
 
 
 @runtime_checkable
@@ -53,7 +84,7 @@ class SearchBackend(Protocol):
 
     name: str
 
-    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
+    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Work]:
         """按 `query` 的关键词、筛选条件与分页参数查询匹配的作品。
 
         Args:
@@ -78,36 +109,44 @@ class SearchBackend(Protocol):
         ...
 
 
+def _resource_exists(*conditions: Any):
+    """「这部作品下存在满足条件的资源」子查询。
+
+    比季级搜索多穿一层：资源挂在 `media`（季）上，而筛选的主体是 `work`，
+    所以要 `work → media → media_resource → resource` 走完四张表。
+    """
+    return (
+        select(media_resource.c.media_id)
+        .join(Media, Media.id == media_resource.c.media_id)
+        .join(Resource, Resource.id == media_resource.c.resource_id)
+        .where(Media.work_id == Work.id, *conditions)
+        .exists()
+    )
+
+
+def _apply_options(stmt: Select, query: SearchQuery) -> Select:
+    """实体加载选项，两个后端的 `search` 共用（`count` 不需要）。"""
+    if query.with_seasons:
+        stmt = stmt.options(selectinload(Work.seasons))
+    return stmt
+
+
 def _apply_filters(stmt: Select, query: SearchQuery) -> Select:
     """非关键词的筛选条件，两个后端共用。"""
     if query.media_type is not None:
-        stmt = stmt.where(Media.media_type == query.media_type)
+        stmt = stmt.where(Work.media_type == query.media_type)
+    else:
+        stmt = stmt.where(Work.media_type.in_(sorted(VIDEO_MEDIA_TYPES)))
     if query.year is not None:
-        stmt = stmt.where(Media.year == query.year)
+        stmt = stmt.where(Work.year == query.year)
     if query.valid_only:
         # 至少有一条校验通过的资源。用 EXISTS 而不是 JOIN —— 后者会因为
         # 一部作品有多条资源而产生重复行，还得再 DISTINCT。
-        stmt = stmt.where(
-            select(media_resource.c.media_id)
-            .join(Resource, Resource.id == media_resource.c.resource_id)
-            .where(
-                media_resource.c.media_id == Media.id,
-                Resource.check_status == CheckStatus.VALID,
-            )
-            .exists()
-        )
+        stmt = stmt.where(_resource_exists(Resource.check_status == CheckStatus.VALID))
     if query.provider is not None:
         # 与 valid_only 是两个独立条件，不要求同一条资源既 valid 又是该网盘 ——
         # 这样两个筛选可以自由组合，语义更符合直觉。
-        stmt = stmt.where(
-            select(media_resource.c.media_id)
-            .join(Resource, Resource.id == media_resource.c.resource_id)
-            .where(
-                media_resource.c.media_id == Media.id,
-                Resource.provider == query.provider,
-            )
-            .exists()
-        )
+        stmt = stmt.where(_resource_exists(Resource.provider == query.provider))
     return stmt
 
 
@@ -126,24 +165,25 @@ class LikeSearchBackend:
         if not query.keyword:
             return None
         key = norm_key(query.keyword)
-        conditions = [Media.title.icontains(query.keyword, autoescape=True)]
+        conditions = [Work.title.icontains(query.keyword, autoescape=True)]
         if key:
-            conditions.append(Media.norm_key.icontains(key, autoescape=True))
+            conditions.append(Work.norm_key.icontains(key, autoescape=True))
         return or_(*conditions)
 
-    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
-        """按查询条件返回匹配的媒体列表。"""
-        stmt = select(Media)
+    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Work]:
+        """按查询条件返回匹配的作品列表。"""
+        stmt = select(Work)
         clause = self._keyword_clause(query)
         if clause is not None:
             stmt = stmt.where(clause)
         stmt = _apply_filters(stmt, query)
-        stmt = stmt.order_by(Media.id.desc()).offset(query.offset).limit(query.limit)
+        stmt = _apply_options(stmt, query)
+        stmt = stmt.order_by(Work.id.desc()).offset(query.offset).limit(query.limit)
         return list(await session.scalars(stmt))
 
     async def count(self, session: AsyncSession, query: SearchQuery) -> int:
-        """按查询条件返回匹配的媒体数量。"""
-        stmt = select(func.count()).select_from(Media)
+        """按查询条件返回匹配的作品数量。"""
+        stmt = select(func.count()).select_from(Work)
         clause = self._keyword_clause(query)
         if clause is not None:
             stmt = stmt.where(clause)
@@ -161,7 +201,7 @@ class PgTrgmSearchBackend:
 
     def _similarity(self, query: SearchQuery):
         key = norm_key(query.keyword) or query.keyword
-        return key, func.similarity(Media.norm_key, key)
+        return key, func.similarity(Work.norm_key, key)
 
     def _keyword_clause(self, query: SearchQuery, key: str):
         return or_(
@@ -173,15 +213,15 @@ class PgTrgmSearchBackend:
             # 实测 5 万行、3 字关键词：63.9ms → 0.235ms。
             #
             # 阈值来自 `pg_trgm.similarity_threshold`，由连接参数下发，见 base/db.py。
-            Media.norm_key.bool_op("%")(key),
+            Work.norm_key.bool_op("%")(key),
             # 子串命中要保底放行：短关键词（「误杀」查「误杀2」）
             # 的 trigram 相似度可能低于阈值，但用户明显想要它。
-            Media.norm_key.contains(key, autoescape=True),
-            Media.title.icontains(query.keyword, autoescape=True),
+            Work.norm_key.contains(key, autoescape=True),
+            Work.title.icontains(query.keyword, autoescape=True),
         )
 
-    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Media]:
-        """按查询条件返回匹配的媒体列表，有关键词时按相似度降序排列。
+    async def search(self, session: AsyncSession, query: SearchQuery) -> list[Work]:
+        """按查询条件返回匹配的作品列表，有关键词时按相似度降序排列。
 
         Args:
             session: 数据库会话。
@@ -191,17 +231,18 @@ class PgTrgmSearchBackend:
             匹配的作品列表；有关键词时按 `pg_trgm` 相似度降序、再按 id 降序；
             无关键词时仅按 id 降序。
         """
-        stmt = select(Media)
+        stmt = select(Work)
 
         if query.keyword:
             key, similarity = self._similarity(query)
             stmt = stmt.where(self._keyword_clause(query, key))
             stmt = _apply_filters(stmt, query)
-            stmt = stmt.order_by(similarity.desc(), Media.id.desc())
+            stmt = stmt.order_by(similarity.desc(), Work.id.desc())
         else:
             stmt = _apply_filters(stmt, query)
-            stmt = stmt.order_by(Media.id.desc())
+            stmt = stmt.order_by(Work.id.desc())
 
+        stmt = _apply_options(stmt, query)
         stmt = stmt.offset(query.offset).limit(query.limit)
         return list(await session.scalars(stmt))
 
@@ -215,7 +256,7 @@ class PgTrgmSearchBackend:
         Returns:
             匹配的作品总数。
         """
-        stmt = select(func.count()).select_from(Media)
+        stmt = select(func.count()).select_from(Work)
         if query.keyword:
             key, similarity = self._similarity(query)
             stmt = stmt.where(self._keyword_clause(query, key))
@@ -231,7 +272,7 @@ def get_backend(session_or_bind: Any) -> SearchBackend:
     return LikeSearchBackend()
 
 
-async def search_media(session: AsyncSession, query: SearchQuery) -> list[Media]:
+async def search_works(session: AsyncSession, query: SearchQuery) -> list[Work]:
     """按数据库方言自动选择后端（PostgreSQL 用 `pg_trgm`，其余用 `LIKE`）并执行搜索。
 
     Args:
@@ -239,15 +280,16 @@ async def search_media(session: AsyncSession, query: SearchQuery) -> list[Media]
         query: 关键词、筛选条件与分页参数。
 
     Returns:
-        匹配的作品列表，具体排序规则由所选后端决定。
+        匹配的作品列表，具体排序规则由所选后端决定。要季列表就把
+        `query.with_seasons` 打开 —— 异步会话下懒加载会抛 `MissingGreenlet`。
     """
     backend = get_backend(session)
     logger.debug(f"搜索后端={backend.name} 关键词={query.keyword!r}")
     return await backend.search(session, query)
 
 
-async def count_media(session: AsyncSession, query: SearchQuery) -> int:
-    """与 `search_media` 同条件的总数，供翻页用。
+async def count_works(session: AsyncSession, query: SearchQuery) -> int:
+    """与 `search_works` 同条件的总数，供翻页用。
 
     `limit` / `offset` 在这里无意义，会被忽略。
     """

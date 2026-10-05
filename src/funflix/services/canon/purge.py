@@ -24,6 +24,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.models import Media, Tag, media_resource, media_tag
+from funflix.services.counters import refresh_work_counters
 from funflix.services.text.normalize import clean_title, looks_like_junk_title, series_norm_key
 
 #: 每批删多少行 media。远端 PG 一次往返 ~100ms，批太小会被往返吃掉；
@@ -46,6 +47,9 @@ class PurgeReport:
     links_detached: int = 0
     tags_detached: int = 0
     tags_recounted: int = 0
+    #: 因为丢了季而被重算的 Work 数。`canon purge` 在 rebuild 之前跑时恒为 0
+    #: （那时还没有 Work），重跑在 rebuild 之后才有值。
+    works_recounted: int = 0
     dry_run: bool = True
     samples: list[str] = field(default_factory=list)
 
@@ -87,25 +91,42 @@ async def _recount_tags(session: AsyncSession, tag_ids: set[uuid.UUID]) -> int:
     return result.rowcount or 0
 
 
-async def _delete_batch(
-    session: AsyncSession, media_ids: list[uuid.UUID]
-) -> tuple[int, int, set[uuid.UUID]]:
-    """删掉一批 media 及其关联，返回 (断开的资源关联数, 断开的标签关联数, 受影响标签)。
+@dataclass(slots=True)
+class _BatchStats:
+    links: int = 0
+    tags: int = 0
+    affected_tags: set[uuid.UUID] = field(default_factory=set)
+    affected_works: set[uuid.UUID] = field(default_factory=set)
+
+
+async def _delete_batch(session: AsyncSession, media_ids: list[uuid.UUID]) -> _BatchStats:
+    """删掉一批 media 及其关联。
 
     两张关联表上都有 `ON DELETE CASCADE`，光删 media 行数据也是对的。
-    这里仍然显式先删子表，为的是两件 CASCADE 给不了的东西：被断开的关联
-    **条数**（报告要用），以及受影响的 **tag_id 集合**（重算计数要用）。
-    顺手也不依赖 SQLite 的 `PRAGMA foreign_keys` 开着。
+    这里仍然显式先删子表，为的是三件 CASCADE 给不了的东西：被断开的关联
+    **条数**（报告要用）、受影响的 **tag_id**、以及受影响的 **work_id**
+    （两者都要重算计数）。顺手也不依赖 SQLite 的 `PRAGMA foreign_keys` 开着。
     """
-    affected_tags = set(
+    stats = _BatchStats()
+    stats.affected_tags = set(
         await session.scalars(select(media_tag.c.tag_id).where(media_tag.c.media_id.in_(media_ids)))
     )
+    # 归属也要在删之前问清楚 —— 行没了就查不到它曾经属于哪部作品了。
+    # 过滤 NULL：这一步在迁移 B 之前也能跑（`canon purge` 正是在 rebuild
+    # **之前**跑的，那时每一行的 work_id 都还是空的）。
+    stats.affected_works = {
+        work_id
+        for work_id in await session.scalars(select(Media.work_id).where(Media.id.in_(media_ids)))
+        if work_id is not None
+    }
     links = await session.execute(
         delete(media_resource).where(media_resource.c.media_id.in_(media_ids))
     )
     tags = await session.execute(delete(media_tag).where(media_tag.c.media_id.in_(media_ids)))
     await session.execute(delete(Media).where(Media.id.in_(media_ids)))
-    return links.rowcount or 0, tags.rowcount or 0, affected_tags
+    stats.links = links.rowcount or 0
+    stats.tags = tags.rowcount or 0
+    return stats
 
 
 @dataclass(slots=True)
@@ -114,6 +135,8 @@ class DeleteStats:
     links_detached: int = 0
     tags_detached: int = 0
     tags_recounted: int = 0
+    #: 因为丢了季而被重算的 Work 数。
+    works_recounted: int = 0
 
 
 async def delete_media_rows(
@@ -122,26 +145,42 @@ async def delete_media_rows(
     *,
     on_progress: Callable[[int], None] | None = None,
 ) -> DeleteStats:
-    """分批删掉指定的 media 行并修正标签计数。按批提交。
+    """分批删掉指定的 media 行，并修正标签与作品计数。按批提交。
 
     阶段 4（`apply`）也走这条路：LLM 判出来的 junk 和规则判出来的 junk
     该有完全一样的删除语义 —— 同样保留 resource 行、同样重算受影响的标签。
+
+    **计数收尾是这个函数的职责**，不是调用方的。删掉一行 media 会让它所属
+    Work 的 `season_count` / `resource_count` 当场失真，而失真的 Work 从
+    media 侧已经查不出来了（行没了）。所以这里和标签一样，在删之前记下归属、
+    删完顺手重算 —— 漏掉的话库里会留下一批「声称有 1 季、实际 0 季」的
+    Work（`#大主宰 #leoziyuan #动画` 那条垃圾就是这么跑出来的）。
+
+    空 Work 本身**不删**，只把计数刷成 0 —— 与 `refresh_work_counters` 的
+    契约一致，理由见 `canon/apply.py` 开头「空出来的 Work 不删」。
     """
     stats = DeleteStats()
     affected_tags: set[uuid.UUID] = set()
+    affected_works: set[uuid.UUID] = set()
     for start in range(0, len(media_ids), CHUNK):
         batch = media_ids[start : start + CHUNK]
-        links, tags, touched = await _delete_batch(session, batch)
-        stats.links_detached += links
-        stats.tags_detached += tags
+        batch_stats = await _delete_batch(session, batch)
+        stats.links_detached += batch_stats.links
+        stats.tags_detached += batch_stats.tags
         stats.deleted += len(batch)
-        affected_tags |= touched
+        affected_tags |= batch_stats.affected_tags
+        affected_works |= batch_stats.affected_works
         await session.commit()
         if on_progress is not None:
             on_progress(stats.deleted)
 
     stats.tags_recounted = await _recount_tags(session, affected_tags)
     await session.commit()
+
+    works = sorted(affected_works)
+    for start in range(0, len(works), CHUNK):
+        stats.works_recounted += await refresh_work_counters(session, works[start : start + CHUNK])
+        await session.commit()
     return stats
 
 
@@ -204,4 +243,5 @@ async def purge_junk_media(
     report.links_detached = stats.links_detached
     report.tags_detached = stats.tags_detached
     report.tags_recounted = stats.tags_recounted
+    report.works_recounted = stats.works_recounted
     return report

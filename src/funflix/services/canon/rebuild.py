@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import MediaType
 from funflix.models import Media, Work
+from funflix.models.canon import CanonState, TitleCanon
 from funflix.models.media import NO_SEASON, UNKNOWN_YEAR
 from funflix.services.canon.assign import assign_identities
 from funflix.services.canon.purge import is_junk_media_title
@@ -88,6 +89,9 @@ class _Agg:
 class RebuildReport:
     scanned: int = 0
     skipped_junk: int = 0
+    #: 因为已有裁决而被跳过的行数。首次跑恒为 0（那时 `title_canon` 还是空的），
+    #: 重跑时才有值 —— 见 `rebuild_works` 的说明。
+    skipped_decided: int = 0
     keys: int = 0
     works_created: int = 0
     works_existing: int = 0
@@ -103,7 +107,22 @@ class RebuildReport:
     samples: list[str] = field(default_factory=list)
 
 
-async def _scan(session: AsyncSession, report: RebuildReport, key: str | None) -> dict[str, _Agg]:
+async def _decided_keys(session: AsyncSession) -> set[str]:
+    """已经有裁决的归一键 —— 这些键归 `apply` 管，规则不许再动。
+
+    只认 `decided`：`pending` 是"还没判"、`rejected` 是"判了但被校验丢掉"，
+    两种都该继续吃规则的默认分组。
+    """
+    return set(
+        await session.scalars(
+            select(TitleCanon.norm_key).where(TitleCanon.status == CanonState.DECIDED)
+        )
+    )
+
+
+async def _scan(
+    session: AsyncSession, report: RebuildReport, key: str | None, decided: set[str]
+) -> dict[str, _Agg]:
     """只读地扫一遍 media，按 `series_norm_key` 聚出作品级属性。"""
     aggs: dict[str, _Agg] = {}
     rows = await session.stream(
@@ -120,6 +139,11 @@ async def _scan(session: AsyncSession, report: RebuildReport, key: str | None) -
         cleaned = clean_title(title or "")
         series_key = series_norm_key(title or "")
         if not series_key or (key is not None and series_key != key):
+            continue
+        if series_key in decided:
+            # 这个键已经被裁决过了，规则的意见作废 —— 见 `rebuild_works` 的
+            # 说明。不进 `aggs` 就不会有 work_id，`_assign` 也就碰不到这些行。
+            report.skipped_decided += 1
             continue
         aggs.setdefault(series_key, _Agg()).observe(
             strip_season(cleaned), media_type, year or UNKNOWN_YEAR
@@ -287,9 +311,22 @@ async def rebuild_works(
     可中断续跑：建 Work 是 get-or-create，回填是幂等的（同样的标题算出同样的
     键，已经归属正确的行一次 UPDATE 都不会发），重算计数本身就是幂等的。
     中断后重跑会把剩下的做完，已经做好的不会被打乱。
+
+    ## 已裁决的键一律跳过
+
+    `title_canon` 里 `status=decided` 的键**不参与重算**。少了这一条，
+    重跑 rebuild 会把 LLM 的裁决全部推翻：三本小说被从 `book` 作品里拽回
+    规则算出来的垃圾键上（`大主宰:我荒古圣体,当为天帝! 作者:墨之所想` 又变成
+    一部独立"作品"），`canon merge` 再跑一遍又搬回去 —— 两个阶段来回拉锯，
+    而花过的 token 白花。
+
+    这正是 `title_canon` 存在的理由（见 `models/canon.py`："不会把好不容易
+    并好的作品重新拆开"）。规则升级之后想重新分组是正常需求，但重新分组的
+    对象只能是**还没裁决过的**那部分；已经判过的要改，改 `title_canon` 那一行
+    再跑 `canon merge`。
     """
     report = RebuildReport(dry_run=dry_run)
-    aggs = await _scan(session, report, key)
+    aggs = await _scan(session, report, key, await _decided_keys(session))
     if dry_run:
         return report
 

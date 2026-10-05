@@ -640,6 +640,7 @@ def canon_purge(
             ["断开资源关联", report.links_detached],
             ["断开标签关联", report.tags_detached],
             ["修正标签计数", report.tags_recounted],
+            ["重算 Work 计数", report.works_recounted],
         ],
         ["项", "数量"],
     )
@@ -679,6 +680,7 @@ def canon_rebuild(
         [
             ["扫描 media", report.scanned],
             ["跳过垃圾行", report.skipped_junk],
+            ["跳过已裁决", report.skipped_decided],
             ["作品归一键", report.keys],
             ["新建 Work", report.works_created],
             ["复用 Work", report.works_existing],
@@ -1637,73 +1639,138 @@ def extractors() -> None:
 # --- 查询 --------------------------------------------------------------------
 
 
-async def _search_media_rows(
+#: 每季最多列出多少条资源链接。热门剧会被很多频道反复分享（`大主宰` 第 2 季
+#: 有 793 条），全列出来是几百屏翻不完的噪声，而使用者要的是「一条能用的链接」。
+#: 真实总数看季行上的 `resource_count`。
+DEFAULT_SEASON_LINKS = 5
+
+#: 季号为 0 时的展示名，见 `models/media.py` 的 `NO_SEASON`。
+_NO_SEASON_LABEL = "正片"
+
+
+async def _search_work_rows(
     keyword: str,
     *,
     limit: int = 20,
     media_type: MediaType | None = None,
     year: int | None = None,
     valid_only: bool = False,
-) -> tuple[str, list[Any]]:
-    from sqlalchemy.orm import selectinload
+    links: int = DEFAULT_SEASON_LINKS,
+) -> tuple[str, list[Any], dict[uuid.UUID, list[Any]], int]:
+    """搜作品，连带每季的前几条资源。
+
+    返回 `(后端名, 作品列表, 季 id → 资源列表, 匹配总数)`。资源单独放在字典里而不是挂
+    在季对象上：数量是截断的，赋给关系属性会被 ORM 当成「这就是全部关联」，
+    flush 时把没列进来的关联行删掉 —— 截断展示会变成截断数据
+    （`funflix-api` 那边用 `set_committed_value` 绕开同一个坑）。
+    """
+    from sqlalchemy import case
 
     from funflix.base.db import session_scope
-    from funflix.models import Media
-    from funflix.services.search import SearchQuery, get_backend, search_media
+    from funflix.models import Resource, media_resource
+    from funflix.services.search import SearchQuery, count_works, get_backend, search_works
 
     async with session_scope() as session:
         backend = get_backend(session)
-        rows = await search_media(
-            session,
-            SearchQuery(
-                keyword=keyword,
-                media_type=media_type,
-                year=year,
-                valid_only=valid_only,
-                limit=limit,
-            ),
+        query = SearchQuery(
+            keyword=keyword,
+            media_type=media_type,
+            year=year,
+            valid_only=valid_only,
+            limit=limit,
+            with_seasons=True,
         )
-        if rows:
-            # 预加载资源，避免逐条访问时触发异步上下文外的懒加载
-            await session.execute(
-                select(Media)
-                .options(selectinload(Media.resources))
-                .where(Media.id.in_([m.id for m in rows]))
-            )
-        return backend.name, rows
+        rows = await search_works(session, query)
+        total = await count_works(session, query)
+
+        resources: dict[uuid.UUID, list[Any]] = {}
+        if links > 0:
+            # 逐季带 LIMIT 查，而不是一条 IN 查完再在内存里切 —— 后者会把
+            # 那 793 条全读回来才扔掉。季数不多（一页 20 部作品也就几十季），
+            # 多几十次带索引的小查询比搬一遍关联表便宜。
+            for work in rows:
+                for season in work.seasons:
+                    if season.resource_count == 0:
+                        continue
+                    stmt = (
+                        select(Resource)
+                        .join(media_resource, media_resource.c.resource_id == Resource.id)
+                        .where(media_resource.c.media_id == season.id)
+                    )
+                    if valid_only:
+                        stmt = stmt.where(Resource.check_status == CheckStatus.VALID)
+                    # 可用的排前面，其余按入库倒序
+                    stmt = stmt.order_by(
+                        case((Resource.check_status == CheckStatus.VALID, 0), else_=1),
+                        Resource.id.desc(),
+                    ).limit(links)
+                    resources[season.id] = list(await session.scalars(stmt))
+        return backend.name, rows, resources, total
 
 
-def _print_media_detail(media: Any, *, valid_only: bool = False) -> None:
-    year = f" ({media.year})" if media.year else ""
-    _heading(f"#{media.id} {media.title}{year}  [{media.media_type.value}]")
-    if media.aliases:
-        _dim("  别名: " + "、".join(media.aliases))
-    resources = [
-        r for r in media.resources if not valid_only or r.check_status is CheckStatus.VALID
-    ]
-    if not resources:
-        _dim("    （无资源）")
+def _print_work_detail(
+    work: Any,
+    resources: dict[uuid.UUID, list[Any]],
+    *,
+    valid_only: bool = False,
+) -> None:
+    """打印一部作品及其季列表。
+
+    季下面的资源条数是截断的（见 `DEFAULT_SEASON_LINKS`），所以同时把季行上
+    的 `resource_count` 打出来 —— 那才是真实总数。
+    """
+    year = f" ({work.year})" if work.year else ""
+    counts = f"{work.season_count} 季 / {work.resource_count} 资源"
+    if work.valid_resource_count:
+        counts += f"（{work.valid_resource_count} 可用）"
+    _heading(f"#{work.id} {work.title}{year}  [{work.media_type.value}]  {counts}")
+    if work.aliases:
+        _dim("  别名: " + "、".join(work.aliases))
+    if not work.seasons:
+        _dim("    （无季）")
         return
-    for r in resources:
-        passcode = f"  提取码 {r.passcode}" if r.passcode else ""
-        typer.echo(f"    [{r.provider.value:<7}] {r.check_status.value:<11} {r.url}{passcode}")
+
+    for season in work.seasons:
+        label = _NO_SEASON_LABEL if season.season == 0 else f"第{season.season}季"
+        total = season.valid_resource_count if valid_only else season.resource_count
+        typer.echo(f"  {label}  {season.title}  （{total} 资源）")
+        rows = resources.get(season.id, [])
+        for r in rows:
+            passcode = f"  提取码 {r.passcode}" if r.passcode else ""
+            typer.echo(f"    [{r.provider.value:<7}] {r.check_status.value:<11} {r.url}{passcode}")
+        if total > len(rows):
+            _dim(f"    …… 另有 {total - len(rows)} 条未列出")
 
 
 @app.command()
 def search(
     keyword: Annotated[str, typer.Argument(help="剧名关键词")],
     limit: Annotated[int, typer.Option(help="最多返回多少部作品")] = 20,
-    media_type: Annotated[MediaType | None, typer.Option(help="按类型筛选")] = None,
+    media_type: Annotated[
+        MediaType | None, typer.Option(help="按类型筛选；传 book/comic/other 才看得到非影视")
+    ] = None,
     year: Annotated[int | None, typer.Option(help="按年份筛选")] = None,
     valid_only: Annotated[bool, typer.Option("--valid-only", help="只看校验通过的资源")] = False,
+    links: Annotated[
+        int, typer.Option(help="每季最多列出多少条链接；0 = 只看季列表")
+    ] = DEFAULT_SEASON_LINKS,
 ) -> None:
-    """按剧名搜索作品及其资源。
+    """按剧名搜索作品，按季列出资源。
+
+    一部剧一条，季是子层 —— 搜「大主宰」给的是一条「大主宰（4 季）」，
+    不是 448 条同名行。
 
     PostgreSQL 上走 pg_trgm 模糊匹配并按相似度排序，其余方言回落到 LIKE。
+    默认只返回影视类型，小说/漫画要显式 `--media-type book`。
     """
-    backend_name, rows = _run(
-        lambda: _search_media_rows(
-            keyword, limit=limit, media_type=media_type, year=year, valid_only=valid_only
+    backend_name, rows, resources, total = _run(
+        lambda: _search_work_rows(
+            keyword,
+            limit=limit,
+            media_type=media_type,
+            year=year,
+            valid_only=valid_only,
+            links=links,
         )
     )
     _dim(f"搜索后端 {backend_name}")
@@ -1711,8 +1778,10 @@ def search(
         typer.echo(f"没有匹配 {keyword!r} 的作品")
         return
 
-    for media in rows:
-        _print_media_detail(media, valid_only=valid_only)
+    for work in rows:
+        _print_work_detail(work, resources, valid_only=valid_only)
+    if total > len(rows):
+        _dim(f"\n共 {total} 部作品，已显示前 {len(rows)} 部（--limit 调整）")
 
 
 @app.command("doc")
@@ -1817,20 +1886,30 @@ def _interactive_search() -> None:
         if not keyword:
             return
 
-        backend_name, rows = _run(lambda kw=keyword: _search_media_rows(kw))
-        _dim(f"搜索后端 {backend_name}")
+        backend_name, rows, resources, total = _run(lambda kw=keyword: _search_work_rows(kw))
+        _dim(
+            f"搜索后端 {backend_name}"
+            + (f"，共 {total} 部，显示前 {len(rows)} 部" if total > len(rows) else "")
+        )
         if not rows:
             typer.echo(f"没有匹配 {keyword!r} 的作品")
             continue
 
         typer.echo()
-        headers = ["作品", "类型", "资源", "有效"]
+        headers = ["作品", "类型", "季", "资源", "有效"]
         table_rows: list[list[Any]] = []
-        for media in rows:
-            year = f" ({media.year})" if media.year else ""
-            valid_count = sum(1 for r in media.resources if r.check_status is CheckStatus.VALID)
+        for work in rows:
+            year = f" ({work.year})" if work.year else ""
+            # 计数读 Work 上的反规范化字段，不是数 `resources` 字典 ——
+            # 那里面的条数是截断的（见 `DEFAULT_SEASON_LINKS`）。
             table_rows.append(
-                [f"{media.title}{year}", media.media_type.value, len(media.resources), valid_count]
+                [
+                    f"{work.title}{year}",
+                    work.media_type.value,
+                    work.season_count,
+                    work.resource_count,
+                    work.valid_resource_count,
+                ]
             )
         widths = [
             max([_width(headers[i])] + [_width(str(row[i])) for row in table_rows])
@@ -1854,7 +1933,7 @@ def _interactive_search() -> None:
             if choice is None:
                 break
             typer.echo()
-            _print_media_detail(rows[choice])
+            _print_work_detail(rows[choice], resources)
             typer.echo()
 
 

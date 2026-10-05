@@ -242,9 +242,12 @@ async def apply_canon_decisions(
         return report
 
     if junk_victims:
+        # `delete_media_rows` 自己把丢了季的 Work 计数刷好了（它必须自己刷 ——
+        # 行删掉之后就再也查不出那些行曾属于哪部作品）。这里只是把数字并进报告。
         stats = await delete_media_rows(session, junk_victims)
         report.junk_media_deleted = stats.deleted
         report.links_detached = stats.links_detached
+        report.works_recounted += stats.works_recounted
 
     touched_works: set[uuid.UUID] = set()
     survivors: set[uuid.UUID] = set()
