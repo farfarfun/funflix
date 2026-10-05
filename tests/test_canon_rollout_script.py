@@ -27,7 +27,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ROLLOUT_SH = REPO_ROOT / "scripts" / "canon-rollout.sh"
 
 STAGES = (
-    "backup", "guard", "rehearse", "purge", "rebuild", "resolve", "merge", "finalize", "reopen",
+    "backup",
+    "guard",
+    "rehearse",
+    "purge",
+    "rebuild",
+    "resolve",
+    "merge",
+    "finalize",
+    "reopen",
 )
 
 #: 假密码取个不可能自然出现的串，这样"日志里没有它"是个有意义的断言。
@@ -83,10 +91,10 @@ def fake_pg(tmp_path: Path, fake_bin: Path) -> Path:
     """
     # 一律答 0：stage_finalize 的两道前置检查（还有多少行没归属、多少组
     # (work_id, season) 撞车）读的是 `psql -tAc` 的输出，答空串会被当成"查出来不是 0"。
-    _write_exec(fake_bin / "psql", 'cat >/dev/null 2>&1 || true\necho 0')
+    _write_exec(fake_bin / "psql", "cat >/dev/null 2>&1 || true\necho 0")
     return _write_exec(
         tmp_path / "fake-python",
-        'cat >/dev/null\n'
+        "cat >/dev/null\n"
         f'printf "h:5432:db:u:{FAKE_PASSWORD}\\n" >"$2"\n'
         'printf "PGHOST=h\\nPGPORT=5432\\nPGDATABASE=db\\nPGUSER=u\\n" >"$3"',
     )
@@ -215,12 +223,25 @@ def test_yes_passes_the_gate(
 ) -> None:
     """`--yes` 是放行的唯一方式，而且放行之后才轮到全库阶段。"""
     result = _run(
-        sandbox, fake_bin, "apply", "--from", "rehearse", "--yes", "--skip-guard",
-        funflix=fake_funflix, python=fake_pg,
+        sandbox,
+        fake_bin,
+        "apply",
+        "--from",
+        "rehearse",
+        "--yes",
+        "--skip-guard",
+        funflix=fake_funflix,
+        python=fake_pg,
     )
     assert result.returncode == 0, result.stdout
     assert _markers(sandbox) == {
-        "rehearse", "purge", "rebuild", "resolve", "merge", "finalize", "reopen",
+        "rehearse",
+        "purge",
+        "rebuild",
+        "resolve",
+        "merge",
+        "finalize",
+        "reopen",
     }
 
     invocations = calls.read_text(encoding="utf-8").split("\n")[:-1]
@@ -238,15 +259,27 @@ def test_completed_stages_are_skipped(
 ) -> None:
     """断点让几小时的流程能中断续跑：已完成的阶段不重跑，也不重新花 token。"""
     first = _run(
-        sandbox, fake_bin, "apply", "--from", "reopen", "--skip-guard",
-        funflix=fake_funflix, python=fake_pg,
+        sandbox,
+        fake_bin,
+        "apply",
+        "--from",
+        "reopen",
+        "--skip-guard",
+        funflix=fake_funflix,
+        python=fake_pg,
     )
     assert first.returncode == 0, first.stdout
     assert _markers(sandbox) == {"reopen"}
 
     second = _run(
-        sandbox, fake_bin, "apply", "--from", "reopen", "--skip-guard",
-        funflix=fake_funflix, python=fake_pg,
+        sandbox,
+        fake_bin,
+        "apply",
+        "--from",
+        "reopen",
+        "--skip-guard",
+        funflix=fake_funflix,
+        python=fake_pg,
     )
     assert second.returncode == 0, second.stdout
     assert "跳过 reopen（已完成于" in second.stdout
@@ -273,8 +306,16 @@ def test_password_file_is_removed_and_never_printed(
     sandbox: Path, fake_bin: Path, fake_pg: Path, fake_funflix: Path
 ) -> None:
     """密码只经由 600 权限的 PGPASSFILE 传给 psql，跑完即删、全程不落日志。"""
-    result = _run(sandbox, fake_bin, "apply", "--from", "reopen", "--skip-guard",
-                  funflix=fake_funflix, python=fake_pg)
+    result = _run(
+        sandbox,
+        fake_bin,
+        "apply",
+        "--from",
+        "reopen",
+        "--skip-guard",
+        funflix=fake_funflix,
+        python=fake_pg,
+    )
     assert result.returncode == 0, result.stdout
     assert not (sandbox / ".run" / "canon-rollout" / ".pgpass").exists()
 
