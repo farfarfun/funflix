@@ -128,6 +128,25 @@ scripts/setup.sh run prod     # 前台运行（prod 跑已安装的 funflix 正�
 
 运行状态、PID 和日志位于 `.run/`。
 
+### canon 归一的上线
+
+`funflix canon` 的四个子命令默认都是 dry-run，加 `--apply` 才写库。把它们应用到
+生产库是一次有顺序、有人工闸门、要跑几个小时的操作，用 `scripts/canon-rollout.sh`
+编排，不要照着文档手敲：
+
+```bash
+scripts/canon-rollout.sh check            # 全程空跑：不写库、不花 token、不碰 Action
+scripts/canon-rollout.sh apply            # 真跑（带断点续跑；中断后重跑接着来）
+scripts/canon-rollout.sh status           # 看库当前状态 + 跑到哪个阶段了
+scripts/canon-rollout.sh apply --from resolve   # 从某个阶段开始
+```
+
+阶段依次是 `backup guard rehearse purge rebuild resolve merge finalize reopen`：
+备份五张表 → 停掉 `collect.yml`（并发 parse 会撞上归并）→ 单组演练并等人核对 →
+全库 purge/rebuild → LLM 裁决（先 `--limit 3` 探针再全量）→ 应用裁决 →
+迁移 B 收口 → 把 Action 开回去。断点和不变量快照在 `.run/canon-rollout/`。
+设计取舍见 `docs/DESIGN.md` §7.5。
+
 采集源除 Telegram 频道和腾讯文档外，还支持公开 RSS/Atom feed。RSS 条目标题、
 描述、真实链接、Atom enclosure，以及扩展字段里的 `infoHash` 都会转成原始文本，按
 feed 的 `guid`/`id` 增量去重。示例：

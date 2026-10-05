@@ -41,6 +41,11 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 run_dir="$root/.run/canon-rollout"
+#: 必须是脚本级变量而不是 pg_connect 的 local —— EXIT trap 是在函数返回之后
+#: 才执行的，那时候 local 已经销毁，set -u 下 trap 自己会报 unbound variable
+#: 并把退出码带成 1（症状：一切正常但脚本报错退出，密码文件还留在盘上）。
+pgpass_file="$run_dir/.pgpass"
+pgenv_file="$run_dir/.pgenv"
 backup_root="$HOME/.farfarfun/funflix/backup"
 canon_key=${CANON_KEY:-大主宰}
 gh_repo=${GH_REPO:-farfarfun/funflix}
@@ -100,11 +105,10 @@ EOF
 pg_connect() {
   command -v psql >/dev/null || die "找不到 psql。装一个 postgresql-client 即可（版本不限，见下面关于 pg_dump 的说明）。"
   mkdir -p "$run_dir"
-  local pgpass="$run_dir/.pgpass" pgenv="$run_dir/.pgenv"
-  rm -f "$pgpass" "$pgenv"
+  rm -f "$pgpass_file" "$pgenv_file"
   (
     umask 077
-    "${funflix_py[@]}" - "$pgpass" "$pgenv" <<'PY' >/dev/null
+    "${funflix_py[@]}" - "$pgpass_file" "$pgenv_file" <<'PY' >/dev/null
 import pathlib
 import sys
 
@@ -128,19 +132,19 @@ pathlib.Path(sys.argv[2]).write_text(
 )
 PY
   ) || die "取数据库连接参数失败（上面是原始输出）。检查 funsecret 里的数据库配置。"
-  [ -s "$pgenv" ] || die "连接参数文件是空的：$pgenv"
+  [ -s "$pgenv_file" ] || die "连接参数文件是空的：$pgenv_file"
   # 跑完就删掉 —— 哪怕是 600 权限，也没必要在盘上长期留一份明文密码；
   # 每次运行都会重新生成。
   #
   # 要同时挂 INT/TERM：这脚本一跑几个小时，Ctrl-C 是常态，而被信号杀掉时
   # bash **不会**执行 EXIT trap。kill -9 和 SIGPIPE 仍然收不到任何信号，
   # 所以 pg_connect 开头还留了一次无条件 rm 兜底。
-  trap 'rm -f "$pgpass"' EXIT
-  trap 'rm -f "$pgpass"; exit 130' INT TERM
+  trap 'rm -f "$pgpass_file"' EXIT
+  trap 'rm -f "$pgpass_file"; exit 130' INT TERM
   # shellcheck disable=SC1090
-  . "$pgenv"
+  . "$pgenv_file"
   export PGHOST PGPORT PGDATABASE PGUSER
-  export PGPASSFILE="$pgpass"
+  export PGPASSFILE="$pgpass_file"
   echo "数据库：$PGDATABASE @ $PGHOST:$PGPORT（用户 $PGUSER）"
 }
 

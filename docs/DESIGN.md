@@ -534,6 +534,34 @@ resource` 走完四张表，用 EXISTS 而不是 JOIN（后者会因为一部作
 
 LLM token 消耗与各网盘失效率目前不在这个接口里。
 
+### 7.5 canon 归一的上线编排（`scripts/canon-rollout.sh`）
+
+`funflix canon` 的四个子命令本身是独立可重跑的，但把它们应用到生产库是一次
+**有顺序、有闸门、要几个小时**的操作，所以单独有个编排脚本，而不是指望照文档
+手敲。阶段依次是 `backup guard rehearse purge rebuild resolve merge finalize reopen`。
+
+几个不显然的约束，都是脚本在替人记：
+
+- **顺序不能动**。`purge` 在 `rebuild` 前（垃圾行不清会凭空造出十几万个垃圾
+  Work）；`rebuild` 在 `resolve` 前（规则能搬掉大部分重复，LLM 只打残局）；
+  迁移 B 在 `merge` 后（它要把 `media.work_id` 设 NOT NULL）。
+- **不能和 `collect.yml` 同时跑**。那个 workflow 每两小时一次、push 到 master
+  也触发，它的 parse job 会往同一批表里并发 insert，正撞上 `(work_id, season)`
+  的合并。`guard` 阶段用 `gh` 停掉它并记下原状态，`reopen` 只把原本 active 的开回去。
+- **备份不能用 `pg_dump`**。生产是 PG 18，常见的开发机客户端是 16，`pg_dump`
+  对高版本服务器会直接 `aborting because of server version mismatch` 拒跑（`psql`
+  跨大版本查询反而没问题）。所以走 `COPY ... WITH (FORMAT binary)` + gzip，代价是
+  备份里**没有表结构**，恢复前目标表必须已存在。校验必须查 COPY 的 `ffff` 结束
+  标记 —— psql 中途失败时 gzip 照样产出一个合法 `.gz`，`gzip -t` 查不出里面是半张表。
+- **不变量分三类看**，别一律要求是 0：两个「孤儿关联」必须始终是 0（不是 0 就是
+  真损坏）；「work_id 为空」和「`(work_id,season)` 撞车」必须归零才能跑迁移 B；
+  两个「计数不一致」只看趋势（基线本身就不是 0 —— 迁移 A 时期建的 Work 计数列
+  从没刷过，canon 只对自己动过的行重算）。
+
+`resolve` 是唯一花钱的阶段，脚本先用 `--limit 3` 打探针、把裁决打出来让人看过
+再放开全量。单组演练（默认 `--key 大主宰`）和探针之后各有一道人工闸门，
+非交互环境下不加 `--yes` 会直接拒绝放行。
+
 ---
 
 ## 8. 目录结构
@@ -543,7 +571,9 @@ funflix/
 ├── pyproject.toml  README.md  CHANGELOG.md
 ├── docs/           DESIGN.md  TODO.md  DEVELOPMENT.md
 ├── alembic.ini  migrations/versions/
-├── scripts/setup.sh              # worker 生命周期（SPEC §6.1）
+├── scripts/
+│   ├── setup.sh                  # worker 生命周期（SPEC §6.1）
+│   └── canon-rollout.sh          # canon 归一的一次性上线编排（见下）
 ├── src/funflix/
 │   ├── security.py               # 登录密码哈希
 │   ├── cli.py                    # typer 入口 + 交互式菜单

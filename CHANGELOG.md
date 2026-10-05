@@ -38,6 +38,22 @@
 - `tests/test_setup_script.py`：把 `scripts/setup.sh` 复制到临时目录、用只含必需命令的
   干净 PATH 驱动，覆盖 `bash -n`、用法、prod/dev 入口缺失、启动即退出、重复启动被拒、
   `status` 返回非 0、陈旧 PID 文件清理。
+- `scripts/canon-rollout.sh`：canon 归一上线的一次性编排（见 `docs/DESIGN.md` §7.5），
+  九个阶段固定顺序 `backup guard rehearse purge rebuild resolve merge finalize reopen`，
+  每阶段完成写 `.run/canon-rollout/<stage>.done`，可 `--from <stage>` 续跑。
+  要点：
+  - `guard` 先停 `collect.yml` + `pipeline-watchdog.yml` 并记下原状态，`reopen` 只恢复
+    原本是 active 的那些。采集与归一同时跑会边删边写，`rebuild` 刚建好的 Work 立刻
+    又被新行绕开。
+  - `backup` 用 `COPY ... WITH (FORMAT binary)` 走 psql 而不是 `pg_dump` —— 本机
+    pg_dump 16 对 PG 18.4 直接 `aborting because of server version mismatch`。校验查
+    `PGCOPY` 文件头**和尾部的 `ffff` 结束标记**：`gzip -t` 对「一个完整的 gz 里只装了
+    半张表」是通不出错的，少了结束标记才看得出截断。
+  - `resolve` 是唯一花钱的阶段，先 `--limit 3` 探一次、打印新落的 `title_canon` 行，
+    人工确认后才放开全量；`rehearse` 之后还有一道人工闸。非 TTY 下没有 `--yes` 就拒绝继续。
+  - 每个阶段前后打一组 16 项不变量快照。注意两项「计数不一致」的基线不是 0 而是
+    64 / 80（迁移 A 时期建的那 80 个 Work 计数列从没刷过），当成「只看趋势」读，
+    别拿它当通过条件。
 
 ### 变更
 
