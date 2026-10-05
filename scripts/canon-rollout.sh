@@ -30,7 +30,8 @@ set -euo pipefail
 # 阶段名依次是: backup guard rehearse purge rebuild resolve merge finalize reopen
 #
 # 环境变量:
-#   FUNFLIX_CMD   跑 funflix 的命令，默认 "uv run funflix"（工作树里的源码）
+#   FUNFLIX_CMD   跑 funflix 的命令，默认 "uv run --frozen funflix"（工作树里的源码）
+#   FUNFLIX_PY    跑 python 的命令，要能 import funflix，默认 "uv run --frozen python"
 #   CANON_KEY     单组演练用的归一键，默认 大主宰
 #   GH_REPO       Action 所在仓库，默认 farfarfun/funflix
 #
@@ -43,7 +44,11 @@ run_dir="$root/.run/canon-rollout"
 backup_root="$HOME/.farfarfun/funflix/backup"
 canon_key=${CANON_KEY:-大主宰}
 gh_repo=${GH_REPO:-farfarfun/funflix}
-read -r -a funflix_cmd <<<"${FUNFLIX_CMD:-uv run funflix}"
+# `--frozen`：按 uv.lock 原样跑，既不校验也不更新它。上线过程中重新解析依赖
+# 是纯风险（会悄悄换掉某个传递依赖的版本），而且不加这个的话 `uv run` 会把
+# lock 里的 `[options] prerelease-mode` 抹掉 —— 一次上线顺手改了依赖解析规则。
+read -r -a funflix_cmd <<<"${FUNFLIX_CMD:-uv run --frozen funflix}"
+read -r -a funflix_py <<<"${FUNFLIX_PY:-uv run --frozen python}"
 
 #: apply 的阶段顺序。改这里要同步改上面的用法说明和各 stage_* 函数。
 STAGES=(backup guard rehearse purge rebuild resolve merge finalize reopen)
@@ -57,8 +62,31 @@ die() {
   exit 1
 }
 
+# 查一个 workflow 当前是 active 还是 disabled_manually。
+# 用 `gh workflow list` 而不是 `gh workflow view` —— 后者不支持 --json，
+# 只能解析它给人看的表格输出，文案一改就碎。
+wf_state() {
+  gh workflow list --all --repo "$gh_repo" --json path,state \
+    -q "map(select(.path | endswith(\"/$1\"))) | .[0].state // empty" 2>/dev/null
+}
+
 usage() {
-  sed -n '4,40p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+用法:
+  scripts/canon-rollout.sh check            # 全程空跑：不写库、不花 token、不碰 Action
+  scripts/canon-rollout.sh apply [选项]      # 真跑
+  scripts/canon-rollout.sh status           # 看库当前状态 + 跑到哪个阶段了
+  scripts/canon-rollout.sh backup           # 只备份
+  scripts/canon-rollout.sh reset            # 清掉断点标记，下次 apply 从头来
+
+apply 的选项:
+  --yes          跳过所有人工闸门（无人值守用；意味着你已经看过 check 的报告）
+  --skip-guard   不管 Action 的开关状态（你已经手工停掉了）
+  --from <阶段>   从这个阶段开始，它之前的全部视作已完成
+
+阶段依次是: backup guard rehearse purge rebuild resolve merge finalize reopen
+详细说明见脚本顶部的注释。
+EOF
   exit 2
 }
 
@@ -76,8 +104,7 @@ pg_connect() {
   rm -f "$pgpass" "$pgenv"
   (
     umask 077
-    "${funflix_cmd[0]}" "${funflix_cmd[@]:1:$((${#funflix_cmd[@]} - 2))}" \
-      python - "$pgpass" "$pgenv" <<'PY' >/dev/null
+    "${funflix_py[@]}" - "$pgpass" "$pgenv" <<'PY' >/dev/null
 import pathlib
 import sys
 
@@ -102,6 +129,14 @@ pathlib.Path(sys.argv[2]).write_text(
 PY
   ) || die "取数据库连接参数失败（上面是原始输出）。检查 funsecret 里的数据库配置。"
   [ -s "$pgenv" ] || die "连接参数文件是空的：$pgenv"
+  # 跑完就删掉 —— 哪怕是 600 权限，也没必要在盘上长期留一份明文密码；
+  # 每次运行都会重新生成。
+  #
+  # 要同时挂 INT/TERM：这脚本一跑几个小时，Ctrl-C 是常态，而被信号杀掉时
+  # bash **不会**执行 EXIT trap。kill -9 和 SIGPIPE 仍然收不到任何信号，
+  # 所以 pg_connect 开头还留了一次无条件 rm 兜底。
+  trap 'rm -f "$pgpass"' EXIT
+  trap 'rm -f "$pgpass"; exit 130' INT TERM
   # shellcheck disable=SC1090
   . "$pgenv"
   export PGHOST PGPORT PGDATABASE PGUSER
@@ -117,8 +152,23 @@ sql() { psql -q -v ON_ERROR_STOP=1 "$@"; }
 #: 关联行数、未归属 resource、孤儿关联。计数列的口径照 services/counters.py：
 #: media.resource_count = 关联行数，media.valid_resource_count = 其中 check_status
 #: 为 valid 的条数，work 的三个计数都是对下属各季的纯求和。
+#:
+#: 怎么看这张表 —— 分三类，别一律要求是 0：
+#:
+#: - **必须始终是 0**：两个「孤儿关联」。不是 0 就说明删 media 时漏删了关联，
+#:   或者关联指向了不存在的 resource，这是真的数据损坏。
+#: - **必须是 0 才能跑迁移 B**：「work_id 为空」和「(work_id,season) 撞车」。
+#:   前者过不了 NOT NULL，后者过不了唯一索引。stage_finalize 会自己先查。
+#: - **只看趋势，不要求是 0**：两个「计数不一致」。2026-10-05 的基线就是
+#:   64 / 80（迁移 A 时期建的那 80 个 Work 计数列从没刷过），canon 各阶段
+#:   只对自己动过的行重算计数，所以它应该一路往下走、最后归零；中途不为 0
+#:   不代表出错。「未归属 resource」同理，基线 42,493。
+#:
+#: 每次快照都存一份到 .run/canon-rollout/inv-<标签>.txt，前后 diff 比盯单次数字有用。
 invariants() {
-  echo "（扫 3M 行关联表，约一两分钟）"
+  local snap
+  snap="$run_dir/inv-${1:-adhoc}-$(date +%H%M%S).txt"
+  echo "（扫 3M 行关联表，约一两分钟；快照存 ${snap##*/}）"
   sql -c "
     select 项, 值 from (values
       ( 1, 'media 总行数',            (select count(*)::text from media)),
@@ -159,25 +209,29 @@ invariants() {
       (14, 'title_canon decided',     (select count(*)::text from title_canon where status = 'decided')),
       (15, 'title_canon rejected',    (select count(*)::text from title_canon where status = 'rejected')),
       (16, 'alembic 版本',            (select version_num from alembic_version))
-    ) t(序, 项, 值) order by 序;"
+    ) t(序, 项, 值) order by 序;" | tee "$snap"
 }
 
 #: 单组演练的验收口径。期望：`$canon_key` 收成一个 Work（底下按季分开），
 #: 而「天命大主宰」「诛天大主宰」「北灵少年志之大主宰」「深空彼岸大主宰4」
 #: 这些**不同的作品**各自独立 —— 这一条比并得多不多重要得多。
 key_report() {
-  echo "── 含「$canon_key」的 Work（季号:资源数）"
-  sql -c "
-    select w.title, w.media_type as 类型, nullif(w.year, 0) as 年份,
-           w.season_count as 季数, w.resource_count as 资源数,
-           (select string_agg(m.season || ':' || m.resource_count, ', ' order by m.season)
-              from media m where m.work_id = w.id) as 各季
-      from work w
-     where w.title like '%' || :'k' || '%' or w.norm_key like '%' || :'k' || '%'
-     order by w.resource_count desc limit 40;" -v k="$canon_key"
-  echo "── 还没归属到任何 Work 的「$canon_key」行"
-  sql -c "select count(*) as 行数 from media
-           where work_id is null and title like '%' || :'k' || '%';" -v k="$canon_key"
+  # 从 stdin 喂 SQL、由 bash 插值，而不是 psql 的 -v + :'k' —— psql **不会**在
+  # -c 给的字符串里做变量插值（会原样发给服务器，报 syntax error at or near ":"）。
+  # 插值前把单引号翻倍，这是 SQL 字符串字面量的标准转义（CANON_KEY 来自环境变量）。
+  local k=${canon_key//\'/\'\'}
+  echo "── 含「$canon_key」的 Work（各季是「季号:资源数」）"
+  sql <<EOF
+select w.title, w.media_type as 类型, nullif(w.year, 0) as 年份,
+       w.season_count as 季数, w.resource_count as 资源数,
+       (select string_agg(m.season || ':' || m.resource_count, ', ' order by m.season)
+          from media m where m.work_id = w.id) as 各季
+  from work w
+ where w.title like '%$k%' or w.norm_key like '%$k%'
+ order by w.resource_count desc limit 40;
+select count(*) as 还没归属到Work的行数 from media
+ where work_id is null and title like '%$k%';
+EOF
 }
 
 # ───────────────────────────── 阶段 ─────────────────────────────
@@ -190,19 +244,37 @@ stage_backup() {
   free_mb=$(df -Pm "$HOME" | awk 'NR==2 {print $4}')
   [ "$free_mb" -ge 1024 ] || die "$HOME 只剩 ${free_mb}MB，备份要 ~200MB 加富余量。先腾点地方。"
 
-  local dir="$backup_root/pre-canon-$(date +%Y%m%d-%H%M%S)"
+  local dir
+  dir="$backup_root/pre-canon-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$dir"
   echo "备份到 $dir"
-  local t
+  # 校验失败就把目录改名再退出 —— 一份半截的备份比没有备份更危险，
+  # 它会在最需要它的时候才暴露，而那时候原始数据已经改掉了。
+  bad_backup() {
+    mv "$dir" "$dir.FAILED"
+    die "$1
+      这一份已改名成 ${dir##*/}.FAILED，不要拿它恢复。"
+  }
+
+  local t f head6 tail2
   for t in "${TABLES[@]}"; do
-    psql -q -v ON_ERROR_STOP=1 -c "\\copy $t to stdout with (format binary)" | gzip -6 >"$dir/$t.bin.gz"
-    # 校验头尾再认账 —— 网络中断留下的半份文件也是一个能打开的 .gz，
-    # 不验的话会在最需要它的时候才发现是截断的。
-    gzip -t "$dir/$t.bin.gz" || die "$t 的备份 gzip 校验失败"
-    gzip -dc "$dir/$t.bin.gz" | head -c 6 | grep -q PGCOPY || die "$t 的备份缺 PGCOPY 文件头"
-    [ "$(gzip -dc "$dir/$t.bin.gz" | tail -c 2 | od -An -tx1 | tr -d ' \n')" = ffff ] ||
-      die "$t 的备份缺 COPY 结束标记（-1 字段数），是截断的"
-    printf '  %-16s %8.1f MB\n' "$t" "$(bc -l <<<"$(stat -c %s "$dir/$t.bin.gz") / 1000000")"
+    f="$dir/$t.bin.gz"
+    psql -q -v ON_ERROR_STOP=1 -c "\\copy $t to stdout with (format binary)" | gzip -6 >"$f"
+    # 三道校验，各管一种坏法：
+    #   gzip -t    —— 整个流的 CRC，管「传输中断导致文件截断」
+    #   PGCOPY 头  —— 管「psql 一开始就连不上，写出来一个空壳」
+    #   ffff 尾    —— 管「psql 中途报错退出，而 gzip 仍然产出了一个完整合法的
+    #                 .gz，只是里面装着半张表」。这一道最关键，gzip -t 查不出来。
+    gzip -t "$f" || bad_backup "$t 的备份 gzip 校验失败"
+    # 两行末尾的 `|| true` 不是偷懒，是必需的：`head -c 6` 读够就关管道，
+    # gzip 吃到 SIGPIPE 非零退出，pipefail 把整条管道判失败 —— 而赋值语句的
+    # 退出码就是命令替换的退出码，于是 set -e 会在这里把脚本直接带走
+    # （症状是只备完第一张表就静默退出，连错误都不打）。
+    head6=$(gzip -dc "$f" | head -c 6) || true
+    tail2=$(gzip -dc "$f" | tail -c 2 | od -An -tx1 | tr -d ' \n') || true
+    [ "$head6" = PGCOPY ] || bad_backup "$t 的备份缺 PGCOPY 文件头（拿到的是 '$head6'）"
+    [ "$tail2" = ffff ] || bad_backup "$t 的备份缺 COPY 结束标记，是截断的（尾部是 '$tail2'）"
+    printf '  %-16s %8.1f MB\n' "$t" "$(bc -l <<<"$(stat -c %s "$f") / 1000000")"
   done
 
   {
@@ -213,6 +285,7 @@ stage_backup() {
     echo "- 库：$PGDATABASE @ $PGHOST"
     echo "- alembic_version：$(psql -tAc 'select version_num from alembic_version')"
     echo
+    # shellcheck disable=SC2016  # 反引号是 Markdown 的代码标记，不要展开
     echo '格式是 `COPY ... WITH (FORMAT binary)`，只在同大版本的服务器之间可移植，'
     echo '且**不含**表结构/索引/约束 —— 恢复前目标表必须已存在且列顺序一致。'
     echo
@@ -246,7 +319,10 @@ stage_guard() {
       pipeline-watchdog.yml，然后加 --skip-guard 重跑。"
   local wf state
   for wf in collect.yml pipeline-watchdog.yml; do
-    if ! state=$(gh workflow view "$wf" --repo "$gh_repo" --json state -q .state 2>/dev/null); then
+    # `|| true` 同上：gh 查不到 workflow 会非零退出，而赋值语句会把那个状态
+    # 交给 set -e。这里要的是「查不到就跳过」，不是「查不到就终止上线」。
+    state=$(wf_state "$wf") || true
+    if [ -z "$state" ]; then
       echo "  $wf：查不到（仓库里没有这个 workflow？跳过）"
       continue
     fi
@@ -266,20 +342,23 @@ stage_rehearse() {
   "${funflix_cmd[@]}" canon purge --key "$canon_key" --apply --yes
   "${funflix_cmd[@]}" canon rebuild --key "$canon_key" --apply --yes
   key_report
-  invariants
-  gate "核对上面：「$canon_key」是否收成了一个 Work、各季分开、而其他同名不同作品
-    （天命大主宰 / 诛天大主宰 / 北灵少年志之大主宰 / 深空彼岸大主宰4 / 各种小说）
-    各自独立？「孤儿关联」和「计数不一致」是否都是 0？确认无误才放开全库"
+  invariants rehearse
+  gate "核对上面三件事，确认无误才放开全库：
+    1) 「$canon_key」是否收成了一个 Work、各季分开？
+    2) 其他同名但**不是同一部作品**的（天命大主宰 / 诛天大主宰 /
+       北灵少年志之大主宰 / 深空彼岸大主宰4 / 各种同名小说）是否各自独立？
+       这一条比并得多不多重要得多 —— 误并不可逆。
+    3) 两个「孤儿关联」是否都是 0？（计数不一致不用是 0，基线就是 64/80）"
 }
 
 stage_purge() {
   "${funflix_cmd[@]}" canon purge --apply --yes
-  invariants
+  invariants purge
 }
 
 stage_rebuild() {
   "${funflix_cmd[@]}" canon rebuild --apply --yes
-  invariants
+  invariants rebuild
 }
 
 # resolve 是唯一花钱的阶段，也是真实模型路径第一次在生产数据上跑
@@ -307,7 +386,7 @@ stage_resolve() {
 stage_merge() {
   "${funflix_cmd[@]}" canon merge --apply --yes
   key_report
-  invariants
+  invariants merge
 }
 
 # 迁移 B：work_id 设 NOT NULL、season 默认 0 且 NOT NULL、加 UNIQUE(work_id, season)、
@@ -325,7 +404,7 @@ stage_finalize() {
   [ "$dup" = 0 ] || die "有 $dup 组 (work_id, season) 撞车，uq_media_season 唯一索引加不上。
       重跑 canon merge 应该能把它们并掉；并不掉的要手工看。"
   "${funflix_cmd[@]}" db upgrade
-  invariants
+  invariants finalize
 }
 
 # 只重开那些本来是 active 的。stage_guard 把原状态记在 .prev-state 里了。
@@ -372,7 +451,8 @@ gate() {
 }
 
 run_stage() {
-  local name="$1" marker="$run_dir/$name.done"
+  local name="$1"
+  local marker="$run_dir/$name.done"
   if [ -f "$marker" ]; then
     echo "跳过 $name（已完成于 $(cat "$marker")）"
     return 0
@@ -407,15 +487,14 @@ cmd_apply() {
 # 耗时和真跑的扫描部分一样（每阶段全表扫 media），所以要 40 分钟左右。
 cmd_check() {
   echo "── 当前库状态"
-  invariants
+  invariants check-baseline
   key_report
   echo
   echo "── Action 状态（只看不动）"
   if command -v gh >/dev/null; then
     local wf
     for wf in collect.yml pipeline-watchdog.yml; do
-      printf '  %-24s %s\n' "$wf" \
-        "$(gh workflow view "$wf" --repo "$gh_repo" --json state -q .state 2>/dev/null || echo 查不到)"
+      printf '  %-24s %s\n' "$wf" "$(wf_state "$wf" || true)"
     done
   else
     echo "  找不到 gh，跳过"
@@ -444,7 +523,7 @@ cmd_status() {
   echo "  最后一次备份：$(cat "$run_dir/last-backup" 2>/dev/null || echo 无)"
   echo
   echo "── 当前库状态"
-  invariants
+  invariants status
 }
 
 cmd_reset() {
