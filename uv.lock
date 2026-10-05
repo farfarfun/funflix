@@ -612,7 +612,7 @@ wheels = [
 
 [[package]]
 name = "funflix"
-version = "1.0.14"
+version = "1.0.15"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -657,8 +657,8 @@ requires-dist = [
     { name = "bcrypt", specifier = ">=4.0" },
     { name = "farlog", specifier = ">=1.1.8" },
     { name = "fundrive", marker = "extra == 'drives'", specifier = ">=2.0.85" },
-    { name = "funsecret", specifier = ">=1.4.95" },
-    { name = "funworker", specifier = ">=0.1.1" },
+    { name = "funsecret", specifier = ">=1.4.96" },
+    { name = "funworker", specifier = ">=0.1.5" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "openai", marker = "extra == 'llm'", specifier = ">=1.0" },
     { name = "opencc-python-reimplemented", marker = "extra == 'zh'", specifier = ">=0.1.7" },
