@@ -444,26 +444,18 @@ funflix/
 
 ## 9. 打包
 
-```toml
-[project]
-name = "funflix"
-requires-python = ">=3.12"        # fundrive 2.0 的要求
-dependencies = [
-  "fastapi", "uvicorn[standard]", "sqlalchemy[asyncio]>=2.0",
-  "alembic", "pydantic>=2", "pydantic-settings",
-  "httpx", "anthropic", "typer", "fundrive>=2.0.85",
-  "aiosqlite",
-]
+以 `pyproject.toml` 为准，本节只说明几个容易踩的约定：
 
-[project.optional-dependencies]
-pg    = ["asyncpg"]
-drives = ["fundrive[all]"]
-zh    = ["opencc-python-reimplemented"]   # 繁简转换
-dev   = ["pytest", "pytest-asyncio", "respx", "ruff", "mypy"]
-
-[project.scripts]
-funflix = "funflix.cli:app"
-```
+- `requires-python = ">=3.10"`（SPEC §3 的组织下限）。源码里不用 PEP 695 类型参数
+  语法（3.12），`enum.StrEnum` 与 `datetime.UTC`（都是 3.11 新增）统一从
+  `funflix.compat` 取，该模块按解释器版本择一导出。
+- HTTP 服务端（FastAPI/uvicorn）不在本仓库：funflix 只提供 `funflix` CLI
+  （`[project.scripts]`），对外 HTTP 接口由 funflix-api 承载。
+- LLM 抽取走 OpenAI 兼容协议（`llm` extra 装 `openai`），不直接依赖 anthropic SDK。
+- `drives` extra（fundrive）目前没有任何模块 import，是给 §6 的 `FundriveProbe`
+  预留的；fundrive 自身要求 Python ≥3.12，所以这个 extra 在 3.10/3.11 上装不上。
+- `migrations/` 与 `alembic.ini` 通过 `[tool.hatch.build.targets.wheel.force-include]`
+  打进 wheel，否则装完包跑 `funflix db upgrade` 会找不到 `script_location`。
 
 ---
 

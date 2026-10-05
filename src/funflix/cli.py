@@ -11,7 +11,7 @@ import os
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, TypeVar
 
 import click
 import questionary
@@ -64,7 +64,11 @@ def _main(
 # --- 输出 helpers ------------------------------------------------------------
 
 
-def _run[T](factory: Callable[[], Awaitable[T]]) -> T:
+#: 泛型参数。用 TypeVar 而不是 PEP 695 的 `[T]` 语法，保持 SPEC §3 的 Python 3.10 下限。
+_T = TypeVar("_T")
+
+
+def _run(factory: Callable[[], Awaitable[_T]]) -> _T:
     """跑一个协程。每条命令都是一次性进程，不需要复用事件循环。"""
     return asyncio.run(factory())
 

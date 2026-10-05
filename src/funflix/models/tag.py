@@ -10,12 +10,12 @@
 from __future__ import annotations
 
 import uuid
-from enum import StrEnum
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
 from funflix.base.enums import enum_col
+from funflix.compat import StrEnum
 from funflix.models.base import Base, PkType, TimestampMixin, UTCDateTime, utcnow, uuid7
 
 

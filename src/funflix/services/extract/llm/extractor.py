@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeVar
 
 from farlog import getLogger
 
@@ -40,7 +40,11 @@ def _coerce_year(value: Any) -> int | None:
     return value if _YEAR_MIN <= value <= _YEAR_MAX else None
 
 
-def _coerce_enum[T](raw: Any, enum_cls: type[T], default: T) -> T:
+#: 泛型参数。用 TypeVar 而不是 PEP 695 的 `[T]` 语法，保持 SPEC §3 的 Python 3.10 下限。
+_T = TypeVar("_T")
+
+
+def _coerce_enum(raw: Any, enum_cls: type[_T], default: _T) -> _T:
     if not isinstance(raw, str):
         return default
     try:

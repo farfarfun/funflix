@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from queue import Queue
 
 import pytest
@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from funflix.base.config import Settings
 from funflix.base.enums import SourceType
+from funflix.compat import UTC
 from funflix.models import Base, RawDocument, Source
 from funflix.services.collect import concurrent_runner as cr
 from funflix.services.collect import telegram

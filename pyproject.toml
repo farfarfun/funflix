@@ -7,11 +7,14 @@ name = "funflix"
 version = "1.0.5"
 description = "影视资源分享文本的结构化采集、解析与网盘链接校验"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = "MIT"
 keywords = ["media", "netdisk", "sqlalchemy"]
 classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 dependencies = [
@@ -62,6 +65,10 @@ name = "farfarfun"
 email = "farfarfun@qq.com"
 [project.optional-dependencies]
 llm = ["openai>=1.0"]
+# 注意：fundrive 自身声明 requires-python >=3.12，这个 extra 只能在 Python ≥3.12
+# 上安装。核心功能（采集/解析/HTTP 匿名探针）不依赖它，装不上不影响使用。
+# 目前 src/ 下没有任何模块 import fundrive，它是给 docs/DESIGN.md §6 规划的
+# FundriveProbe（匿名探测判不出来时降级到带登录态的网盘驱动）预留的。
 drives = ["fundrive>=2.0.85"]
 zh = ["opencc-python-reimplemented>=0.1.7"]
 dev = [
@@ -88,8 +95,6 @@ packages = ["src/funflix"]
 "migrations" = "funflix/migrations"
 "alembic.ini" = "funflix/alembic.ini"
 
-[tool.setuptools]
-
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
@@ -99,7 +104,7 @@ pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

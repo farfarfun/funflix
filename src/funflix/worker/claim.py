@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from farlog import getLogger
 from sqlalchemy import ColumnElement, case, func, or_, select, update
@@ -48,11 +48,15 @@ logger = getLogger("funflix")
 DEFAULT_LEASE = timedelta(minutes=5)
 
 
+#: 泛型参数。用 TypeVar 而不是 PEP 695 的 `[T]` 语法，保持 SPEC §3 的 Python 3.10 下限。
+_T = TypeVar("_T")
+
+
 @dataclass(slots=True)
-class Claimed[T]:
+class Claimed(Generic[_T]):
     """一次领取的结果。"""
 
-    rows: list[T] = field(default_factory=list)
+    rows: list[_T] = field(default_factory=list)
     #: 从过期租约里重捞回来的数量。持续大于 0 意味着有 worker 在反复崩溃。
     reclaimed: int = 0
     #: 重捞时发现已超过重试上限、直接置终态的数量。
@@ -73,16 +77,16 @@ def _overfetch(limit: int) -> int:
     return limit * 2 + 8
 
 
-async def _claim_rows[T](
+async def _claim_rows(
     session: AsyncSession,
-    model: type[T],
+    model: type[_T],
     *,
     columns: list[Any],
     conditions: list[ColumnElement[bool]],
     order_by: list[Any],
     limit: int,
     decide: Callable[..., tuple[dict[str, Any], bool, bool]],
-) -> Claimed[T]:
+) -> Claimed[_T]:
     """领取的通用骨架。
 
     Args:
@@ -92,7 +96,7 @@ async def _claim_rows[T](
             `values` 是要写入的列，`is_terminal` 为真表示这行被置了终态、
             不算领到手的任务。
     """
-    result: Claimed[T] = Claimed()
+    result: Claimed[_T] = Claimed()
     if limit <= 0:
         return result
 

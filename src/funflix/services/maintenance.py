@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TypeVar
 
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -269,7 +270,11 @@ class CleanupResourcesReport:
     media_recounted: int = 0
 
 
-def _chunks[T](items: list[T], size: int = 500) -> list[list[T]]:
+#: 泛型参数。用 TypeVar 而不是 PEP 695 的 `[T]` 语法，保持 SPEC §3 的 Python 3.10 下限。
+_T = TypeVar("_T")
+
+
+def _chunks(items: list[_T], size: int = 500) -> list[list[_T]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
