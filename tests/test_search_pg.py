@@ -12,20 +12,26 @@
 而是**查询计划**。`similarity(a, b) > 阈值` 与 `a % b` 结果完全一致，
 只有后者能走 GIN 索引 —— 前者退化成全表扫描，结果照样正确，测试照样全绿，
 只是慢几百倍。这种退化只有查执行计划才拦得住。
+
+搜索的主体是 `Work`（一部剧），所以这里的索引、种子数据、执行计划断言
+全部盯在 `work` 表上。资源筛选（`valid_only` / `provider`）要多穿一层
+`work → media → media_resource → resource`，单独一组用例盯那条链路。
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from funflix.base.config import Settings
-from funflix.base.enums import MediaType
-from funflix.models import Base, Media
+from funflix.base.enums import CheckStatus, MediaType, Provider
+from funflix.models import Base, Media, Resource, Work, media_resource
+from funflix.models.base import utcnow
 from funflix.services.search import PgTrgmSearchBackend, SearchQuery, get_backend
 
 PG_URL = os.environ.get("FUNFLIX_TEST_PG_URL")
@@ -46,13 +52,16 @@ async def pg_session():
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
-        # 与 migrations/versions/a1b2c3d4e5f6_pg_trgm_search.py 保持一致
-        await conn.execute(
-            text("CREATE INDEX ix_media_norm_key_trgm ON media USING gin (norm_key gin_trgm_ops)")
-        )
-        await conn.execute(
-            text("CREATE INDEX ix_media_title_trgm ON media USING gin (title gin_trgm_ops)")
-        )
+        # 与 migrations/versions/a1b2c3d4e5f6_pg_trgm_search.py 及
+        # b1c2d3e4f5a6（Work 表）保持一致
+        for table in ("media", "work"):
+            for column in ("norm_key", "title"):
+                await conn.execute(
+                    text(
+                        f"CREATE INDEX ix_{table}_{column}_trgm "
+                        f"ON {table} USING gin ({column} gin_trgm_ops)"
+                    )
+                )
 
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with maker() as s:
@@ -60,29 +69,71 @@ async def pg_session():
     await engine.dispose()
 
 
-async def _seed(session: AsyncSession, bulk: int = 0) -> None:
-    session.add_all(
-        [
-            Media(title=t, norm_key=n, media_type=MediaType.MOVIE, year=2024, aliases=[])
-            for t, n in [("误杀2", "误杀2"), ("流浪地球", "流浪地球"), ("误杀瞒天记", "误杀瞒天记")]
-        ]
-    )
+async def _seed(session: AsyncSession, bulk: int = 0) -> list[Work]:
+    """三部作品：两部能被「误杀」命中，一部不能。"""
+    works = [
+        Work(title=t, norm_key=n, media_type=MediaType.MOVIE, year=2024, aliases=[])
+        for t, n in [("误杀2", "误杀2"), ("流浪地球", "流浪地球"), ("误杀瞒天记", "误杀瞒天记")]
+    ]
+    session.add_all(works)
     await session.commit()
 
     if bulk:
         # 走原生 INSERT ... generate_series，逐条 ORM 插 5 万行要几十秒。
+        # `id` 这里由 PG 自己生成 —— 模型上的 uuid7 默认值是 Python 侧的，
+        # 绕过 ORM 就不生效，不给值会撞 NOT NULL。
         await session.execute(
             text(
-                "INSERT INTO media "
-                "(title, norm_key, media_type, year, aliases, "
-                " resource_count, valid_resource_count, created_at, updated_at) "
-                "SELECT '填充剧集' || g, '填充剧集' || g, 'tv', 2020, '[]', "
-                "       0, 0, now(), now() "
+                "INSERT INTO work "
+                "(id, title, norm_key, media_type, year, aliases, "
+                " season_count, resource_count, valid_resource_count, created_at, updated_at) "
+                "SELECT gen_random_uuid(), '填充剧集' || g, '填充剧集' || g, 'tv', 2020, '[]', "
+                "       0, 0, 0, now(), now() "
                 f"FROM generate_series(1, {bulk}) g"
             )
         )
         await session.commit()
         await _vacuum(session)
+    return works
+
+
+async def _add_season(
+    session: AsyncSession,
+    work: Work,
+    *,
+    season: int = 0,
+    check_status: CheckStatus = CheckStatus.VALID,
+    provider: Provider = Provider.QUARK,
+) -> Media:
+    """给作品挂一季 + 一条资源。资源筛选要穿四张表，必须有真数据才测得到。"""
+    media = Media(
+        title=f"{work.title} 第{season}季",
+        norm_key=f"{work.norm_key}-{season}",
+        media_type=work.media_type,
+        year=work.year,
+        aliases=[],
+        work_id=work.id,
+        season=season,
+        resource_count=1,
+        valid_resource_count=1 if check_status is CheckStatus.VALID else 0,
+    )
+    share_id = uuid.uuid4().hex[:12]
+    now = utcnow()
+    resource = Resource(
+        provider=provider,
+        share_id=share_id,
+        url=f"https://example.com/s/{share_id}",
+        check_status=check_status,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    session.add_all([media, resource])
+    await session.flush()
+    await session.execute(
+        insert(media_resource).values(media_id=media.id, resource_id=resource.id, created_at=now)
+    )
+    await session.commit()
+    return media
 
 
 async def _vacuum(session: AsyncSession) -> None:
@@ -98,7 +149,7 @@ async def _vacuum(session: AsyncSession) -> None:
     engine = session.bind
     async with engine.connect() as conn:
         await conn.execution_options(isolation_level="AUTOCOMMIT")
-        await conn.execute(text("VACUUM ANALYZE media"))
+        await conn.execute(text("VACUUM ANALYZE work"))
 
 
 @pytest.mark.asyncio
@@ -113,7 +164,7 @@ class TestTrgmSearch:
     async def test_finds_by_substring(self, pg_session) -> None:
         await _seed(pg_session)
         rows = await PgTrgmSearchBackend().search(pg_session, SearchQuery(keyword="误杀"))
-        assert {m.title for m in rows} == {"误杀2", "误杀瞒天记"}
+        assert {w.title for w in rows} == {"误杀2", "误杀瞒天记"}
 
     async def test_count_agrees_with_search(self, pg_session) -> None:
         """count 与 search 是两条独立语句，过滤条件必须一致。
@@ -141,6 +192,140 @@ class TestTrgmSearch:
         )
         assert rows == []
 
+    async def test_one_row_per_work_not_per_season(self, pg_session) -> None:
+        """这是整次改造的目标：一部剧一条，不管它有几季。
+
+        回归的是旧行为 —— 搜索打在 `media` 上时，《大主宰》的 448 条标题变体
+        会原样铺在结果里。现在季是子层，搜索结果里一部剧只出现一次。
+        """
+        works = await _seed(pg_session)
+        for season in (1, 2, 3):
+            await _add_season(pg_session, works[0], season=season)
+
+        backend = PgTrgmSearchBackend()
+        query = SearchQuery(keyword="误杀2", limit=100)
+        rows = await backend.search(pg_session, query)
+
+        assert [w.title for w in rows] == ["误杀2"]
+        assert await backend.count(pg_session, query) == 1
+
+    async def test_seasons_are_loaded_on_demand(self, pg_session) -> None:
+        """`with_seasons` 打开时季要随查询一起回来。
+
+        异步会话下懒加载抛 `MissingGreenlet`，所以不能让调用方拿到对象
+        之后再访问 `.seasons` —— 必须在构语句时就预加载。
+        """
+        works = await _seed(pg_session)
+        await _add_season(pg_session, works[0], season=1)
+        await _add_season(pg_session, works[0], season=2)
+        pg_session.expunge_all()
+
+        rows = await PgTrgmSearchBackend().search(
+            pg_session, SearchQuery(keyword="误杀2", with_seasons=True)
+        )
+        assert [s.season for s in rows[0].seasons] == [1, 2]
+
+
+@pytest.mark.asyncio
+class TestResourceFiltersCrossSeasons:
+    """`valid_only` / `provider` 要穿 `work → media → media_resource → resource`。
+
+    季级搜索时这两个子查询只走三张表，多穿一层是改造里最容易写错的地方：
+    漏掉 `Media.work_id == Work.id` 的关联条件，EXISTS 会退化成「库里存在
+    任意一条可用资源」—— 永远为真，筛选静默失效，而结果看着还挺正常。
+    """
+
+    async def test_valid_only_needs_a_valid_resource_on_some_season(self, pg_session) -> None:
+        works = await _seed(pg_session)
+        await _add_season(pg_session, works[0], season=1, check_status=CheckStatus.INVALID)
+        await _add_season(pg_session, works[2], season=1, check_status=CheckStatus.VALID)
+
+        backend = PgTrgmSearchBackend()
+        query = SearchQuery(keyword="误杀", valid_only=True, limit=100)
+        rows = await backend.search(pg_session, query)
+
+        assert [w.title for w in rows] == ["误杀瞒天记"]
+        assert await backend.count(pg_session, query) == 1
+
+    async def test_provider_filter_crosses_the_season_hop(self, pg_session) -> None:
+        works = await _seed(pg_session)
+        await _add_season(pg_session, works[0], season=1, provider=Provider.QUARK)
+        await _add_season(pg_session, works[2], season=1, provider=Provider.ALIYUN)
+
+        backend = PgTrgmSearchBackend()
+        query = SearchQuery(keyword="误杀", provider=Provider.ALIYUN, limit=100)
+        rows = await backend.search(pg_session, query)
+
+        assert [w.title for w in rows] == ["误杀瞒天记"]
+        assert await backend.count(pg_session, query) == 1
+
+    async def test_work_without_seasons_is_filtered_out(self, pg_session) -> None:
+        """没有季（也就没有资源）的作品不该通过资源筛选。
+
+        `canon` 流水线会留下一批空壳 Work（季被并走或被判垃圾删掉，
+        作品本身刻意保留做审计，见 `canon/apply.py`）。它们不该出现在
+        带资源筛选的搜索结果里。
+        """
+        await _seed(pg_session)
+        backend = PgTrgmSearchBackend()
+        assert await backend.count(pg_session, SearchQuery(keyword="误杀", valid_only=True)) == 0
+
+
+@pytest.mark.asyncio
+class TestNonVideoIsHiddenByDefault:
+    """小说/漫画默认不进搜索结果，显式传 `media_type` 才看得到。"""
+
+    async def test_book_is_excluded_unless_asked_for(self, pg_session) -> None:
+        pg_session.add_all(
+            [
+                Work(
+                    title="大主宰",
+                    norm_key="大主宰",
+                    media_type=MediaType.ANIME,
+                    year=2023,
+                    aliases=[],
+                ),
+                Work(
+                    title="大主宰（小说）",
+                    norm_key="大主宰小说",
+                    media_type=MediaType.BOOK,
+                    year=0,
+                    aliases=[],
+                ),
+            ]
+        )
+        await pg_session.commit()
+
+        backend = PgTrgmSearchBackend()
+        default = await backend.search(pg_session, SearchQuery(keyword="大主宰", limit=100))
+        assert [w.title for w in default] == ["大主宰"]
+
+        books = await backend.search(
+            pg_session, SearchQuery(keyword="大主宰", media_type=MediaType.BOOK, limit=100)
+        )
+        assert [w.title for w in books] == ["大主宰（小说）"]
+
+    async def test_unknown_type_stays_visible(self, pg_session) -> None:
+        """`unknown` 是「还没判出类型」，不是「不是影视」。
+
+        生产库里 40 多万部作品是这个值，把它当非影视排掉等于把它们整体藏起来。
+        """
+        pg_session.add(
+            Work(
+                title="某部没判出类型的剧",
+                norm_key="某部没判出类型的剧",
+                media_type=MediaType.UNKNOWN,
+                year=0,
+                aliases=[],
+            )
+        )
+        await pg_session.commit()
+
+        rows = await PgTrgmSearchBackend().search(
+            pg_session, SearchQuery(keyword="没判出类型", limit=100)
+        )
+        assert [w.title for w in rows] == ["某部没判出类型的剧"]
+
 
 @pytest.mark.asyncio
 class TestIndexIsActuallyUsed:
@@ -158,11 +343,11 @@ class TestIndexIsActuallyUsed:
 
         backend = PgTrgmSearchBackend()
         query = SearchQuery(keyword="误杀2")
-        key, similarity = backend._similarity(query)
+        key, _similarity = backend._similarity(query)
 
         from sqlalchemy import select
 
-        stmt = select(Media.id).where(backend._keyword_clause(query, key))
+        stmt = select(Work.id).where(backend._keyword_clause(query, key))
         compiled = stmt.compile(
             dialect=pg_session.bind.dialect, compile_kwargs={"literal_binds": True}
         )
