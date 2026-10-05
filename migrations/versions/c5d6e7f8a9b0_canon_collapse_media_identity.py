@@ -63,9 +63,7 @@ NO_SEASON = 0
 def _guard_no_unassigned_media() -> None:
     """还有 media 没归属就别往下走。"""
     bind = op.get_bind()
-    pending = bind.execute(
-        sa.text("SELECT count(*) FROM media WHERE work_id IS NULL")
-    ).scalar_one()
+    pending = bind.execute(sa.text("SELECT count(*) FROM media WHERE work_id IS NULL")).scalar_one()
     if pending:
         raise RuntimeError(
             f"还有 {pending} 行 media 的 work_id 是空的，不能收口。\n"
