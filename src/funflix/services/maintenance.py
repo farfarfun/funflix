@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import cast
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import Table, bindparam, delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus, Provider
@@ -31,7 +32,15 @@ from funflix.services.verify.base import CheckOutcome
 from funflix.services.verify.runner import _next_check_at
 
 #: 重建时保留的表。采集源是**配置**，不是采集回来的数据。
-PRESERVED_TABLES = frozenset({"source", "alembic_version"})
+#:
+#: `user` 同理 —— 登录账号是身份配置，不是流水线产物。它原先在清空清单里，
+#: 而全量重建的生产库只有一个账号：清掉之后运维区就登不进去了，密码哈希是
+#: 单向的，`db reset` 的报告里也救不回来，只能让人重新 `funflix user create`。
+#: `db reset --help` 写的是「采集源配置保留」，顺手清掉账号属于意料之外的破坏。
+PRESERVED_TABLES = frozenset({"source", "user", "alembic_version"})
+
+#: `relink_checks` 每次往返携带的行数。见那里关于 84 万次往返的说明。
+_RELINK_BATCH = 5_000
 
 
 def data_tables(keep_documents: bool = False, purge_checks: bool = False) -> list[str]:
@@ -174,28 +183,115 @@ async def relink_checks(session: AsyncSession) -> RelinkReport:
     `check_attempts` 不做精确复原（新 resource 保持默认值 0）——精确复原要扫完整
     历史计数，多余；副作用最多是极少数刚确认失效两次的链接会多等一轮 TTL 才停止
     复查，不影响正确性。
+
+    ## 为什么是攒批 executemany，而不是逐行查改
+
+    这个函数原来对每条历史记录发一次 `session.scalar` 去找对应 resource。
+    生产库有 848,416 个去重链接 —— 那就是 84 万次网络往返，全量重建卡在这一步
+    要跑到天荒地老。现在改成：一条流式查询读出每个链接的最新结论，按
+    `_RELINK_BATCH` 攒批，用带 `bindparam` 的 `UPDATE` 走 executemany，
+    往返降到 170 次左右。
+
+    `check_attempts` 恒为 0 这件事顺手把 `_next_check_at` 简化掉了：它只读
+    `check_attempts` 和 `status`，而这里只碰 `UNCHECKED` 的行 —— 一条 resource
+    只要被真实校验过，status 就不再是 `UNCHECKED`（`RATE_LIMITED` / `ERROR`
+    也都是落库的状态值）。所以 attempts 必然还是默认的 0，`_next_check_at`
+    退化成「只看 status」的纯函数，每种状态预算一次即可，不必逐行调。
     """
-    latest_check_ids = select(func.max(LinkCheck.id)).group_by(
-        LinkCheck.provider, LinkCheck.share_id
-    )
-    hydrated = 0
-    for check in await session.scalars(select(LinkCheck).where(LinkCheck.id.in_(latest_check_ids))):
-        resource = await session.scalar(
-            select(Resource).where(
-                Resource.provider == check.provider, Resource.share_id == check.share_id
-            )
+    # 预算每种状态的下次复查时间。`now` 在整个过程里会漂移几分钟，
+    # 而 TTL 以天计，无关紧要。
+    next_check_by_status = {
+        status: _next_check_at(Resource(check_attempts=0), CheckOutcome(status=status))
+        for status in CheckStatus
+    }
+
+    # **必须打到 Core 表上，不能用 ORM 实体。** `session.execute(update(Resource), [...])`
+    # 会被 ORM 解释成「按主键批量更新」，于是要求每个字典都带 `resource.id` ——
+    # 而我们正是因为不知道 id 才按 (provider, share_id) 去找。走 `__table__`
+    # 就是一条普通的带 WHERE 的 UPDATE + executemany。
+    #
+    # 代价是身份映射不会同步：会话里已加载的 Resource 对象读到的还是旧值。
+    # 这个函数跑在刚 `db reset` 完的库上，本来就没有这种对象；
+    # 调用方（含单测）要看改后的值得自己 `session.refresh()`。
+    #
+    # bindparam 的名字刻意不叫 `status` / `provider` —— 和列名重名会跟
+    # SET 子句自动生成的参数撞上。
+    # `__table__` 的静态类型是宽泛的 `FromClause`，而 `update()` 要 `TableClause`；
+    # 运行时它就是 `Table`，cast 只是把类型说准。
+    table = cast(Table, Resource.__table__)
+    stmt = (
+        update(table)
+        .where(
+            table.c.provider == bindparam("p"),
+            table.c.share_id == bindparam("s"),
+            # 已经被真实校验过、或上一轮已恢复过的行不覆盖。
+            table.c.check_status == CheckStatus.UNCHECKED,
         )
-        if resource is None or resource.check_status is not CheckStatus.UNCHECKED:
-            # 没有对应的新 resource，或者已经不是刚重建出来的默认状态
-            # （已被真实校验过或已恢复），不覆盖。
-            continue
-        resource.check_status = check.status
-        resource.last_checked_at = check.checked_at
-        resource.next_check_at = _next_check_at(resource, CheckOutcome(status=check.status))
-        hydrated += 1
+        .values(
+            check_status=bindparam("st"),
+            last_checked_at=bindparam("lc"),
+            next_check_at=bindparam("nc"),
+        )
+    )
+
+    unchecked_before = await _unchecked_count(session)
+
+    # 「最新一条」按 `checked_at` 排，**不能用 `max(id)`**。id 是 uuid7，
+    # 毫秒级单调 —— 同一毫秒内落库的两条校验，它们 id 的大小由随机位决定，
+    # 于是 `max(id)` 会随机挑一条。一条链接从 valid 变成 invalid、两条记录又
+    # 恰好同毫秒时，这个函数就会把早已失效的链接恢复成 valid。
+    # id 留作同一时刻的稳定 tie-break。
+    #
+    # 窗口函数而不是 `DISTINCT ON`：后者只有 PG 有，单测跑在 SQLite 上。
+    ranked = select(
+        LinkCheck.provider,
+        LinkCheck.share_id,
+        LinkCheck.status,
+        LinkCheck.checked_at,
+        func.row_number()
+        .over(
+            partition_by=(LinkCheck.provider, LinkCheck.share_id),
+            order_by=(LinkCheck.checked_at.desc(), LinkCheck.id.desc()),
+        )
+        .label("rn"),
+    ).subquery()
+    # 只取需要的四列：848k 行不值得实例化成 ORM 对象。
+    latest = select(
+        ranked.c.provider, ranked.c.share_id, ranked.c.status, ranked.c.checked_at
+    ).where(ranked.c.rn == 1)
+    rows = await session.stream(latest)
+
+    batch: list[dict[str, object]] = []
+    async for provider, share_id, status, checked_at in rows:
+        batch.append(
+            {
+                "p": provider,
+                "s": share_id,
+                "st": status,
+                "lc": checked_at,
+                "nc": next_check_by_status[status],
+            }
+        )
+        if len(batch) >= _RELINK_BATCH:
+            await session.execute(stmt, batch)
+            batch.clear()
+    if batch:
+        await session.execute(stmt, batch)
 
     await session.commit()
-    return RelinkReport(hydrated=hydrated)
+    # 逐行数不出来（executemany 的 rowcount 不可靠），用前后差值 —— 这是精确的，
+    # 因为本函数是把 resource 从 `UNCHECKED` 改走的唯一来源。
+    return RelinkReport(hydrated=unchecked_before - await _unchecked_count(session))
+
+
+async def _unchecked_count(session: AsyncSession) -> int:
+    return (
+        await session.scalar(
+            select(func.count())
+            .select_from(Resource)
+            .where(Resource.check_status == CheckStatus.UNCHECKED)
+        )
+    ) or 0
 
 
 @dataclass(slots=True)

@@ -38,30 +38,48 @@
 - `tests/test_setup_script.py`：把 `scripts/setup.sh` 复制到临时目录、用只含必需命令的
   干净 PATH 驱动，覆盖 `bash -n`、用法、prod/dev 入口缺失、启动即退出、重复启动被拒、
   `status` 返回非 0、陈旧 PID 文件清理。
-- `scripts/canon-rollout.sh`：canon 归一上线的一次性编排（见 `docs/DESIGN.md` §7.5），
-  九个阶段固定顺序 `backup guard rehearse purge rebuild resolve merge finalize reopen`，
-  每阶段完成写 `.run/canon-rollout/<stage>.done`，可 `--from <stage>` 续跑。
-  要点：
-  - `guard` 先停 `collect.yml` + `pipeline-watchdog.yml` 并记下原状态，`reopen` 只恢复
-    原本是 active 的那些。采集与归一同时跑会边删边写，`rebuild` 刚建好的 Work 立刻
-    又被新行绕开。
-  - `backup` 用 `COPY ... WITH (FORMAT binary)` 走 psql 而不是 `pg_dump` —— 本机
-    pg_dump 16 对 PG 18.4 直接 `aborting because of server version mismatch`。校验查
-    `PGCOPY` 文件头**和尾部的 `ffff` 结束标记**：`gzip -t` 对「一个完整的 gz 里只装了
-    半张表」是通不出错的，少了结束标记才看得出截断。
-  - `resolve` 是唯一花钱的阶段，先 `--limit 3` 探一次、打印新落的 `title_canon` 行，
-    人工确认后才放开全量；`rehearse` 之后还有一道人工闸。非 TTY 下没有 `--yes` 就拒绝继续。
-  - 每个阶段前后打一组 16 项不变量快照。注意两项「计数不一致」的基线不是 0 而是
-    64 / 80（迁移 A 时期建的那 80 个 Work 计数列从没刷过），当成「只看趋势」读，
-    别拿它当通过条件。
-- `tests/test_canon_rollout_script.py`：psql / python / funflix 全用假桩，不碰库、
-  不花 token。测的是四条安全属性而不是功能 —— `check` 传给 funflix 的参数里不出现
-  `--apply`；非 TTY 下没有 `--yes` 时闸门必须拒绝**且不留阶段断点**（留了的话重跑会
-  把没人核对过的阶段当成已完成，那道人工核对就永远不发生）；已完成的阶段会被跳过；
-  `--from` 跟了不存在的阶段名要在连库之前就报掉。
+- **持续修复机制 `services/repair/` + `funflix repair` 三条子命令**（见
+  `docs/DESIGN.md` §7.5）。解析规则永远加不完，每加一条就留下一批「按旧规则算
+  出来、现在看是错的」数据，所以这不是一次性迁移脚本，而是可以反复跑的三条命令：
+  `scan`（只读 media + 只写 `repair_task`，规则没变就零写入）、`apply`（破坏性、
+  不可逆、带限额和爆炸半径闸门）、`requeue`（把规则版本过期的文档打回 parse 队列）。
+  三条都默认 dry-run，`--apply` 才写库。要点：
+  - 检测和应用**必须能分开调度**：误并不可逆（关联迁走、败者行删掉，没有信息
+    能分回去），而检测只读且便宜。`scan` 把结论落成 `repair_task` 行，它同时是
+    审计记录。`UNIQUE (kind, media_id) WHERE status = 'pending'` 这条部分唯一索引
+    是幂等的支点 —— 每轮都会重新发现同一批行，没有它任务表会无限膨胀。索引挡不住
+    **跨 kind** 的并存，所以诊断结论变了的旧任务要显式撤掉。
+  - 目标值**复用 `canon/lookup.py::resolve_target`**，不另写规则。修复的终点必须和
+    parse 现在会产出的结果一字不差，否则 repair 改成 A、parse 改回 B，无限循环。
+  - 类型和年份**只补不改**（书刊是唯一例外）。反过来写的话，一轮 scan 就能把全库
+    的 `media_type` 刷成 unknown —— 绝大多数行的类型来自正文 `类型:电影`，而只看
+    标题会得到 `UNKNOWN`。
+  - 判据取**库里存着的** `media.title`，不是再洗一遍的结果：`clean_title` 会把
+    `作者:奏光 txt` 整段剥掉，洗完书刊信号就不存在了；`(2019)` 洗完年份也没了。
+  - 爆炸半径闸门按 **media 总行数**算（不是队列长度 —— 拿队列当分母的话攒得越多
+    越容易通过，正好反了）：删除 > 5% 或重挂 > 20% 就拒绝，要 `--force`。
+    dry-run 时也检查，因为 dry-run 的作用就是让人提前看到这个拦截。
+  - `collect.yml` 新增第四个 job `repair`，和 collect / parse / verify **完全并列、
+    不设 `needs`**，刻意不传 `--force`，靠 `--limit` 慢慢刷。
+- `repair_task` 表 + `raw_document.parse_rules_version` 列（迁移 `d6e7f8a9b0c1`）。
+  版本戳是深层重解析的廉价预筛 —— 213 万份文档不可能每次改规则都全量重跑。
+  `PARSE_RULES_VERSION` 手工 bump，**刻意不用源码哈希**：改个注释不该让 213 万份
+  文档重排队。
 
 ### 变更
 
+- **删掉 `scripts/canon-rollout.sh`（587 行）和 `tests/test_canon_rollout_script.py`。**
+  它整套设计（COPY binary 备份、停 Action、九个人工闸门、迁移 B 收口）是为「原地改
+  89 万行历史数据」服务的，而历史数据不需要保留 —— 只有采集（`raw_document`）和
+  验证（`link_check`）的成果要留，其余都可以重建。而且实查发现它要原地迁移的历史
+  Work 数据**根本不存在**：生产库 89 万行 media 里只有 80 行 `work_id` 非空，
+  `title_canon` 80 行全是 pending。全量重建是唯一能产出可用 work 层的路径，也比
+  原地改干净 —— 没有「迁移没覆盖到」的残留。持续修复的常态化手段改由
+  `funflix repair` 承担。
+- `services/maintenance.py::relink_checks()` 从逐行 `session.scalar` 改成攒批
+  executemany：生产库有 848,416 个去重链接，原先就是 84 万次网络往返，全量重建
+  卡在这一步要跑到天荒地老。现在一条流式查询读出每个链接的最新结论，按 5,000
+  行一批走带 `bindparam` 的 UPDATE，往返降到 170 次左右。
 - **搜索的主体从 `Media` 改成 `Work`**（`services/search.py`）：两个后端都返回
   `list[Work]`，`search_media`/`count_media` 改名为 `search_works`/`count_works`。
   资源筛选（`valid_only` / `provider`）因此要多穿一层，走完
@@ -93,6 +111,55 @@
 
 ### 修复
 
+- **`title_canon` 的键空间错配**（`services/extract/runner.py`）。parse 时的防回退
+  查询用的是 `item.norm_key`（逐标题身份），而 `canon/resolver.py` 落裁决行用的是
+  `series_norm_key`（系列身份），`canon/apply.py` 回头也按 `series_norm_key` 匹配。
+  两个键空间对不上，于是花钱得出的裁决在新数据入库时经常被静默绕过 —— 正是这一层
+  要防的事。统一到 `series_norm_key`。
+  顺带修掉同一条路径上的一个撞主键：`resolve_target` 碰到「decided 但
+  `work_norm_key` 为空」的坏裁决时会回落到 `_fallback`，而 `_fallback` 无条件把
+  `needs_pending_row` 置真 —— 那个键在库里已经有行了，再插一行就撞主键、把整个
+  SAVEPOINT 带崩。现在插 pending 行要同时满足 `canon is None`。
+- **`_SCRAPE_CUT_RE` 补齐书刊字段名** `作者|译者|主播|演播|播音|出版社|字数|连载状态`
+  （沿用「必须带冒号」的约束）。`全民攻防:我有签到系统 作者:奏光 txt` 这种小说分享
+  在库里有 4,399 行，作者名整条粘在片名里。同时新增 `_BOOK_SIGNAL_RE` 把这个信号
+  判成 `MediaType.BOOK`，并让它排在影视关键词**之前** —— 小说正文常顺带写「改编
+  动画」「同名电视剧」，先跑影视词表会把 `作者:墨之所想 txt` 判成 anime。
+  三个负向回顾（`原著作者:` / `词曲作者:` / `编曲作者:`）把「这是书」和「这改编自
+  书 / 这是首歌」分开；刻意不收光杆 `txt`，因为 `_SHEET_MARKER_RE` 正把它当表格
+  列名残渣剥，两边会打架。
+  另外查清了 926 行「导演」残留的成因：670 行无冒号（`威力导演`、`今敏导演`、
+  `导演评论`，冒号约束正好挡住）、19 行落在开头两字内（`:导演你有病` 是真片名，
+  `match.start() < 2` 那道闸挡住）、237 行带冒号且全是本规则加上去之前解析的陈旧
+  数据 —— 后者是 `funflix repair` 的活，不是词表的问题。
+- `services/maintenance.py::relink_checks()` 判「最新一条校验」原先用
+  `max(LinkCheck.id)`。id 是 uuid7，只到毫秒级单调 —— 同一毫秒内落库的两条校验，
+  id 的大小由随机位决定，于是 `max(id)` 会随机挑一条。一条链接从 valid 变成
+  invalid、两条记录又恰好同毫秒时，这个函数会把早已失效的链接恢复成 valid。
+  改成按 `checked_at DESC, id DESC` 的 `ROW_NUMBER()` 窗口函数（PG 和 SQLite
+  都支持；`DISTINCT ON` 只有 PG 有，单测跑在 SQLite 上）。
+- **`db reset` 不再清掉登录账号。** `PRESERVED_TABLES` 原先只有
+  `{source, alembic_version}`，`user` 落在清空清单里。生产库只有一个账号，
+  而密码哈希是单向的 —— 清掉就只能重新 `funflix user create`，运维区当场锁死。
+  登录账号和采集源同属**配置**，不是流水线产物；`db reset --help` 也只承诺
+  「采集源配置保留」，顺手清账号属于意料之外的破坏。
+- **迁移 `d6e7f8a9b0c1` 挪到收口迁移 `c5d6e7f8a9b0` 之前**，链变成
+  `b1c2d3e4f5a6 → d6e7f8a9b0c1 → c5d6e7f8a9b0`。两条原先的顺序会死锁：
+  `reset_pipeline_data` 的清表清单从 ORM 元数据推导、现在含 `repair_task`，
+  PG 分支又是单条 `TRUNCATE ... CASCADE`，表不存在就整条失败 —— 于是 reset
+  要求 `d6e7f8a9b0c1` 先上；而 `c5d6e7f8a9b0` 的 `work_id` 非空守卫要求先
+  reset 清空 media。`d6e7f8a9b0c1` 纯加法、`repair_task` 刻意不建 media 外键，
+  对收口迁移零依赖，挪到前面即可解环。两条迁移在任何环境都没应用过
+  （生产库停在 `b1c2d3e4f5a6`），换序没有已部署的库受影响。
+- **`httpx` 收紧到 `>=0.27,<1`，锁文件重新解析。** `uv.lock` 的
+  `[options] prerelease-mode = "allow"` 让开区间的 `httpx>=0.27` 解析到了
+  `1.0.dev6`，而那个开发版已经不再导出 `AsyncClient`。后果不止于测试：
+  `services/collect/tencent_text.py` 和 `collect/concurrent_runner.py` 真的会调
+  `httpx.AsyncClient(...)`，而 CI 的 collect job 用的是同一份锁文件。
+  测试侧的表现是 respx 拦不住请求、整套 pytest 挂在真实网络上超时（本次两次
+  600 秒被杀都是这个原因）。重新 `uv lock` 后 `prerelease-mode` 回到默认的
+  `if-necessary-or-explicit`，httpx 落到 0.28.1，锁文件只动了 httpx 和 httpcore
+  两项。
 - `scripts/setup.sh`（SPEC §6.1）：
   - `start`/`run` 在拉起进程前校验环境入口——prod 用 `command -v funflix` 确认正式包
     已安装，缺失立即非 0 退出；dev 对应校验 `uv`。此前 prod 直接执行 `funflix worker`，

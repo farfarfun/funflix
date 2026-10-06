@@ -1,7 +1,7 @@
 """归一迁移 B：media 身份收口为 (work_id, season)
 
 Revision ID: c5d6e7f8a9b0
-Revises: b1c2d3e4f5a6
+Revises: d6e7f8a9b0c1
 Create Date: 2026-10-05
 
 迁移 A 是纯加法，这一条才是**收口**：
@@ -18,14 +18,20 @@ Create Date: 2026-10-05
 直接报错退出，而不是让 PG 在扫到第一行时抛一条看不懂的
 `column "work_id" contains null values`。
 
-正确顺序：
+实际采用的顺序是**全量重建**，而不是原地迁移历史数据 —— 生产库里
+`media.work_id` 非空的只有 80 行（894,162 行里），`title_canon` 80 行全是
+pending，work 层等于不存在，没有「历史数据」值得原地搬：
 
-    funflix db upgrade --revision b1c2d3e4f5a6   # 迁移 A
-    funflix canon purge   --apply
-    funflix canon rebuild --apply
-    funflix canon resolve --apply                # 可选，要花钱
+    funflix db upgrade d6e7f8a9b0c1    # 纯加法，不碰 media
+    funflix db reset --keep-documents  # 清空 media，留 raw_document/link_check/source
+    funflix db upgrade head            # 这一条。守卫看到 0 行 media 才放行
+    funflix parse --limit 20000        # 重解析，天生带 work_id
+    funflix db relink-checks           # 把 84 万条链接的校验结论接回来
+    funflix canon resolve --apply      # 要花钱
     funflix canon merge   --apply
-    funflix db upgrade                           # 这一条
+
+原地迁移的路线（`canon purge` → `rebuild` → `merge` 之后再上这一条）在结构上
+仍然成立，守卫就是为它准备的；只是本项目没走。
 
 ## 为什么两个约束不能并存，也不能分两次迁移
 
@@ -51,7 +57,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c5d6e7f8a9b0"
-down_revision: str | None = "b1c2d3e4f5a6"
+down_revision: str | None = "d6e7f8a9b0c1"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

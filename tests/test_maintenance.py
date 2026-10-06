@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import itertools
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
@@ -26,6 +27,7 @@ from funflix.models import (
     media_tag,
     utcnow,
 )
+from funflix.services import maintenance
 from funflix.services.maintenance import (
     cleanup_resources,
     data_tables,
@@ -102,6 +104,17 @@ class TestDataTables:
         for expected in ["media", "resource", "raw_document", "tag", "media_tag", "media_resource"]:
             assert expected in tables, f"{expected} 不在清空清单里"
         assert "source" not in tables, "采集源是配置，不该被清空"
+        assert "user" not in tables, "登录账号是身份配置，不该被清空"
+
+    def test_login_accounts_survive_a_rebuild(self) -> None:
+        """账号在任何参数组合下都不能被清掉。
+
+        密码哈希是单向的 —— 清了就只能重新 `funflix user create`，而生产库
+        只有一个账号，清掉等于把运维区锁死。`purge_checks=True` 是「连最贵的
+        校验历史都一起清」的最狠档位，账号在这一档也要留住。
+        """
+        for kwargs in ({}, {"keep_documents": True}, {"purge_checks": True}):
+            assert "user" not in data_tables(**kwargs), f"user 不该出现在 {kwargs} 的清单里"
 
     def test_children_come_before_parents(self) -> None:
         """按外键依赖倒序，先删子表，否则 SQLite 开了外键约束会报错。"""
@@ -543,3 +556,56 @@ class TestRelinkChecks:
         assert report.hydrated == 0
         await session.refresh(already_checked)
         assert already_checked.check_status is CheckStatus.VALID
+
+    async def test_latest_history_wins(self, session) -> None:
+        """一个链接有多条历史时只认最新那条，否则会把早已失效的链接恢复成有效。"""
+        base = utcnow()
+        for offset, status in ((0, CheckStatus.VALID), (1, CheckStatus.INVALID)):
+            session.add(
+                LinkCheck(
+                    provider=Provider.QUARK,
+                    share_id="s000004",
+                    url="https://pan.quark.cn/s/s000004",
+                    checked_at=base + timedelta(hours=offset),
+                    status=status,
+                )
+            )
+            await session.flush()  # 逐条 flush 才能保证 id 单调递增
+        rebuilt = _resource(4)
+        session.add(rebuilt)
+        await session.commit()
+
+        report = await relink_checks(session)
+
+        assert report.hydrated == 1
+        await session.refresh(rebuilt)
+        assert rebuilt.check_status is CheckStatus.INVALID
+
+    async def test_restores_every_link_across_batch_boundaries(self, session, monkeypatch) -> None:
+        """攒批 executemany 的边界：末尾那个不满一批的残批不能被漏掉。
+
+        84 万次往返改成攒批之后，「最后一批没发出去」是这段代码最容易出的
+        静默错误 —— 它不报错，只是有一部分链接的校验结论没恢复，
+        于是全量重建之后那些资源会被重新探测一遍。
+        """
+        monkeypatch.setattr(maintenance, "_RELINK_BATCH", 2)
+        for n in range(10, 15):  # 5 条 = 两个满批 + 一个残批
+            session.add(
+                LinkCheck(
+                    provider=Provider.QUARK,
+                    share_id=f"s{n:06d}",
+                    url=f"https://pan.quark.cn/s/s{n:06d}",
+                    checked_at=utcnow(),
+                    status=CheckStatus.VALID,
+                )
+            )
+            session.add(_resource(n))
+        await session.commit()
+
+        report = await relink_checks(session)
+
+        assert report.hydrated == 5
+        remaining = await session.scalars(
+            select(Resource).where(Resource.check_status == CheckStatus.UNCHECKED)
+        )
+        assert list(remaining) == []
