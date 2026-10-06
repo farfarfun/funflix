@@ -11,6 +11,12 @@ from funflix.models.check import LinkCheck
 from funflix.models.extraction import Extraction
 from funflix.models.media import NO_SEASON, UNKNOWN_YEAR, Media
 from funflix.models.raw import RawDocument
+from funflix.models.repair import (
+    RepairKind,
+    RepairState,
+    RepairSymptom,
+    RepairTask,
+)
 from funflix.models.resource import Resource
 from funflix.models.source import Source
 from funflix.models.tag import Tag, TagKind, media_tag
@@ -27,6 +33,10 @@ __all__ = [
     "LinkCheck",
     "Media",
     "RawDocument",
+    "RepairKind",
+    "RepairState",
+    "RepairSymptom",
+    "RepairTask",
     "Resource",
     "Source",
     "Tag",

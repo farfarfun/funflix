@@ -14,9 +14,10 @@ permissions:
   contents: read
 
 jobs:
-  # collect/parse/verify 各消费自己的队列（采集水位 / 待解析文档 / 待校验资源），
-  # 互不依赖对方产出的结果才能跑，所以拆成三个独立 job 并行执行，而不是
-  # 一个 job 里顺序跑三步——一步卡住不该拖着后面两步一起等。
+  # collect/parse/verify/repair 各消费自己的队列（采集水位 / 待解析文档 /
+  # 待校验资源 / 待修复 media），互不依赖对方产出的结果才能跑，所以拆成四个
+  # 独立 job 并行执行，而不是一个 job 里顺序跑四步——一步卡住不该拖着后面
+  # 几步一起等。
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -106,3 +107,52 @@ jobs:
 
       - name: Verify
         run: uv run funflix verify --limit 10000
+
+  # 解析规则永远加不完，每加一条就留下一批「按旧规则算出来、现在看是错的」
+  # media。这个 job 就是把那批数据慢慢刷对，所以它和上面三个完全并列、
+  # 不设 needs：它消费的是自己的 repair_task 队列。
+  #
+  # 和 parse 重叠的后果是自愈的——parse 若重新插回一行 repair 刚删的垃圾
+  # media，下一轮 scan 会再把它检出来。为此把两个 job 串进同一个队列
+  # （互相堵、push 时排队）代价大于收益。
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: pipeline-repair
+      cancel-in-progress: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install
+        run: uv sync
+
+      - name: Load secrets
+        env:
+          FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
+        run: |
+          url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
+          uv run funsecret load "$url"
+
+      # 只读 media + 只写 repair_task。规则没变时零写入，所以每轮都跑没有成本。
+      - name: Scan
+        run: uv run funflix repair scan --apply
+
+      # 破坏性的一半。**刻意不传 --force**：爆炸半径闸门（删除 > 全库 5% 或
+      # 重挂 > 20% 就拒绝）在无人值守的自动流水线上是最后一道防线，一次规则
+      # 写错不该被自动放行。真超限了这一步会红，人去核对 scan 的样例再决定。
+      - name: Apply
+        run: uv run funflix repair apply --apply --yes --limit 5000
+
+      # 深层修复：把规则版本过期的文档打回 parse 队列，由 parse job 按它自己
+      # 的节奏消化。这一步和上面那步互不依赖，所以 apply 被闸门拦住时它照样
+      # 要跑完（job 整体仍然是红的，不会掩盖问题）。
+      - name: Requeue
+        if: ${{ !cancelled() }}
+        run: uv run funflix repair requeue --apply --yes --limit 50000

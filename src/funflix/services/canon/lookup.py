@@ -85,7 +85,9 @@ def resolve_target(
         title: 抽取器给出的清洗后标题。
         media_type: 抽取器判出的类型，可能是 `UNKNOWN`。
         year: 抽取器判出的年份，`None` 当作未知。
-        canon: 按 `item.norm_key` 查到的裁决行，查不到传 `None`。
+        canon: 按 `series_norm_key(title)` 查到的裁决行，查不到传 `None`。
+            键空间必须是 `series_norm_key` —— `title_canon.norm_key` 由
+            `canon/resolver.py` 按它写入，用逐标题的 `norm_key` 去查会查不中。
 
     类型和年份的取舍是「宁缺毋滥」：裁决里是 unknown / 0 的时候用这一项
     自己判出来的值补上，反过来**不**用这一项的值去覆盖裁决里已有的值 ——

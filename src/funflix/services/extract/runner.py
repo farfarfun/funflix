@@ -36,6 +36,7 @@ from funflix.models import (
 from funflix.models.base import uuid7
 from funflix.models.canon import TitleCanon
 from funflix.models.media import NO_SEASON, UNKNOWN_YEAR
+from funflix.models.raw import PARSE_RULES_VERSION
 from funflix.services.canon.lookup import CanonTarget, pending_row, resolve_target
 from funflix.services.counters import refresh_counters_for_media
 from funflix.services.extract.base import ExtractedItem, ExtractionOutcome, Extractor
@@ -99,9 +100,16 @@ class BatchCache:
     media_by_key: dict[tuple[uuid.UUID, int], Media] = field(default_factory=dict)
     #: Work.norm_key → Work
     work_by_key: dict[str, Work] = field(default_factory=dict)
-    #: ExtractedItem.norm_key → 裁决行。**值为 None 表示"查过，库里没有"** ——
-    #: 和"没查过"必须区分开，否则同一批里的同一个新键会被反复 SELECT，
+    #: `series_norm_key(item.title)` → 裁决行。**值为 None 表示"查过，库里没有"**
+    #: —— 和"没查过"必须区分开，否则同一批里的同一个新键会被反复 SELECT，
     #: 而且 `_upsert_media` 会给它插好几行 pending（撞主键）。
+    #:
+    #: 键空间是 `series_norm_key` 而**不是** `item.norm_key`。`title_canon.norm_key`
+    #: 这一列由 `canon/resolver.py` 写入，写的是 `series_norm_key`（见那里的
+    #: `_scan_blocks`），`canon/apply.py::_media_ids_for_keys` 回头也按
+    #: `series_norm_key(media.title)` 匹配。这里曾经用 `item.norm_key`（逐标题身份，
+    #: 不剥季、不剥外文原名、不收敛重复 token），于是防回退查询经常查不中
+    #: 已裁决的行 —— 花钱得出的结论入库时被静默绕过，正是这一层要防的事。
     canon_by_key: dict[str, TitleCanon | None] = field(default_factory=dict)
     resource_by_key: dict[tuple[str, str], Resource] = field(default_factory=dict)
     tag_by_key: dict[tuple[str, str], Tag] = field(default_factory=dict)
@@ -215,7 +223,7 @@ async def _preload_batch_cache(
 
     for outcome in outcomes:
         for item in outcome.items:
-            item_keys.add(item.norm_key)
+            item_keys.add(series_norm_key(item.title))
             item_titles.add(item.title)
             for kind, name in item.tags:
                 key = tag_norm_key(name)
@@ -226,6 +234,9 @@ async def _preload_batch_cache(
         for link in outcome.unattributed_links:
             provider_shares.add((link.provider, link.share_id))
 
+    # 标题被洗成空的那些项（纯噪声）算出空键，不值得去查 —— 它们在
+    # `_upsert_media` 里会因为 `work_norm_key` 为空被整项丢掉。
+    item_keys.discard("")
     if item_keys:
         rows = await session.scalars(select(TitleCanon).where(TitleCanon.norm_key.in_(item_keys)))
         for canon in rows:
@@ -357,20 +368,27 @@ async def _upsert_media(
     传了 `cache` 时优先查内存、未命中才落到 SELECT——批内新建的 work/media
     也会写回 cache，同批后续文档引用同一部作品不会再查一次库。
     """
-    canon = await _lookup_canon(session, item.norm_key, cache)
+    # 用 `series_norm_key` 而不是 `item.norm_key` —— 键空间的理由见 `BatchCache`。
+    canon_key = series_norm_key(item.title)
+    canon = await _lookup_canon(session, canon_key, cache)
     target = resolve_target(
         title=item.title, media_type=item.media_type, year=item.year, canon=canon
     )
     if target.is_junk:
         return None, False
 
-    if target.needs_pending_row:
+    if target.needs_pending_row and canon is None and canon_key:
         # 新键：写一行 pending 让 `canon resolve` 下次捞走。写回 cache 是为了
         # 同一批里的同一个键不会被插第二行（撞主键会把整个 SAVEPOINT 带崩）。
-        canon = pending_row(item.norm_key, target)
+        #
+        # `canon is None` 这个条件是必须的，不能只看 `needs_pending_row`：
+        # `resolve_target` 碰到一行 decided 但 `work_norm_key` 是空的坏裁决时会
+        # 回落到 `_fallback`，而 `_fallback` 无条件把 `needs_pending_row` 置真 ——
+        # 那个键在库里已经有行了，再插一行就是撞主键。
+        canon = pending_row(canon_key, target)
         session.add(canon)
         if cache is not None:
-            cache.canon_by_key[item.norm_key] = canon
+            cache.canon_by_key[canon_key] = canon
 
     if not target.work_norm_key:
         # 规则把标题洗成空了（纯噪声）。这种项在抽取器层本该已经被
@@ -775,6 +793,9 @@ async def parse_document(
         doc.lease_until = None
         doc.next_parse_at = None
         doc.last_parsed_at = now
+        # 盖上规则集版本戳。`repair requeue` 靠它找出按旧规则解析的文档，
+        # 见 `models/raw.py::PARSE_RULES_VERSION`。
+        doc.parse_rules_version = PARSE_RULES_VERSION
         report.status = doc.parse_status
 
     except IntegrityError:
@@ -943,6 +964,7 @@ async def _persist_chunk(
             doc.lease_until = None
             doc.next_parse_at = None
             doc.last_parsed_at = now
+            doc.parse_rules_version = PARSE_RULES_VERSION
             report.status = doc.parse_status
 
     except IntegrityError:

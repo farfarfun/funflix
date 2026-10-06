@@ -97,6 +97,32 @@ class TestRealCorpusRegressions:
         body = "名称：某剧\n描述：讲述一位动画师的故事\n全40集"
         assert guess_media_type(body, title="某剧 全40集") == MediaType.TV
 
+    def test_book_field_labels_are_cut(self) -> None:
+        """小说分享把作者名整条粘进片名，生产库里有 4,399 行。"""
+        assert clean_title("全民攻防:我有签到系统 作者:奏光 txt") == "全民攻防:我有签到系统"
+        assert clean_title("某书名 译者:李四 出版社:人民文学") == "某书名"
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "9夜王 导演版 蓝光原盘",  # 版本名
+            "MobLand 黑帮领地 盖里奇 导演",  # 署名后置
+            "PowerDirector 威力导演视频剪辑 v14 5 0",  # 软件名
+            "▎今敏导演",
+        ],
+    )
+    def test_field_label_without_colon_is_not_cut(self, title: str) -> None:
+        """冒号是 `_SCRAPE_CUT_RE` 唯一的精度来源。
+
+        生产库 926 行含「导演」的标题里有 670 行不带冒号，全都不该切 ——
+        少了这道约束，《导演万岁》《威力导演》会被洗成空串。
+        """
+        assert "导演" in clean_title(title)
+
+    def test_field_label_at_the_very_start_is_not_cut(self) -> None:
+        """`:导演你有病` 是真片名。靠 `strip_scrape_labels()` 的 start < 2 闸挡住。"""
+        assert clean_title(":导演你有病 導演你有病") == "导演你有病 導演你有病"
+
 
 class TestNormKey:
     def test_collapses_spacing_and_case(self) -> None:
@@ -199,3 +225,36 @@ class TestGuessMediaType:
     def test_unknown_when_no_signal(self) -> None:
         """猜不出就是猜不出，不臆断为电影。"""
         assert guess_media_type("测试资源 1080p") == MediaType.UNKNOWN
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "全民攻防:我有签到系统 作者:奏光 txt",
+            "大主宰 我荒古圣体当为天帝 作者:墨之所想 txt",
+            "某书 epub",
+            "某轻小说合集",
+        ],
+    )
+    def test_book_signals(self, text: str) -> None:
+        """非影视资源要认出来 —— 它们默认不进搜索结果（见 `MediaType` docstring）。"""
+        assert guess_media_type(text) == MediaType.BOOK
+
+    def test_book_signal_beats_video_keyword(self) -> None:
+        """小说正文常写「已改编动画」。先跑影视词表就会把一本书判成 anime。"""
+        assert guess_media_type("某书 作者:张三 已改编动画 番剧") == MediaType.BOOK
+
+    @pytest.mark.parametrize(
+        ("text", "media_type"),
+        [
+            # 「作者」不带冒号 —— 是正文叙述，不是字段名
+            ("《狄金森》1 3季 小妇人作者来串场", MediaType.UNKNOWN),
+            # `词曲作者:` 是音乐署名，`原著作者:` 是影视的改编来源
+            (": 词曲作者 Songwriter 年纪录片", MediaType.DOCUMENTARY),
+            ("活着 原著作者:余华", MediaType.UNKNOWN),
+            # `text` 是表格列名残渣（`_SHEET_MARKER_RE` 负责剥），不是 txt 电子书
+            ("text 25 重获新生:母亲的逆袭", MediaType.UNKNOWN),
+        ],
+    )
+    def test_book_false_positives(self, text: str, media_type: MediaType) -> None:
+        """判成 book 等于从影视搜索里藏起来，所以宁可漏判不可误判。"""
+        assert guess_media_type(text) == media_type

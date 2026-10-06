@@ -35,8 +35,10 @@ source_app = typer.Typer(help="采集源管理与采集", no_args_is_help=True)
 sync_app = typer.Typer(help="本地库与远端库同步（自建 self-hosted runner）", no_args_is_help=True)
 user_app = typer.Typer(help="登录账号管理", no_args_is_help=True)
 canon_app = typer.Typer(help="搜索结果归一（Work 实体 + 季子层）", no_args_is_help=True)
+repair_app = typer.Typer(help="持续修复（规则更新后把旧数据刷对）", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(canon_app, name="canon")
+app.add_typer(repair_app, name="repair")
 app.add_typer(source_app, name="source")
 app.add_typer(sync_app, name="sync")
 app.add_typer(user_app, name="user")
@@ -595,7 +597,7 @@ _CanonApplyOption = Annotated[
 ]
 
 
-def _canon_samples(samples: list[str], heading: str) -> None:
+def _samples_block(samples: list[str], heading: str) -> None:
     if not samples:
         return
     _heading(heading)
@@ -640,7 +642,7 @@ def canon_purge(
         ],
         ["项", "数量"],
     )
-    _canon_samples(report.samples, "命中样例")
+    _samples_block(report.samples, "命中样例")
     if report.dry_run:
         _warn("dry-run：没有写库。确认报告无误后加 --apply 执行")
     else:
@@ -690,7 +692,7 @@ def canon_rebuild(
         ],
         ["项", "数量"],
     )
-    _canon_samples(report.samples, "最大的归一组")
+    _samples_block(report.samples, "最大的归一组")
     if report.dry_run:
         _warn("dry-run：没有写库。确认报告无误后加 --apply 执行")
     else:
@@ -754,7 +756,7 @@ def canon_resolve(
         ],
         ["项", "数量"],
     )
-    _canon_samples(report.samples, "待裁决的候选块（同块内的候选项）")
+    _samples_block(report.samples, "待裁决的候选块（同块内的候选项）")
     if report.dry_run:
         _warn("dry-run：一次调用都没发。确认要送的块无误后加 --apply 执行")
     else:
@@ -807,11 +809,226 @@ def canon_merge(
         ],
         ["项", "数量"],
     )
-    _canon_samples(report.samples, "将要应用的裁决")
+    _samples_block(report.samples, "将要应用的裁决")
     if report.dry_run:
         _warn("dry-run：没有写库。确认报告无误后加 --apply 执行")
     else:
         _ok("裁决应用完成")
+
+
+#: 修复命令和归一命令同一个口径：**默认 dry-run**。`scan` 虽然只写任务表、
+#: 不碰 media，但默认空跑能让「规则改完先看一眼检出量」成为顺手的习惯 ——
+#: 这一眼正是爆炸半径闸门之外的第二道人工防线。
+_RepairApplyOption = Annotated[
+    bool, typer.Option("--apply", help="真正写库。不传则只统计和抽样（dry-run）")
+]
+_RepairKeyOption = Annotated[
+    str | None,
+    typer.Option("--key", help="只处理这一个作品归一键（series_norm_key），用于单组演练"),
+]
+
+
+@repair_app.command("scan")
+def repair_scan(
+    apply: _RepairApplyOption = False,
+    key: _RepairKeyOption = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="最多扫多少行 media，用于分轮磨完全表")
+    ] = None,
+) -> None:
+    """按当前规则重扫 media，把需要修的行落成 `repair_task`。
+
+    **只读 + 只写任务表** —— 一个 media 字段都不碰，所以可以每轮跑。规则没变时
+    每一行都判为「不用修」，于是一个任务都不建、一个字都不写，这是它能挂在
+    流水线上的前提。
+
+    检出分三类：`retitle`（标题/类型/年份变了）、`rehome`（作品归属或季号变了，
+    目标被占时就是**多合一**）、`delete`（垃圾行和零资源空壳）。真正改库是
+    `repair apply` 的事 —— 分两步是故意的：检测便宜且可逆，应用不可逆。
+
+    `--limit` 限的是**扫多少行**，不是建多少任务。一轮扫不完下一轮从头再扫，
+    已有的 pending 任务靠部分唯一索引不会重复建。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.repair import scan_media
+
+    bar = tqdm(total=0, desc="扫描", unit="行", leave=False)
+
+    def _on_progress(scanned: int) -> None:
+        # 总数不预查：`select count(*)` 在 89 万行的表上要几秒，而这里只是
+        # 个进度提示。直接把已扫数当成总数往前推。
+        bar.total = max(scanned, bar.total or 0)
+        bar.n = scanned
+        bar.refresh()
+
+    async def _do():
+        async with session_scope() as session:
+            return await scan_media(
+                session, dry_run=not apply, key=key, limit=limit, on_progress=_on_progress
+            )
+
+    try:
+        report = _run(_do)
+    finally:
+        bar.close()
+
+    _table(
+        [
+            ["扫描 media", report.scanned],
+            ["需要修复", report.planned],
+            ["  改标题", report.retitle],
+            ["  改归属", report.rehome],
+            ["  删除", report.delete],
+            ["其中会多合一", report.expect_merge],
+            ["新建任务", report.created],
+            ["刷新任务", report.refreshed],
+            ["已有任务不变", report.unchanged],
+            ["撤销旧任务", report.cancelled],
+        ],
+        ["项", "数量"],
+    )
+    _samples_block(report.samples, "检出样例")
+    if report.dry_run:
+        _warn("dry-run：连任务表都没写。确认检出量和样例无误后加 --apply")
+    elif report.planned == 0:
+        _ok("全库都符合当前规则，没有需要修的行")
+    else:
+        _ok(f"检出 {report.planned} 行，接下来用 repair apply 应用")
+
+
+@repair_app.command("apply")
+def repair_apply(
+    apply: _RepairApplyOption = False,
+    key: _RepairKeyOption = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="每一类最多领多少个任务，节流阀")
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="跳过爆炸半径闸门（确认规则没写错再用）")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """把 `repair_task` 里的 pending 任务落到 media / work 上。
+
+    **不可逆。** 两部剧并成一部之后没有任何信息能把它们分回去。所以默认
+    dry-run，并且在动手前检查爆炸半径：删除任务超过 media 总量 5%、或重挂
+    超过 20% 就直接拒绝 —— 一次规则改动不该动到全库两成，真触发了更可能是
+    规则写错了。确认无误才用 `--force` 放行。
+
+    执行顺序是硬性的 `delete → retitle → rehome`：先把垃圾清掉，免得被并进
+    真作品；改标题不动身份，最安全；重挂放最后，由 `assign_identities` 一步
+    完成移动、撞车合并、换位腾挪。`resource` 行全程保留 —— 链接是真的，
+    只是归属错了。
+
+    `--limit` 是节流阀，一轮刷不完下一轮接着刷，pending 任务天然是断点。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.repair import BlastRadiusExceeded, apply_repairs
+
+    if apply and not yes and not typer.confirm("将**不可逆地**删改 media 并合并重复，继续？"):
+        raise typer.Abort()
+
+    bar = tqdm(total=0, desc="重挂", unit="行", leave=False)
+
+    def _on_progress(done: int) -> None:
+        bar.total = max(done, bar.total or 0)
+        bar.n = done
+        bar.refresh()
+
+    async def _do():
+        async with session_scope() as session:
+            return await apply_repairs(
+                session,
+                dry_run=not apply,
+                key=key,
+                limit=limit,
+                force=force,
+                on_progress=_on_progress,
+            )
+
+    try:
+        report = _run(_do)
+    except BlastRadiusExceeded as exc:
+        _fail(f"爆炸半径闸门拦住了：{exc}")
+    finally:
+        bar.close()
+
+    _table(
+        [
+            ["领取任务 删除", report.delete],
+            ["领取任务 改标题", report.retitle],
+            ["领取任务 改归属", report.rehome],
+            ["实际删除 media", report.deleted],
+            ["断开资源关联", report.links_detached],
+            ["实际改标题", report.retitled],
+            ["实际重挂", report.rehomed],
+            ["新建 Work", report.works_created],
+            ["复用 Work", report.works_existing],
+            ["多合一删除 media", report.merged],
+            ["迁移资源关联", report.links_moved],
+            ["丢弃重复关联", report.links_dropped],
+            ["换位腾挪", report.parked],
+            ["重算 Work 计数", report.works_recounted],
+            ["跳过（已无需修）", report.skipped],
+            ["失败", report.failed],
+        ],
+        ["项", "数量"],
+    )
+    _samples_block(report.samples, "将要应用的任务")
+    if report.dry_run:
+        _warn("dry-run：没有写库。确认报告无误后加 --apply 执行")
+    elif report.failed:
+        _warn(f"{report.failed} 个任务失败，错误记在 repair_task.error 上")
+    else:
+        _ok("修复应用完成")
+
+
+@repair_app.command("requeue")
+def repair_requeue(
+    apply: _RepairApplyOption = False,
+    limit: Annotated[int | None, typer.Option("--limit", help="这一轮最多打回多少份文档")] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """把解析规则版本过期的文档打回 parse 队列（深层修复）。
+
+    浅层修复只能从已清洗的 `media.title` 重算，所以修不了两类情况：旧规则
+    **洗坏**、信息已经丢了的行，以及抽取器**切分逻辑**本身变了的情况（一条
+    分享该拆成几个作品项变了，这在 media 层面看不出来）。这两类只能回到
+    `raw_document.content` 重解析。
+
+    靠 `raw_document.parse_rules_version` 做预筛 —— 213 万份文档不可能每次
+    改规则都全量重跑。改了抽取逻辑要手动 bump `PARSE_RULES_VERSION`
+    （刻意不用源码哈希：改个注释不该让 213 万份文档重排队）。
+
+    打回之后**什么都不用做** —— 现有 parse 节点本来就是个队列，会按它自己的
+    `--limit` 节奏消化。只收 `parse_status = done` 的文档：pending / failed
+    的本来就在队列里，碰它只会把退避时间清掉。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.repair import requeue_stale_documents
+
+    if apply and not yes and not typer.confirm("将把过期文档打回 pending 重新解析，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await requeue_stale_documents(session, dry_run=not apply, limit=limit)
+
+    report = _run(_do)
+    _table(
+        [
+            ["当前规则版本", report.version],
+            ["版本过期文档", report.stale],
+            ["本轮打回", report.requeued],
+        ],
+        ["项", "数量"],
+    )
+    if report.dry_run:
+        _warn("dry-run：没有写库。确认数量无误后加 --apply 执行")
+    elif report.stale > report.requeued:
+        _ok(f"打回 {report.requeued} 份，还剩 {report.stale - report.requeued} 份下轮继续")
+    else:
+        _ok("过期文档已全部打回队列，等 parse 消化")
 
 
 @db_app.command("info")

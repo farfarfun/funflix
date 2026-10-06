@@ -47,7 +47,15 @@ class TitleCanon(TimestampMixin, Base):
 
     __tablename__ = "title_canon"
 
-    #: 现有清洗器对某个原始标题产出的 `norm_key`。主键 —— 一个脏键只有一条裁决。
+    #: **系列身份键，即 `series_norm_key(title)`** —— 不是逐标题的 `norm_key`。
+    #: 主键，一个键只有一条裁决。
+    #:
+    #: 键空间这件事必须和三处写法完全一致，不然裁决会被静默绕过：
+    #: `canon/resolver.py` 按它写入，`extract/runner.py` 的防回退查询按它查，
+    #: `canon/apply.py::_media_ids_for_keys` 和 `services/repair/plan.py::plan_key`
+    #: 按它回头找 media。用逐标题的 `norm_key`（不剥季、不剥外文原名、不收敛重复
+    #: token）去查就查不中已裁决的行 —— 花钱得出的结论入库时被绕过，正是这张表
+    #: 要防的事。
     norm_key: Mapped[str] = mapped_column(sa.String(500), primary_key=True)
 
     #: 裁决出的规范作品。`is_junk=True` 时为空。

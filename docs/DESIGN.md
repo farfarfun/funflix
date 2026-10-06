@@ -534,33 +534,120 @@ resource` 走完四张表，用 EXISTS 而不是 JOIN（后者会因为一部作
 
 LLM token 消耗与各网盘失效率目前不在这个接口里。
 
-### 7.5 canon 归一的上线编排（`scripts/canon-rollout.sh`）
+### 7.5 持续修复（`services/repair/`）
 
-`funflix canon` 的四个子命令本身是独立可重跑的，但把它们应用到生产库是一次
-**有顺序、有闸门、要几个小时**的操作，所以单独有个编排脚本，而不是指望照文档
-手敲。阶段依次是 `backup guard rehearse purge rebuild resolve merge finalize reopen`。
+解析规则永远加不完 —— 每往 `normalize.py` 补一条词表或一个字段名，库里就多出
+一批「按旧规则算出来、现在看是错的」数据。所以这里**没有**一次性迁移脚本，
+只有三条可以反复跑的命令。这个取舍是整节的前提：一次性脚本意味着下次改规则
+还要再写一个。
 
-几个不显然的约束，都是脚本在替人记：
+| 命令 | 性质 | 模块 |
+| --- | --- | --- |
+| `repair scan` | 只读 media + 只写 `repair_task`。规则没变就零写入 | `scan.py` + `plan.py` |
+| `repair apply` | 破坏性、不可逆。带限额和爆炸半径闸门 | `apply.py` |
+| `repair requeue` | 把规则版本过期的文档打回 parse 队列 | `requeue.py` |
 
-- **顺序不能动**。`purge` 在 `rebuild` 前（垃圾行不清会凭空造出十几万个垃圾
-  Work）；`rebuild` 在 `resolve` 前（规则能搬掉大部分重复，LLM 只打残局）；
-  迁移 B 在 `merge` 后（它要把 `media.work_id` 设 NOT NULL）。
-- **不能和 `collect.yml` 同时跑**。那个 workflow 每两小时一次、push 到 master
-  也触发，它的 parse job 会往同一批表里并发 insert，正撞上 `(work_id, season)`
-  的合并。`guard` 阶段用 `gh` 停掉它并记下原状态，`reopen` 只把原本 active 的开回去。
-- **备份不能用 `pg_dump`**。生产是 PG 18，常见的开发机客户端是 16，`pg_dump`
-  对高版本服务器会直接 `aborting because of server version mismatch` 拒跑（`psql`
-  跨大版本查询反而没问题）。所以走 `COPY ... WITH (FORMAT binary)` + gzip，代价是
-  备份里**没有表结构**，恢复前目标表必须已存在。校验必须查 COPY 的 `ffff` 结束
-  标记 —— psql 中途失败时 gzip 照样产出一个合法 `.gz`，`gzip -t` 查不出里面是半张表。
-- **不变量分三类看**，别一律要求是 0：两个「孤儿关联」必须始终是 0（不是 0 就是
-  真损坏）；「work_id 为空」和「`(work_id,season)` 撞车」必须归零才能跑迁移 B；
-  两个「计数不一致」只看趋势（基线本身就不是 0 —— 迁移 A 时期建的 Work 计数列
-  从没刷过，canon 只对自己动过的行重算）。
+#### 检测和应用必须能分开调度
 
-`resolve` 是唯一花钱的阶段，脚本先用 `--limit 3` 打探针、把裁决打出来让人看过
-再放开全量。单组演练（默认 `--key 大主宰`）和探针之后各有一道人工闸门，
-非交互环境下不加 `--yes` 会直接拒绝放行。
+误并和误删不可逆：两部剧并成一部之后，`media_resource` 的关联已经迁走、败者的
+行已经删掉，没有任何信息能把它们分回去。而检测是只读的、便宜的。所以 `scan`
+不直接改库，而是把结论落成 `repair_task` 行，`apply` 再分批消化。
+
+`repair_task` 上那条 `UNIQUE (kind, media_id) WHERE status = 'pending'` 的**部分
+唯一索引**是幂等的支点：扫描每轮都会重新发现同一批问题行，没有它任务表会无限
+膨胀。索引是按 `(kind, media_id)` 建的，挡不住**跨 kind** 的并存 —— 一行先被判
+`retitle`、规则改完又该判 `delete` 的话，两个任务会同时在队列里，所以 `scan`
+还要显式撤掉诊断结论变了的旧任务。
+
+`repair_task` 同时是审计记录：哪行被改成什么、什么症状触发的、什么时候应用的。
+和 `title_canon` 之于 LLM 裁决是同一个定位。
+
+#### 目标值复用 `resolve_target`，不另写一套规则
+
+这是整个模块最重要的约束：修复的终点必须和 **parse 现在会产出的结果**一字不差。
+否则两条路会互相拆台 —— repair 把一行改成 A，下一条分享进来 parse 又把它改回 B，
+然后下一轮 scan 再检出一个任务，无限循环。
+
+#### 两个不显然的事实
+
+- **判据在库里存着的那个标题上，不是洗完的那个。** `clean_title` 会把
+  `作者:奏光 txt` 整段剥掉，在洗后的标题上判类型，书刊信号已经不存在了；
+  `流浪地球 (2019)` 洗完年份也没了。而 `media.original_title` 全库是空的，
+  `media.title` 就是我们手上最接近原文的东西。
+- **每一个键函数内部都会先跑 `clean_title`。** 所以
+  `series_norm_key('白月光向我自荐枕席 作者:烟叶')` 等于
+  `series_norm_key('白月光向我自荐枕席')` —— 按今天的规则算，作品键**不会**漂移。
+  生产库里的漂移全部来自 `work.norm_key` 是**当年**算完存下来的字符串。
+  结论：`作者` 这类脏标题多数是 `retitle`，`rehome` 是那些顶着旧键的行才有的。
+
+#### 类型和年份只补不改
+
+一行的 `media_type` 很可能是抽取器从正文 `类型:电影` 判出来的，而只看标题会得到
+`UNKNOWN`。拿标题的判定去覆盖，等于用更少的信息推翻更多的信息 —— **一轮 scan
+就能把全库的类型刷成未知**。所以是单向的：只在当前是 `UNKNOWN` 时补。唯一的
+例外是书刊，`作者:` / `epub` 是决定性信号，不会出现在影视分享里。
+
+#### 执行顺序是硬性的：delete → retitle → rehome
+
+1. **delete** 先跑。垃圾行和空壳先清掉，缩小后面 rehome 的候选集，也避免「把一行
+   垃圾并进正常作品」—— 一旦并进去，那条垃圾链接就永久挂在真作品下面了。走
+   `canon/purge.py::delete_media_rows`，**resource 行保留**（链接是真的，只是归属错了）。
+2. **retitle** 再跑。纯 UPDATE，不动身份，最安全。
+3. **rehome** 最后。get-or-create 目标 Work，然后交给
+   `canon/assign.py::assign_identities` —— 移动、撞车合并、换位停车三件事在同一步
+   里完成，**多合一就是它负责的那部分**，这里不重新实现。标题的修改通过
+   `extra_titles` 一并交给它，所以同一行不需要拆成两个任务、不会出现「改完标题
+   下一轮才搬家」的两轮收敛。
+
+收尾的 `_recount()` 顺序也是硬性的：先刷季级计数 → commit → 再刷 work 计数
+（`refresh_work_counters` 读的是 `media.resource_count`，反了会停在旧值上，
+不报错但悄悄对不上）。季级**只刷存活行** —— `refresh_media_counters` 会物理删除
+零资源的行，全刷会连带删掉这一轮压根没碰过的空壳。
+
+#### 爆炸半径闸门
+
+一次规则改动不该动到全库的两成。真触发了，更可能是规则写错了，而不是数据真的
+坏了那么多 —— 而「规则写错 + 自动应用」的组合在生产库上不可挽回。所以删除任务
+超过 media 总量 5%、或重挂超过 20% 就直接拒绝，要人显式 `--force`。
+
+阈值按 **media 总行数**算，不是按队列长度：队列是慢慢攒起来的，拿它自己当分母的
+话，攒得越多越容易通过，正好反了。闸门在 dry-run 时**也**检查 —— dry-run 的作用
+就是让人提前看到这个拦截。流水线上的 `repair` job 刻意不传 `--force`。
+
+#### 深层修复靠版本戳预筛
+
+浅层从已清洗的 `media.title` 重算，这可行是因为 `clean_title` 的每一步都是**减法**：
+对已经干净的标题是空操作，而新补进词表的噪声词照样能剥掉。代价是修不了两类
+情况：旧规则**洗坏**、信息已经丢了的行（`_SCRAPE_LABEL_RE` 曾把 `导演万岁` 剥成
+`万岁`，那个「导演」找不回来了），以及抽取器**切分逻辑**本身变了的情况（一条分享
+该拆成几个作品项变了，这在 media 层面根本看不出来）。
+
+这两类只能回到 `raw_document.content` 重解析。但生产库有 213 万份文档，每次改
+规则都全量重跑的话这个节点就只能偶尔手动跑一次 —— 和「规则一直在加」的现实正好
+相反。所以 `raw_document.parse_rules_version` 记下「这一行是用哪一版规则解析的」，
+`requeue` 只捞版本对不上的。`PARSE_RULES_VERSION` **手工 bump，刻意不用源码哈希**：
+改个注释不该让 213 万份文档重排队。
+
+打回 `pending` 之后**什么都不用做** —— 现有的 parse 节点本来就是个队列，会按它
+自己的 `--limit` 节奏消化。深层修复因此天然自限速，不需要新的执行器。只收
+`parse_status = done` 的文档：`pending` / `failed` 的本来就在队列里（或在退避里），
+碰它只会把 `parse_attempts` 和退避时间清掉。
+
+#### 流水线上的位置
+
+`repair` 是 `collect.yml` 的第四个 job，和 collect / parse / verify **完全并列、
+不设 `needs`**，各有自己的 `concurrency` 组。和 parse 重叠的后果是自愈的：parse
+若重新插回一行 repair 刚删的垃圾 media，下一轮 scan 会再把它检出来。为此把两个
+job 串进同一个队列（互相堵、push 时排队）代价大于收益。`--limit` 本身就是节流阀
+—— 一轮刷不完下一轮接着刷，`repair_task` 的 pending 行天然是断点。
+
+#### `funflix canon` 是同一套数据的 LLM 一侧
+
+`purge` / `rebuild` 靠规则收口，剩下的残局交给 `resolve`（写 `title_canon` 裁决）
+和 `merge`（应用裁决）。顺序不能动：`purge` 在 `rebuild` 前（垃圾行不清会凭空
+造出十几万个垃圾 Work），`rebuild` 在 `resolve` 前（规则能搬掉大部分重复，LLM
+只打残局）。`resolve` 是唯一花钱的阶段，建议先 `--limit 3` 打探针、把裁决打出来
+看过再放开全量。
 
 ---
 
@@ -572,8 +659,7 @@ funflix/
 ├── docs/           DESIGN.md  TODO.md  DEVELOPMENT.md
 ├── alembic.ini  migrations/versions/
 ├── scripts/
-│   ├── setup.sh                  # worker 生命周期（SPEC §6.1）
-│   └── canon-rollout.sh          # canon 归一的一次性上线编排（见下）
+│   └── setup.sh                  # worker 生命周期（SPEC §6.1）
 ├── src/funflix/
 │   ├── security.py               # 登录密码哈希
 │   ├── cli.py                    # typer 入口 + 交互式菜单
@@ -584,8 +670,9 @@ funflix/
 │   │   ├── backoff.py            # 三条流水线共用的指数退避
 │   │   ├── http.py               # 公共请求头
 │   │   └── commit_batcher.py     # 按条数/时间节流提交
-│   ├── models/                   # SQLAlchemy 2.0：raw/media/resource/check/
-│   │   └──                       # extraction/source/tag/user/association/base
+│   ├── models/                   # SQLAlchemy 2.0：raw/media/work/resource/check/
+│   │   └──                       # extraction/source/tag/user/canon/repair/
+│   │                             # association/base
 │   ├── schemas/                  # Pydantic I/O：common/media/raw/source/stats
 │   ├── services/
 │   │   ├── ingest.py             # 原始文本入库 + content_hash 去重
@@ -596,6 +683,9 @@ funflix/
 │   │   │                         # + runner / concurrent_runner / priority
 │   │   ├── extract/              # 抽取：rule / sheet / llm（client/extractor/
 │   │   │                         # prompts）+ registry + runner/concurrent_runner
+│   │   ├── canon/                # 归一：purge / rebuild / resolve / apply
+│   │   │                         # + assign（移动+合并+停车）/ lookup（§7.5）
+│   │   ├── repair/               # 持续修复：plan / scan / apply / requeue（§7.5）
 │   │   ├── text/                 # 纯函数层：linkscan / normalize / segment
 │   │   ├── verify/               # 探针：quark/uc/alipan/pan123/ctfile
 │   │   │                         # + base（AnonymousHttpProbe）+ registry

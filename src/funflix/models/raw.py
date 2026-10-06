@@ -12,6 +12,19 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from funflix.base.enums import ParseStatus, SourceType, enum_col
 from funflix.models.base import Base, JsonType, PkType, TimestampMixin, UTCDateTime, uuid7
 
+#: 解析规则集的版本号。**手工 bump** —— 给 `services/text/normalize.py` 的词表、
+#: `services/extract/rule.py` / `sheet.py` 的切分逻辑做了会改变产出的修改之后 +1。
+#:
+#: 它是 `funflix repair requeue` 的廉价预筛：版本号对不上的文档才有必要回到原文
+#: 重解析。213 万文档不可能每次规则改动都全量重跑。
+#:
+#: **刻意不用源码哈希。** 哈希会把改注释、调格式这类无关变更也算成规则变更，
+#: 一次就把 213 万文档全部打回队列 —— 那等于废掉预筛本身。
+#:
+#: 和 `CANON_PROMPT_VERSION`（归一 prompt）、`extract/llm/prompts.py` 的
+#: `PROMPT_VERSION`（绑在 `extraction` 表缓存键上）都是独立的东西，不要混用。
+PARSE_RULES_VERSION = "rules-v1"
+
 if TYPE_CHECKING:
     from funflix.models.extraction import Extraction
     from funflix.models.resource import Resource
@@ -61,6 +74,9 @@ class RawDocument(TimestampMixin, Base):
     #: 最近一次尝试解析的时间（成功或失败都算）。为空即"从没解析过"，
     #: 领取/排队时用它把这类文档排到已处理过但待重试的文档前面。
     last_parsed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    #: 最近一次成功解析时用的规则集版本，见 `PARSE_RULES_VERSION`。
+    #: `NULL` = 规则版本戳这个机制上线之前解析的，等同于"版本对不上"。
+    parse_rules_version: Mapped[str | None] = mapped_column(sa.String(32))
 
     source: Mapped[Source | None] = relationship(back_populates="documents")
     extractions: Mapped[list[Extraction]] = relationship(
@@ -72,6 +88,10 @@ class RawDocument(TimestampMixin, Base):
         # worker 领取待解析文档的主查询路径
         sa.Index("ix_raw_document_parse_queue", "parse_status", "next_parse_at"),
         sa.Index("ix_raw_document_source", "source_type", "source_name", "published_at"),
+        # `funflix repair requeue` 的查询路径：找出已解析完、但规则集版本对不上的文档。
+        # 规则刚 bump 完时几乎全表命中、走不走索引都一样；真正需要它的是
+        # **规则没变**的那些轮次 —— 得能一眼证明"没有要重刷的"，而不是扫 213 万行。
+        sa.Index("ix_raw_document_rules_version", "parse_status", "parse_rules_version"),
         # 按采集源回溯其产出，以及排查"某条消息到底采没采到"
         sa.Index("ix_raw_document_source_msg", "source_id", "source_msg_id"),
     )

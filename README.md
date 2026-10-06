@@ -128,24 +128,47 @@ scripts/setup.sh run prod     # 前台运行（prod 跑已安装的 funflix 正�
 
 运行状态、PID 和日志位于 `.run/`。
 
-### canon 归一的上线
+### 持续修复：规则更新后把旧数据刷对
 
-`funflix canon` 的四个子命令默认都是 dry-run，加 `--apply` 才写库。把它们应用到
-生产库是一次有顺序、有人工闸门、要跑几个小时的操作，用 `scripts/canon-rollout.sh`
-编排，不要照着文档手敲：
+解析规则永远加不完。每往 `normalize.py` 补一条词表，库里就多出一批「按旧规则
+算出来、现在看是错的」数据。所以这不是一次性迁移，而是三条可以反复跑的命令
+（`funflix repair`，和 `funflix canon` 一样**默认 dry-run**，加 `--apply` 才写库）：
+
+| 命令 | 性质 |
+| --- | --- |
+| `funflix repair scan` | 只读 media + 只写 `repair_task`。规则没变就零写入，可每轮跑 |
+| `funflix repair apply` | 破坏性、不可逆。带 `--limit` 限额和爆炸半径闸门 |
+| `funflix repair requeue` | 把规则版本过期的文档打回 parse 队列（深层修复） |
+
+检测和应用分成两步是故意的：检测便宜且可逆，可以天天跑；应用不可逆 ——
+两部剧并成一部之后没有任何信息能把它们分回去。`repair apply` 在动手前先查
+爆炸半径，删除任务超过 media 总量 5%、或重挂超过 20% 就直接拒绝（要 `--force`
+放行）—— 一次规则改动不该动到全库两成，真触发了更可能是规则写错了。
 
 ```bash
-scripts/canon-rollout.sh check            # 全程空跑：不写库、不花 token、不碰 Action
-scripts/canon-rollout.sh apply            # 真跑（带断点续跑；中断后重跑接着来）
-scripts/canon-rollout.sh status           # 看库当前状态 + 跑到哪个阶段了
-scripts/canon-rollout.sh apply --from resolve   # 从某个阶段开始
+funflix repair scan                        # dry-run：看这轮检出多少、都是什么样
+funflix repair scan --apply                # 落成 repair_task
+funflix repair apply                       # dry-run：核对 改标题/多合一/删除 各几条
+funflix repair apply --apply --limit 5000  # 真跑，限额
+
+funflix repair scan --key <series_norm_key> --apply   # 单组演练
+funflix repair apply --key <series_norm_key>
 ```
 
-阶段依次是 `backup guard rehearse purge rebuild resolve merge finalize reopen`：
-备份五张表 → 停掉 `collect.yml`（并发 parse 会撞上归并）→ 单组演练并等人核对 →
-全库 purge/rebuild → LLM 裁决（先 `--limit 3` 探针再全量）→ 应用裁决 →
-迁移 B 收口 → 把 Action 开回去。断点和不变量快照在 `.run/canon-rollout/`。
-设计取舍见 `docs/DESIGN.md` §7.5。
+这三条已经挂在 `.github/workflows/collect.yml` 的 `repair` job 上，和
+collect / parse / verify 完全并列、不设 `needs`，靠 `--limit` 慢慢刷。
+
+浅层（scan + apply）从已清洗的 `media.title` 重算 —— 可行是因为清洗是**减法**，
+对已经干净的标题是空操作。它修不了「旧规则洗坏、信息已经丢了」和「抽取器切分
+逻辑本身变了」这两类，那些只能靠 `repair requeue` 回到 `raw_document.content`
+重解析；改了抽取逻辑要手动 bump `PARSE_RULES_VERSION`（刻意不用源码哈希：
+改个注释不该让 213 万份文档重排队）。
+
+`funflix canon` 的四个子命令是同一套数据的 LLM 一侧：`purge` / `rebuild` 靠规则
+收口，剩下的残局交给 `resolve`（写 `title_canon` 裁决）和 `merge`（应用裁决）。
+`repair` 复用 `canon/lookup.py::resolve_target` 算目标值 —— 修复的终点必须和
+parse 现在会产出的结果一字不差，否则两条路会互相拆台。设计取舍见
+`docs/DESIGN.md` §7.5。
 
 采集源除 Telegram 频道和腾讯文档外，还支持公开 RSS/Atom feed。RSS 条目标题、
 描述、真实链接、Atom enclosure，以及扩展字段里的 `infoHash` 都会转成原始文本，按
