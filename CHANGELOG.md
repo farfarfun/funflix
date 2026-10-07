@@ -155,6 +155,18 @@
 
 ### 修复
 
+- **LLM 网关一个 429 就让 `canon resolve` 整轮白花钱**
+  （`services/extract/llm/client.py`）。`extract()` 的契约写着「调用失败一律抛
+  `LLMCallError`」，调用方（`canon/resolver.py`、`extract/runner.py`）也只接这一种，
+  但 openai SDK 自己重试完 `max_retries` 次之后抛的 `RateLimitError` /
+  `APITimeoutError` / `APIConnectionError` 从来没被收口。后果在 GitHub Action 上
+  实测到了：`canon resolve --limit 200 --concurrency 8` 撞上网关的
+  `429 Request Rate Reaches Maximum Limit`，异常穿过 `asyncio.gather` 一路冒到
+  CLI，整个 job 退出 1 —— **连已经调完的那些块也不会落库**，`_persist` 根本没执行。
+  现在 `APIError` 的任何子类都收口成 `LLMCallError`，那一页留在 pending 下轮重跑，
+  其余照常落库。配套：`max_retries` 默认 2 → 5（限流是按速率算的，等几秒就过去，
+  比下轮重新付整块输入 token 便宜），workflow 里 `--concurrency` 压到 4。
+  程序 bug 类异常仍然原样抛出，不会被当成「这一页失败了」无限重试。
 - **一个 `ed2k://` 链接就让整个采集源这一轮全废**（`services/collect/web.py`）。
   `urljoin` / `urlsplit` 遇上 `ed2k://|file|[电影]冰与火之歌.mkv|123|abc|/` 这种
   href 会抛 `ValueError: Invalid IPv6 URL` —— urllib 把 `//` 后面那段当 netloc，

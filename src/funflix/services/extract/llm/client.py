@@ -98,7 +98,10 @@ class OpenAICompatClient:
         model: str | None = None,
         timeout: float = 120.0,
         temperature: float = 0.0,
-        max_retries: int = 2,
+        # SDK 自带指数退避。给到 5 次是因为网关的限流是按速率算的（实测
+        # `429 Request Rate Reaches Maximum Limit`），等几秒就能过去，
+        # 而重试一次远比把这一页留到下一轮重跑便宜 —— 重跑要重新付整块的输入 token。
+        max_retries: int = 5,
         tool_schema: dict[str, Any] | None = None,
         tool_name: str | None = None,
     ) -> None:
@@ -113,7 +116,7 @@ class OpenAICompatClient:
             model: 模型名；为 None 时读取 funsecret 的 `model`。
             timeout: 单次请求超时秒数。
             temperature: 采样温度，默认 0 以保证抽取结果尽量确定。
-            max_retries: 底层 SDK 的请求失败重试次数。
+            max_retries: 底层 SDK 的请求失败重试次数（指数退避，主要用来扛网关限流）。
 
         Raises:
             LLMConfigError: 对应的 funsecret 配置项未设置。
@@ -161,23 +164,40 @@ class OpenAICompatClient:
             `LLMResult`：解析出的工具参数 payload，连同模型名、输入/输出 token 数、耗时（毫秒）。
 
         Raises:
-            LLMCallError: 响应中没有 choices、模型未调用工具、或工具参数不是合法 JSON 对象。
+            LLMCallError: 网关侧调用失败（限流、5xx、超时、连接断开），或响应中
+                没有 choices、模型未调用工具、工具参数不是合法 JSON 对象。
         """
         import time
 
+        from openai import APIError
+
         client = self._ensure_client()
         started = time.monotonic()
-        response = await client.chat.completions.create(
-            model=self.model,
-            temperature=self._temperature,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            tools=[self._tool_schema],
-            # 强制走工具，不给模型"用自然语言回答"的选项
-            tool_choice={"type": "function", "function": {"name": self._tool_name}},
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=self.model,
+                temperature=self._temperature,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                tools=[self._tool_schema],
+                # 强制走工具，不给模型"用自然语言回答"的选项
+                tool_choice={"type": "function", "function": {"name": self._tool_name}},
+            )
+        except APIError as exc:
+            # SDK 自己重试完 `max_retries` 次之后仍然失败的，会原样抛 `APIError`
+            # 子类（`RateLimitError`/`APITimeoutError`/`APIConnectionError`/5xx）。
+            # 必须在这里收口成 `LLMCallError` —— 调用方只接这一种（见
+            # `canon/resolver.py` 与 `extract/runner.py`），接住之后把这一页留在
+            # pending、下次重跑，不让一页失败拖垮整条命令。
+            #
+            # 不收口的后果实测过：GitHub Action 里 `canon resolve --limit 200`
+            # 撞上网关的 `429 Request Rate Reaches Maximum Limit`，异常穿过
+            # `asyncio.gather` 一路冒到 CLI，整个 job 退出 1，**连已经调完的那些块
+            # 也不会落库** —— gather 一抛，后面的 `_persist` 根本不会执行，
+            # 那一轮所有 token 全白花。
+            raise LLMCallError(f"调用网关失败：{type(exc).__name__}: {exc}") from exc
         latency_ms = int((time.monotonic() - started) * 1000)
 
         payload = _extract_tool_arguments(response)

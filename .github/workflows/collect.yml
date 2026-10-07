@@ -193,8 +193,14 @@ jobs:
 
       # `--limit` 是**钱的闸门**，不只是时间的：一个块一次调用。已经 decided
       # 的键会被跳过，所以每轮都只打残局、不重复付费，一轮打不完下一轮接着打。
+      #
+      # `--concurrency` 压到 4（默认 8）：实测默认值会打出网关的
+      # `429 Request Rate Reaches Maximum Limit`。限流了就是白花钱 —— 重试要重新
+      # 付整块的输入 token，而这里的瓶颈从来不是墙上时间（一轮才 200 个块）。
       - name: Resolve
-        run: uv run $UV_SYNC_EXTRAS --extra llm funflix canon resolve --apply --yes --limit 200
+        run: >
+          uv run $UV_SYNC_EXTRAS --extra llm funflix canon resolve
+          --apply --yes --limit 200 --concurrency 4
 
       # 应用的是**之前每一轮**攒下来的裁决，不只是这一轮的，所以 resolve 挂了
       # （比如 LLM 网关抽风）它照样要跑完 —— job 整体仍然是红的，不会掩盖问题。
