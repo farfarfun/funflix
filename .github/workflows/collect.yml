@@ -40,9 +40,16 @@ jobs:
     timeout-minutes: 120
     concurrency:
       group: pipeline-collect
-      # push 触发时取消掉同组里还在跑的旧一轮（多半是上一次 push 触发的），
-      # 只让最新代码跑；定时/手动触发不取消任何东西，保证数据采集轮次不丢。
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      # **一轮都不许掐。** 这里原来是 `github.event_name == 'push'`，想的是
+      # 「只让最新代码跑」—— 但这条流水线是在**补数据**，每一轮不管跑的是哪个
+      # 版本的代码都在往前推进度，掐掉等于把已经跑掉的几十分钟直接扔了。实测
+      # 2026-10-07 当天六七轮里有五轮是 `cancelled`，全是我自己 push 掐的，
+      # 于是「这一轮到底跑通没跑通」反复看不出来。
+      #
+      # 改成 false 之后新一轮不会跟旧一轮并行：同组的新 run 变成 pending，
+      # 等旧的跑完才开始（GitHub 在一个组里只留一个 pending，更新的到了会把
+      # 前一个 pending 取消掉 —— 正好是想要的「不丢进度、也不堆积」）。
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
 
@@ -88,9 +95,10 @@ jobs:
         shard: [0, 1, 2, 3]
     concurrency:
       # 组名必须带上片号。不带的话四片会被 GitHub 当成同一组，
-      # push 触发时互相取消，只剩一片真的在跑。
+      # 互相排队（改 `cancel-in-progress: false` 之前是互相取消），
+      # 四片退化成一片一片地跑。
       group: pipeline-parse-${{ matrix.shard }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
 
@@ -120,7 +128,7 @@ jobs:
     timeout-minutes: 120
     concurrency:
       group: pipeline-verify
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
 
@@ -184,7 +192,7 @@ jobs:
     timeout-minutes: 120
     concurrency:
       group: pipeline-canon
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
 
@@ -234,7 +242,7 @@ jobs:
     timeout-minutes: 120
     concurrency:
       group: pipeline-repair
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
 
