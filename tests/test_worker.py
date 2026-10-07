@@ -640,7 +640,10 @@ class TestRunnerParseBatch:
     ) -> None:
         """`persist_extracted` 把多条文档打包共享一个 SAVEPOINT（见
         `SAVEPOINT_BATCH_SIZE`）以摊薄往返次数，代价是失败隔离变粗：一条撞
-        唯一约束会连累同组其它文档一起回滚重试，都不计入失败次数。"""
+        唯一约束会连累同组其它文档一起回滚，都不计入失败次数。
+
+        这里是**一直撞**的情形（重跑也撞，见 `CHUNK_CONFLICT_ATTEMPTS` 里关于
+        组内冲突的说明），所以本轮重跑完还是整组留待下一轮。"""
         from sqlalchemy.exc import IntegrityError
 
         from funflix.services.extract import runner as runner_module
@@ -672,6 +675,56 @@ class TestRunnerParseBatch:
         assert "同批" in (report_b.error or "")
         assert doc_b.parse_attempts == 0
         assert doc_b.parse_status == ParseStatus.PENDING
+
+    @pytest.mark.asyncio
+    async def test_a_conflicted_batch_is_retried_in_the_same_round(
+        self, session, monkeypatch
+    ) -> None:
+        """撞车只是**瞬时**的：报错时对面那条已经提交完，本轮重跑一次就该过。
+
+        不重跑的代价是这一组整整两小时不动（parse 的 cron 是 2 小时一轮）。
+        实测线上一轮 20000 份里有 560 份（2.8%、28 组）栽在这上面。
+
+        顺带盯住重跑的那个坑：报告的计数是原地累加的，重跑前不把它拨回去，
+        这一组的 `media_created` 之类就会翻倍。
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        from funflix.services.extract import runner as runner_module
+        from funflix.services.extract.rule import RuleExtractor
+
+        doc_a = make_doc(1)
+        baseline_doc = make_doc(2)
+        session.add_all([doc_a, baseline_doc])
+        await session.commit()
+
+        # 没撞过的那条的计数，当对照。两条文档内容结构一样，计数应当完全一致。
+        (baseline,) = await parse_batch(session, [baseline_doc], RuleExtractor())
+        await session.commit()
+
+        real_phase1 = runner_module._persist_phase1
+        calls = 0
+
+        async def _boom_once(session, doc, outcome, report, cache, seen_deltas):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise IntegrityError("INSERT", {}, Exception("uq_media_identity"))
+            return await real_phase1(session, doc, outcome, report, cache, seen_deltas)
+
+        monkeypatch.setattr(runner_module, "_persist_phase1", _boom_once)
+
+        (report,) = await parse_batch(session, [doc_a], RuleExtractor())
+        await session.commit()
+
+        assert calls == 2, "撞车后要在本轮里重跑这一组"
+        assert report.ok, f"重跑该成功，实际 error={report.error!r}"
+        assert doc_a.parse_status == ParseStatus.DONE
+        assert doc_a.parse_attempts == 0, "撞车不是这条文档的错，不该计入失败次数"
+        assert (report.media_created, report.resources_created) == (
+            baseline.media_created,
+            baseline.resources_created,
+        ), "重跑前要把报告计数拨回去，否则翻倍"
 
     @pytest.mark.asyncio
     async def test_generic_exception_penalizes_only_the_doc_that_raised(

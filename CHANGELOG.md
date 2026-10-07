@@ -100,6 +100,16 @@
 
 ### 变更
 
+- **parse 撞车的那一组改成本轮重跑一次，不再整组推迟两小时**
+  （`CHUNK_CONFLICT_ATTEMPTS`，`services/extract/runner.py`）。实测线上一轮
+  20000 份里有 560 份（2.8%、28 组 × 20）因为 `IntegrityError` 整组回滚 ——
+  四个分片并行写同一批 `resource`/`work`/`tag`，撞上就整组作废、留给下一轮，
+  而 parse 的 cron 是两小时一轮。报错时冲突的那一行**已经在库里**（对面提交
+  完了才轮到我们报错），而回滚时这一组写进 `BatchCache` 的条目也一并撤了，
+  所以重跑时 `_upsert_*` 会重新 SELECT、查中那一行、走复用分支，一次就过。
+  只重跑一次：还撞说明冲突来自组内（同批两个项算出同一身份键却没共用缓存
+  条目），那是自己的 bug，再跑多少次都一样。重跑前会把 `ParseReport` 的计数
+  拨回去 —— 它是原地累加的，不拨就翻倍。
 - **并发写入冲突的重试提成公用件 `base/dbconflict.py`，`db relink-checks` 撞车
   不再把整个 verify job 带走。** 实测 2026-10-07 13:14 那轮（run 37626929998）
   `Relink` 这一步在 5000 行一批的 `UPDATE resource` 上被 Postgres 判了死锁，

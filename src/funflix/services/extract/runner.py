@@ -10,6 +10,7 @@ tag 去重、关联是否已存在……），批量预读把这些查询从 O(�
 
 from __future__ import annotations
 
+import copy
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -56,6 +57,17 @@ MAX_PARSE_ATTEMPTS = 5
 #: O(文档数 / N)。代价是失败隔离变粗：一条文档撞唯一约束会连累同批其余
 #: 文档一起回滚重试（不计入它们的失败次数，见 `persist_extracted`）。
 SAVEPOINT_BATCH_SIZE = 20
+
+#: 一组撞上并发写入冲突时，本轮里总共跑几次（含第一次）。
+#:
+#: 只重跑一次就够：报错的时候对面那条已经提交完了，重跑时 `_upsert_*` 会查中
+#: 它、走复用分支。还是撞，多半说明冲突来自**组内**（同一批里两个项算出了同一个
+#: 身份键却没共用缓存条目），那是我们自己的 bug，再重跑多少次结果都一样。
+#:
+#: 为什么不干脆留给下一轮：那意味着这一组整整两小时不动（parse 的 cron 是
+#: 2 小时一轮）。实测 20000 份一轮里有 560 份（2.8%，28 组）栽在撞车上回滚，
+#: 四个分片并行写同一批 `resource`，这个比例随分片数还会涨。
+CHUNK_CONFLICT_ATTEMPTS = 2
 
 
 @dataclass(slots=True)
@@ -959,8 +971,9 @@ async def persist_extracted(
     失败隔离按 `SAVEPOINT_BATCH_SIZE` 条一组：同组文档共享一个 SAVEPOINT、
     一次 flush，把往返次数摊薄成 O(文档数 / SAVEPOINT_BATCH_SIZE)。代价是
     隔离变粗——一条文档撞唯一约束（`IntegrityError`）会连累同组其余文档一起
-    回滚重试（不计入失败次数）；其它异常则只把"引发异常那一条"计入失败次数
-    /退避，同组其余文档视为受牵连，同样回滚重试、不计入失败次数。
+    回滚（不计入失败次数），这一组会在本轮里原样重跑，见
+    `CHUNK_CONFLICT_ATTEMPTS`；其它异常则只把"引发异常那一条"计入失败次数
+    /退避，同组其余文档视为受牵连，同样回滚、留待下一轮、不计入失败次数。
     """
     reports = {doc.id: ParseReport(document_id=doc.id, status=doc.parse_status) for doc in docs}
     now = utcnow()
@@ -997,19 +1010,32 @@ async def persist_extracted(
 
     for start in range(0, len(persistable_docs), SAVEPOINT_BATCH_SIZE):
         chunk = persistable_docs[start : start + SAVEPOINT_BATCH_SIZE]
-        await _persist_chunk(
-            session,
-            chunk,
-            outcomes,
-            cached_doc_ids,
-            extractor,
-            cache,
-            reports,
-            now,
-            all_touched,
-            tag_deltas,
-            seen_deltas,
-        )
+        # 报告的计数是**原地累加**的（`report.media_created += ...`），重跑前
+        # 得先留一份原样，不然重试过的那一组计数会翻倍。
+        snapshot = {doc.id: copy.copy(reports[doc.id]) for doc in chunk}
+        for attempt in range(CHUNK_CONFLICT_ATTEMPTS):
+            conflicted = await _persist_chunk(
+                session,
+                chunk,
+                outcomes,
+                cached_doc_ids,
+                extractor,
+                cache,
+                reports,
+                now,
+                all_touched,
+                tag_deltas,
+                seen_deltas,
+            )
+            if not conflicted or attempt == CHUNK_CONFLICT_ATTEMPTS - 1:
+                break
+            # 撞车的那一行**现在已经在库里了**（对面提交完了才轮到我们报错），
+            # 而 `_persist_chunk` 回滚时把这一组写进 `cache` 的条目也撤了，
+            # 于是重跑时 `_upsert_*` 会重新 SELECT、查中那一行、走复用分支 ——
+            # 这才是"下一轮重试"真正会发生的事，只是不用等两小时。
+            for doc in chunk:
+                reports[doc.id] = copy.copy(snapshot[doc.id])
+            logger.info(f"解析撞车重跑这一组 {len(chunk)} 份（第 {attempt + 1} 次）")
 
     # 顺序有要求：标签增量必须先落，`refresh_counters_for_media` 删空作品时会
     # 按关联表重算受影响标签的计数，反过来就会在正确值上再加一遍增量。
@@ -1033,9 +1059,13 @@ async def _persist_chunk(
     all_touched: set[uuid.UUID],
     tag_deltas: dict[uuid.UUID, int],
     seen_deltas: dict[Resource, int],
-) -> None:
+) -> bool:
     """把一组文档打包进一个共享 SAVEPOINT：阶段一全组 add 完再统一 flush 一次，
     阶段二全组的关联行攒成一批 INSERT，往返次数固定不随组内文档数增长。
+
+    返回「这一组是不是因为并发写入冲突整体回滚了」—— 真值时调用方可以在本轮
+    里原样重跑一次（见 `persist_extracted`），别的情况都是假值（提交成功，或者
+    已经按文档记好失败/连带回滚，重跑没意义）。
 
     两个热行计数的增量先攒在 chunk 本地，只在这个 SAVEPOINT 真的提交之后才
     合并进调用方的 `tag_deltas`/`seen_deltas`——增量不幂等，回滚重试的 chunk
@@ -1116,7 +1146,7 @@ async def _persist_chunk(
             report.status = doc.parse_status
 
     except IntegrityError:
-        # 并发撞车不算"处理过"，同组全部回滚，留到下次自然重试。
+        # 并发撞车不算"处理过"，同组全部回滚。
         # 缓存也要跟着回滚——这个 chunk 里新建、写进 cache 的对象已经随
         # SAVEPOINT 一起失效，留着会被下一个 chunk 当"已存在"复用到坏对象。
         if cache is not None and cache_snapshot is not None:
@@ -1125,7 +1155,9 @@ async def _persist_chunk(
             report = reports[doc.id]
             report.status = doc.parse_status
             report.error = "同批并发写入冲突，已回滚，留待下次重试（不计入失败次数）"
-        logger.info(f"解析撞车 docs={[d.id for d in chunk]}: 同批并发写入冲突，留待下次重试")
+        logger.info(f"解析撞车 docs={[d.id for d in chunk]}: 同批并发写入冲突")
+        # 由调用方决定还要不要在本轮里再试一次，见 `persist_extracted`。
+        return True
 
     except Exception as exc:
         # 同上：这个 chunk 的 SAVEPOINT 整体回滚了，缓存里这个 chunk 期间
@@ -1156,6 +1188,8 @@ async def _persist_chunk(
                 report.status = doc.parse_status
                 report.error = "同批其它文档处理异常，已回滚，留待下次重试（不计入失败次数）"
                 logger.info(f"解析连带回滚 doc={doc.id}: 同批其它文档异常，留待下次重试")
+
+    return False
 
 
 async def parse_batch(
