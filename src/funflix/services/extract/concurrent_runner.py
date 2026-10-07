@@ -54,7 +54,7 @@ from collections.abc import Callable
 from typing import Any
 
 from funworker import BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
-from sqlalchemy import func, or_, select
+from sqlalchemy import ColumnElement, String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from funflix.base.config import Settings, get_settings
@@ -70,20 +70,103 @@ from funflix.services.extract.runner import (
     persist_extracted,
 )
 
+#: 十六进制字符表，分片键的取值空间。小写——两种方言存的 uuid 文本都是小写，
+#: 但谓词里仍然套了 `lower()`，不依赖这个巧合。
+_HEX_DIGITS = "0123456789abcdef"
 
-def _pending_conditions(now: Any) -> tuple[Any, ...]:
-    return (
+
+def parse_shard(spec: str) -> tuple[int, int]:
+    """解析 `--shard` 的 `i/N` 写法，返回 `(序号, 总片数)`。
+
+    Args:
+        spec: 形如 `"0/8"` 的字符串，序号从 0 开始、必须小于总片数。
+
+    Returns:
+        `(index, total)`。
+
+    Raises:
+        ValueError: 格式不对、不是整数、总片数不是正数，或序号越界。
+    """
+    index_text, _, total_text = spec.partition("/")
+    if not _:
+        raise ValueError(f"分片要写成 i/N（比如 0/8），收到 {spec!r}")
+    try:
+        index, total = int(index_text), int(total_text)
+    except ValueError:
+        raise ValueError(f"分片的序号和总数都得是整数，收到 {spec!r}") from None
+    if total < 1:
+        raise ValueError(f"总片数至少是 1，收到 {total}")
+    if not 0 <= index < total:
+        raise ValueError(f"分片序号要落在 [0, {total}) 里，收到 {index}")
+    return index, total
+
+
+def shard_digits(index: int, total: int) -> tuple[str, ...]:
+    """第 `index` 片负责的 uuid 末位字符集合。
+
+    16 个十六进制字符按 `% total` round-robin 分摊。`total` 整除 16 时
+    （1/2/4/8/16）每片严格等量；不整除时相邻片差一个字符，即最多 6.25% 的
+    倾斜——够用了，不值得为此引入不可移植的 SQL 取模。
+    """
+    return tuple(d for d in _HEX_DIGITS if int(d, 16) % total == index)
+
+
+def shard_condition(shard: tuple[int, int] | None) -> ColumnElement[bool] | None:
+    """把分片切成 SQL 谓词：按 `id` 的**末位十六进制字符**取模分摊。
+
+    为什么是末位字符：主键是 UUIDv7，低位 74 位是随机数（`models/base.py::uuid7`），
+    所以末位字符天然均匀——生产库 213 万行实测 16 个桶每桶 6.25%±2%。
+    换成高位就全是毫秒时间戳前缀，同一批采集进来的文档会挤在同一片里。
+
+    为什么不用 `lease_until` 领取租约来分活：`worker/claim.py` 那套是**逐行**
+    带守卫 UPDATE（它要能分辨"新任务"和"崩溃后重捞的任务"，批量 UPDATE 做不到），
+    每条多一次往返。而本机到 RDS 的往返是 131ms、每条文档总共才约 2 次往返，
+    加租约等于把单进程吞吐再砍三分之一。分片不写库、零额外往返，而且失败模式
+    是安全的：切漏了只会让那些文档**留在 pending**，最后补跑一遍不带 `--shard`
+    的就能收干净；重复切则因为各片谓词互斥而不可能发生。
+
+    代价是各片要独立扫索引（谓词不可索引，PG 走有序索引逐条过滤），
+    即全表索引扫的工作量放大 `total` 倍。配合 `ix_raw_document_parse_scan`
+    这是索引内过滤、不回表，比没索引时每页全表扫 2.6GB 便宜得多。
+
+    Args:
+        shard: `(序号, 总片数)`；为 None 或总片数为 1 时返回 None（不加谓词）。
+
+    Returns:
+        `id` 末位字符落在本片里的条件；不需要分片时为 None。
+    """
+    if shard is None:
+        return None
+    index, total = shard
+    if total <= 1:
+        return None
+    id_text = cast(RawDocument.id, String)
+    tail = func.lower(func.substr(id_text, func.length(id_text), 1))
+    return tail.in_(shard_digits(index, total))
+
+
+def _pending_conditions(now: Any, shard: tuple[int, int] | None = None) -> tuple[Any, ...]:
+    conditions: list[Any] = [
         RawDocument.parse_status == ParseStatus.PENDING,
         or_(RawDocument.next_parse_at.is_(None), RawDocument.next_parse_at <= now),
-    )
+    ]
+    if (clause := shard_condition(shard)) is not None:
+        conditions.append(clause)
+    return tuple(conditions)
 
 
-async def count_pending(session: AsyncSession, *, limit: int | None) -> int:
-    """待解析文档总数，供调用方渲染进度条，不影响流水线本身。"""
+async def count_pending(
+    session: AsyncSession, *, limit: int | None, shard: tuple[int, int] | None = None
+) -> int:
+    """待解析文档总数，供调用方渲染进度条，不影响流水线本身。
+
+    分了片就只数本片的——否则每个分片进程的进度条分母都是全局待处理量，
+    看起来像是谁都没在推进。
+    """
     now = utcnow()
     total = int(
         await session.scalar(
-            select(func.count()).select_from(RawDocument).where(*_pending_conditions(now))
+            select(func.count()).select_from(RawDocument).where(*_pending_conditions(now, shard))
         )
         or 0
     )
@@ -102,6 +185,7 @@ class _ParseProducer(BaseProducer):
         limit: int | None,
         batch_size: int,
         force: bool,
+        shard: tuple[int, int] | None = None,
         name: str | None = None,
     ) -> None:
         """保存构造参数；数据库引擎、事件循环等资源留到 `on_start()` 里按线程现造。
@@ -113,6 +197,7 @@ class _ParseProducer(BaseProducer):
             limit: 本次最多处理的文档数；None 表示不限。
             batch_size: 每次翻页读取的文档数上限。
             force: 为 True 时跳过缓存查询，强制让每条文档都重新抽取。
+            shard: `(序号, 总片数)`，只处理 id 末位落在本片的文档；None 表示全量。
             name: 线程名，透传给 `BaseProducer`。
         """
         super().__init__(output_queue, name=name)
@@ -121,6 +206,7 @@ class _ParseProducer(BaseProducer):
         self.limit = limit
         self.batch_size = batch_size
         self.force = force
+        self.shard = shard
 
     def on_start(self) -> None:
         """在生产者线程内创建专属 `AsyncEngine`/事件循环，并初始化翻页游标与缓冲区。"""
@@ -176,7 +262,7 @@ class _ParseProducer(BaseProducer):
                 await session.scalars(
                     select(RawDocument)
                     .where(
-                        *_pending_conditions(now),
+                        *_pending_conditions(now, self.shard),
                         keyset_after(
                             RawDocument.last_parsed_at, RawDocument.id, self._last_ts, self._last_id
                         ),
@@ -418,6 +504,7 @@ def run_parse_pipeline(
     flush_interval: float = 10.0,
     concurrency: int = 4,
     force: bool = False,
+    shard: tuple[int, int] | None = None,
     settings: Settings | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[ParseReport]:
@@ -431,6 +518,13 @@ def run_parse_pipeline(
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，即便生产者
     已经翻完页（规划通常比 `extract()` 快得多），只要队列里还有积压就继续
     轮询——不然进度条会在处理单元/消费者还在忙的时候看起来像卡死了。
+
+    `shard=(i, N)` 让本次只处理 id 末位落在第 i 片的文档，供 N 个互不重叠的
+    进程并行推进同一个队列（见 `shard_condition`）。**一个进程内把
+    `concurrency` 开大并不能提速**：落库全程只有一个 `_ParseConsumer` 线程，
+    而远程库场景下瓶颈是每条文档那两次网络往返，不是 `extract()` 的 CPU。
+    要提吞吐只能多开进程，而多开进程必须分片，否则各进程的翻页游标从同一处
+    起步、把同一批文档重复解析一遍。
     """
     settings = settings or get_settings()
 
@@ -449,6 +543,7 @@ def run_parse_pipeline(
             "limit": limit,
             "batch_size": batch_size,
             "force": force,
+            "shard": shard,
         },
         consumer_kwargs={
             "settings": settings,

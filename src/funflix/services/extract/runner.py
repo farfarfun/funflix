@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from farlog import getLogger
-from sqlalchemy import and_, or_, select, tuple_
+from sqlalchemy import and_, case, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -124,8 +124,9 @@ def _snapshot_cache(cache: BatchCache) -> tuple:
     对已经在 chunk 开始前就存在的对象，SAVEPOINT 回滚会由 SQLAlchemy
     自己把它们过期掉，下次访问自动重新 SELECT，值总是对的；这里要防的
     是"这个 chunk 里新建、又被这个 chunk 的回滚撤销"的对象继续赖在缓存里
-    被后面的 chunk 复用——那些对象的默认值（比如 `Tag.media_count=0`）
-    在回滚后就丢了，再复用会在 `+= 1` 时炸出 `None + int`。
+    被后面的 chunk 复用——那种对象在库里根本没有对应行，被后面的 chunk 当成
+    "已存在"拿去用，关联表 INSERT 就会撞外键；它们的属性在回滚后读出来也
+    全是 None。
     """
     return (
         dict(cache.media_by_key),
@@ -444,9 +445,16 @@ async def _upsert_resource(
     *,
     doc: RawDocument,
     item: ExtractedItem | None,
-    cache: BatchCache | None = None,
+    cache: BatchCache | None,
+    seen_deltas: dict[Resource, int],
 ) -> tuple[Resource, bool]:
-    """按 (provider, share_id) 幂等落库。返回 (资源, 是否新建)。"""
+    """按 (provider, share_id) 幂等落库。返回 (资源, 是否新建)。
+
+    重复看到的行**不在这里改 `seen_count`/`last_seen_at`**，只往 `seen_deltas`
+    记一笔，由调用方收尾时一条算术 UPDATE 落下去（`_apply_resource_seen_deltas`）。
+    理由同 `_apply_tag_count_deltas`：热行上的 ORM 自增既会丢更新，又会把行锁
+    一路握到外层事务提交。
+    """
     now = utcnow()
     key = (link.provider, link.share_id)
     existing = (
@@ -461,8 +469,7 @@ async def _upsert_resource(
 
     if existing is not None:
         # 同一份分享被多处转发 —— 记热度，不重复建行
-        existing.last_seen_at = now
-        existing.seen_count += 1
+        seen_deltas[existing] = seen_deltas.get(existing, 0) + 1
         if existing.passcode is None and link.passcode:
             existing.passcode = link.passcode
         if existing.title_raw is None and item is not None:
@@ -487,10 +494,9 @@ async def _upsert_resource(
         next_check_at=now if checkable else None,
         first_seen_at=now,
         last_seen_at=now,
-        # 显式给 seen_count 赋初值——同一份分享在同一批里被多处转发时，
-        # 上面的 `existing.seen_count += 1` 会在这个刚建、还没 flush 的对象
-        # 上直接自增，列定义的 `default=1` 只在 flush 时才生效，flush 前
-        # Python 侧读到的是 None，会让 += 直接炸掉（同 Tag.media_count）。
+        # 新建就是"第一次看到"。同一批里这份分享再出现时走上面的 existing
+        # 分支、只记增量，所以收尾那条 `seen_count = seen_count + :d` 会加在
+        # 这个 1 上，不会把它冲掉。
         seen_count=1,
     )
     session.add(resource)
@@ -498,6 +504,40 @@ async def _upsert_resource(
     if cache is not None:
         cache.resource_by_key[key] = resource
     return resource, True
+
+
+async def _apply_resource_seen_deltas(
+    session: AsyncSession, deltas: dict[Resource, int], now: Any
+) -> None:
+    """把"又看到了几次"用**一条**算术 UPDATE 写回 `resource.seen_count`。
+
+    和 `_apply_tag_count_deltas` 是同一套理由、同一套写法，只是慢一步才发现：
+    `resource` 有近两百万行，看着不像热行，但分享链接是**被反复转发**的
+    —— 爆款那一份会出现在成百上千条文档里。8 个分片进程跑起来之后，
+    `pg_blocking_pids` 上排队最长的就变成了
+    `UPDATE resource SET last_seen_at=..., seen_count=...`，等了 1 分 55 秒。
+    （标签那条已经不在榜上了，说明上一轮改对了，只是把瓶颈让给了下一个。）
+
+    键是 ORM 对象而不是 id：这个增量在**阶段一**攒，那时新建的行还没 flush、
+    `id` 是 `uuid7` 的 Python 侧默认值、要到 flush 才赋上。等收尾时再取 `.id`
+    就都有了。
+
+    调用方的约束同 `_apply_tag_count_deltas`：只能合并提交成功的那部分。
+    """
+    if not deltas:
+        return
+    ordered = sorted(((r.id, d) for r, d in deltas.items()), key=lambda kv: kv[0])
+    await session.execute(
+        update(Resource)
+        .where(Resource.id.in_([rid for rid, _ in ordered]))
+        .values(
+            seen_count=Resource.seen_count + case(dict(ordered), value=Resource.id),
+            # 字典里的行都是"这一批又看到了"，统一盖上这一批的时间戳。
+            last_seen_at=now,
+            updated_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def _link_media_resource(
@@ -564,9 +604,10 @@ async def _resolve_tags(
         if tag is None and cache is None:
             tag = await session.scalar(select(Tag).where(Tag.kind == kind, Tag.norm_key == key))
         if tag is None:
-            # 显式给 media_count 赋初值——`_link_tags` 会在同一次 flush 之前
-            # 对刚建的这个对象直接 `+= 1`，列定义的 `default=0` 只在 flush
-            # 时才生效，flush 前 Python 侧读到的是 None，会让 += 直接炸掉。
+            # 显式给 media_count 赋初值。列定义的 `default=0` 也会在 flush 时
+            # 补上，写在这里是为了让「计数从 0 起、只由
+            # `_apply_tag_count_deltas` 的算术 UPDATE 推动」这件事在建对象的
+            # 地方就看得见——否则 flush 之前 Python 侧读出来是 None。
             tag = Tag(kind=TagKind(kind), name=name, norm_key=key, media_count=0)
             session.add(tag)
             if cache is not None:
@@ -579,14 +620,19 @@ async def _link_tags(
     session: AsyncSession,
     media: Media,
     tags: list[Tag],
-    cache: BatchCache | None = None,
-    pending: list[dict] | None = None,
+    cache: BatchCache | None,
+    pending: list[dict] | None,
+    tag_deltas: dict[uuid.UUID, int],
 ) -> int:
     """建立作品 ↔ 标签关联。返回新建的关联数。
 
     调用时 `tags` 里的行必须已经 flush 过、拿到了真实 id（见 `_resolve_tags`）。
     新增的关联行同 `_link_media_resource`——传了 `pending` 就攒进去，由调用方
     一次性批量 INSERT，而不是每个标签各发一次往返。
+
+    **计数不在这里改 `tag.media_count`，只往 `tag_deltas` 记增量**，由调用方
+    收尾时用一条算术 UPDATE 落下去（`_apply_tag_count_deltas`）。原因见那个
+    函数的 docstring：热行上的 ORM 自增既慢又会丢更新。
     """
     linked = 0
     pair_rows: list[dict] = []
@@ -605,7 +651,7 @@ async def _link_tags(
         if exists:
             continue
         pair_rows.append({"media_id": media.id, "tag_id": tag.id, "created_at": utcnow()})
-        tag.media_count += 1
+        tag_deltas[tag.id] = tag_deltas.get(tag.id, 0) + 1
         if cache is not None:
             cache.media_tag_pairs.add(pair)
         linked += 1
@@ -616,6 +662,52 @@ async def _link_tags(
         await session.execute(media_tag.insert(), pair_rows)
 
     return linked
+
+
+async def _apply_tag_count_deltas(session: AsyncSession, deltas: dict[uuid.UUID, int]) -> None:
+    """把攒下来的标签计数增量用**一条**算术 UPDATE 写回 `tag.media_count`。
+
+    这里刻意不走 ORM 的 `tag.media_count += 1`，有两个各自独立的理由：
+
+    **一、丢更新。** ORM 会把 `+= 1` 刷成绝对值（读到 5 就写
+    `SET media_count = 6`）。两个 parse 进程同时处理挂了同一个标签的文档，
+    后提交的那个就把前一个的 +1 盖掉了。这正是 `maintenance.recount_tags`
+    存在的原因。算术形式 `media_count = media_count + :d` 由数据库在持有行锁
+    时自己算，不存在这个窗口。
+
+    **二、串行化。** 生产库只有一千多个标签行，而几乎每条文档都会挂上
+    「夸克」「电视剧」这类大热标签——ORM 自增发生在阶段二，行锁要一直握到
+    外层事务提交（一整批上百条文档、好几秒），于是所有 parse 进程在那几行上
+    排队。实测 8 个分片进程跑出来 2.6 条/s，比单进程的 4.6 条/s 还慢，
+    `pg_blocking_pids` 上看到的就是 `UPDATE tag SET media_count=...` 的
+    `Lock: transactionid` 等待，最长 57 秒。改成收尾时一条语句之后，行锁只从
+    这条语句握到提交，窗口是毫秒级。
+
+    调用方必须保证**只有真的提交成功的 chunk 才把增量合并进来**——增量不幂等，
+    回滚重试的 chunk 要是也算一份，计数就会偏高。（`all_touched` 没这个要求，
+    因为 `refresh_counters_for_media` 是重算。）
+
+    同理，必须在 `refresh_counters_for_media` **之前**调用：那个函数在物理删除
+    零资源作品时会按关联表**重算**受影响标签的计数，先加增量再重算是对的
+    （重算覆盖掉就行），反过来会在已经正确的值上再加一次。
+    """
+    if not deltas:
+        return
+    # 一条 CASE 把整批写完，理由同 `services/counters.py`：远端库往返很贵。
+    # id 排序是为了让并发进程取行锁的顺序尽量一致，少踩死锁。
+    ordered = sorted(deltas.items())
+    await session.execute(
+        update(Tag)
+        .where(Tag.id.in_([tag_id for tag_id, _ in ordered]))
+        .values(
+            media_count=Tag.media_count + case(dict(ordered), value=Tag.id),
+            updated_at=utcnow(),
+        )
+        # 身份映射里那些 Tag 对象的 `media_count` 会就此过期，但落库路径之后
+        # 不再读它；让 ORM 去同步反而要么多发一次 SELECT、要么在 Python 侧
+        # 求值这个 CASE 失败。
+        .execution_options(synchronize_session=False)
+    )
 
 
 @dataclass(slots=True)
@@ -631,13 +723,17 @@ async def _persist_phase1(
     doc: RawDocument,
     outcome: ExtractionOutcome,
     report: ParseReport,
-    cache: BatchCache | None = None,
+    cache: BatchCache | None,
+    seen_deltas: dict[Resource, int],
 ) -> _PersistState:
     """阶段一：只 `session.add()` 新建的 media/resource/tag，不 flush。
 
     调用方（`_persist` 单文档场景、`persist_extracted` 批量场景）决定什么
     时候统一 flush——批量场景把好几条文档的阶段一攒在一起、只 flush 一次，
     才能把「一条文档一次往返」摊薄成「一批文档一次往返」。
+
+    `seen_deltas` 由调用方收尾时用一条 UPDATE 落下去，见
+    `_apply_resource_seen_deltas`。
     """
     media_by_item: list[tuple[Media, list[Tag]]] = []
     resource_by_link: list[tuple[Media, Resource]] = []
@@ -660,7 +756,7 @@ async def _persist_phase1(
             resource = resources.get(link.key)
             if resource is None:
                 resource, is_new = await _upsert_resource(
-                    session, link, doc=doc, item=item, cache=cache
+                    session, link, doc=doc, item=item, cache=cache, seen_deltas=seen_deltas
                 )
                 resources[link.key] = resource
                 report.resources_created += int(is_new)
@@ -669,7 +765,9 @@ async def _persist_phase1(
 
     # 没归属到作品的链接照样入库（无任何关联），进人工/二次归属队列，绝不丢弃
     for link in [*outcome.unattributed_links, *orphaned]:
-        _, is_new = await _upsert_resource(session, link, doc=doc, item=None, cache=cache)
+        _, is_new = await _upsert_resource(
+            session, link, doc=doc, item=None, cache=cache, seen_deltas=seen_deltas
+        )
         report.resources_created += int(is_new)
         report.resources_updated += int(not is_new)
     report.unattributed_links = len(outcome.unattributed_links) + len(orphaned)
@@ -684,16 +782,19 @@ async def _persist_phase2(
     cache: BatchCache | None,
     pending_links: list[dict],
     pending_tag_links: list[dict],
+    tag_deltas: dict[uuid.UUID, int],
 ) -> set[uuid.UUID]:
     """阶段二：用阶段一 flush 后拿到的 id 建关联关系，攒进调用方共享的批量列表。
 
     调用方负责在处理完一批文档后把 `pending_links`/`pending_tag_links` 各批量
-    INSERT 一次——攒的范围越大（单文档 vs 一整个 SAVEPOINT 里的好几条文档），
-    往返就摊得越薄。
+    INSERT 一次，并把 `tag_deltas` 用一条 UPDATE 落下去（`_apply_tag_count_deltas`）
+    ——攒的范围越大（单文档 vs 一整个 SAVEPOINT 里的好几条文档），往返就摊得越薄。
     """
     touched: set[uuid.UUID] = set()
     for media, tags in state.media_by_item:
-        report.tags_linked += await _link_tags(session, media, tags, cache, pending_tag_links)
+        report.tags_linked += await _link_tags(
+            session, media, tags, cache, pending_tag_links, tag_deltas
+        )
         touched.add(media.id)
     for media, resource in state.resource_by_link:
         # 一个链接可以关联多部作品（合集），关联表的唯一约束保证不重复
@@ -718,17 +819,24 @@ async def _persist(
     这个封装，而是把好几条文档的阶段一/阶段二分别攒在一起，摊得更薄——
     见该函数内部对 `_persist_phase1`/`_persist_phase2` 的直接调用。
     """
-    state = await _persist_phase1(session, doc, outcome, report, cache)
+    seen_deltas: dict[Resource, int] = {}
+    state = await _persist_phase1(session, doc, outcome, report, cache, seen_deltas)
     await session.flush()
 
     pending_links: list[dict] = []
     pending_tag_links: list[dict] = []
-    touched = await _persist_phase2(session, state, report, cache, pending_links, pending_tag_links)
+    tag_deltas: dict[uuid.UUID, int] = {}
+    touched = await _persist_phase2(
+        session, state, report, cache, pending_links, pending_tag_links, tag_deltas
+    )
 
     if pending_links:
         await session.execute(media_resource.insert(), pending_links)
     if pending_tag_links:
         await session.execute(media_tag.insert(), pending_tag_links)
+    # 必须在调用方的 `refresh_counters_for_media` 之前，见 `_apply_tag_count_deltas`。
+    await _apply_tag_count_deltas(session, tag_deltas)
+    await _apply_resource_seen_deltas(session, seen_deltas, utcnow())
 
     return touched
 
@@ -859,6 +967,10 @@ async def persist_extracted(
 
     cache = await _preload_batch_cache(session, list(outcomes.values()))
     all_touched: set[uuid.UUID] = set()
+    #: 热行计数的增量，都只收提交成功的 chunk 的那一份
+    #: （见 `_apply_tag_count_deltas` / `_apply_resource_seen_deltas`）。
+    tag_deltas: dict[uuid.UUID, int] = {}
+    seen_deltas: dict[Resource, int] = {}
 
     persistable_docs: list[RawDocument] = []
     for doc in docs:
@@ -886,9 +998,23 @@ async def persist_extracted(
     for start in range(0, len(persistable_docs), SAVEPOINT_BATCH_SIZE):
         chunk = persistable_docs[start : start + SAVEPOINT_BATCH_SIZE]
         await _persist_chunk(
-            session, chunk, outcomes, cached_doc_ids, extractor, cache, reports, now, all_touched
+            session,
+            chunk,
+            outcomes,
+            cached_doc_ids,
+            extractor,
+            cache,
+            reports,
+            now,
+            all_touched,
+            tag_deltas,
+            seen_deltas,
         )
 
+    # 顺序有要求：标签增量必须先落，`refresh_counters_for_media` 删空作品时会
+    # 按关联表重算受影响标签的计数，反过来就会在正确值上再加一遍增量。
+    await _apply_tag_count_deltas(session, tag_deltas)
+    await _apply_resource_seen_deltas(session, seen_deltas, now)
     if all_touched:
         await refresh_counters_for_media(session, all_touched)
 
@@ -905,11 +1031,19 @@ async def _persist_chunk(
     reports: dict[uuid.UUID, ParseReport],
     now: Any,
     all_touched: set[uuid.UUID],
+    tag_deltas: dict[uuid.UUID, int],
+    seen_deltas: dict[Resource, int],
 ) -> None:
     """把一组文档打包进一个共享 SAVEPOINT：阶段一全组 add 完再统一 flush 一次，
     阶段二全组的关联行攒成一批 INSERT，往返次数固定不随组内文档数增长。
+
+    两个热行计数的增量先攒在 chunk 本地，只在这个 SAVEPOINT 真的提交之后才
+    合并进调用方的 `tag_deltas`/`seen_deltas`——增量不幂等，回滚重试的 chunk
+    多算一份计数就偏高了。（`all_touched` 没这个顾虑，重算多传几个 id 只是白跑。）
     """
     failed_doc_id: uuid.UUID | None = None
+    chunk_tag_deltas: dict[uuid.UUID, int] = {}
+    chunk_seen_deltas: dict[Resource, int] = {}
     cache_snapshot = _snapshot_cache(cache) if cache is not None else None
     try:
         async with session.begin_nested():
@@ -935,7 +1069,9 @@ async def _persist_chunk(
                     )
                     # 不在这里单独 flush——留给下面全组共享的那一次 flush。
                 report.is_catalog = outcome.is_catalog
-                state = await _persist_phase1(session, doc, outcome, report, cache)
+                state = await _persist_phase1(
+                    session, doc, outcome, report, cache, chunk_seen_deltas
+                )
                 states.append((doc, state))
 
             # 阶段一到此结束：一次 flush 把这一组文档新建的
@@ -948,7 +1084,13 @@ async def _persist_chunk(
                 failed_doc_id = doc.id
                 report = reports[doc.id]
                 touched = await _persist_phase2(
-                    session, state, report, cache, pending_links, pending_tag_links
+                    session,
+                    state,
+                    report,
+                    cache,
+                    pending_links,
+                    pending_tag_links,
+                    chunk_tag_deltas,
                 )
                 all_touched.update(touched)
 
@@ -956,6 +1098,12 @@ async def _persist_chunk(
                 await session.execute(media_resource.insert(), pending_links)
             if pending_tag_links:
                 await session.execute(media_tag.insert(), pending_tag_links)
+
+        # SAVEPOINT 已提交，这一组的计数增量才算真的发生了。
+        for tag_id, delta in chunk_tag_deltas.items():
+            tag_deltas[tag_id] = tag_deltas.get(tag_id, 0) + delta
+        for resource, delta in chunk_seen_deltas.items():
+            seen_deltas[resource] = seen_deltas.get(resource, 0) + delta
 
         for doc in chunk:
             report = reports[doc.id]
@@ -982,8 +1130,10 @@ async def _persist_chunk(
     except Exception as exc:
         # 同上：这个 chunk 的 SAVEPOINT 整体回滚了，缓存里这个 chunk 期间
         # 新增/新建的条目也得跟着撤销，不然下一个 chunk 会复用到已经失效
-        # 的 ORM 对象（比如新建的 Tag，其 `media_count` 回滚后读出来是
-        # None，下一个 chunk 里 `+= 1` 直接抛 TypeError）。
+        # 的 ORM 对象（比如新建的 Tag，回滚后库里没有对应行，下一个 chunk
+        # 把它当"已存在"用，`media_tag` 的 INSERT 就撞外键）。
+        # `chunk_tag_deltas`/`chunk_seen_deltas` 不用清：它们是 chunk 本地的，
+        # 只有上面提交成功的那条路径才会把它们合并进调用方的字典。
         if cache is not None and cache_snapshot is not None:
             _restore_cache(cache, cache_snapshot)
         for doc in chunk:

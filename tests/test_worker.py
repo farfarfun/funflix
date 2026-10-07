@@ -12,7 +12,7 @@ from datetime import timedelta
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from funflix.base.backoff import BASE_BACKOFF, MAX_BACKOFF, backoff
@@ -26,7 +26,9 @@ from funflix.models import (
     Resource,
     Source,
     Tag,
+    TagKind,
     media_resource,
+    media_tag,
     utcnow,
 )
 from funflix.services.extract.runner import (
@@ -537,9 +539,11 @@ class TestRunnerParseBatch:
     @pytest.mark.asyncio
     async def test_two_docs_reposting_the_same_link_dedupe_within_the_batch(self, session) -> None:
         """同批内两条文档转发同一个分享链接——第二条该复用第一条批内新建、
-        还没 flush 的 resource 并把 `seen_count` 累加，而不是在 `+= 1` 时
-        炸出 `None + int`（新建的 resource 没显式给 `seen_count` 赋初值，
-        flush 前 Python 侧读到的是 None）。
+        还没 flush 的 resource，热度算到一起（建行时的 1 + 再看到一次）。
+
+        收尾那条算术 UPDATE 发生在 flush 之后，所以它也顺带守住了"增量字典
+        用 ORM 对象当键、到收尾才取 `.id`"这件事：阶段一攒增量时新建的行
+        `id` 还没赋上。
         """
         from funflix.services.extract.rule import RuleExtractor
 
@@ -557,6 +561,34 @@ class TestRunnerParseBatch:
         assert resource_rows[0].seen_count == 2
         assert doc_a.parse_status == ParseStatus.DONE
         assert doc_b.parse_status == ParseStatus.DONE
+
+    @pytest.mark.asyncio
+    async def test_resource_seen_count_is_added_to_not_overwritten(self, session) -> None:
+        """`seen_count` 走算术 UPDATE，和 `tag.media_count` 同一个理由。
+
+        `resource` 近两百万行、看着不是热行，但分享链接会被反复转发，爆款那
+        一份能出现在成百上千条文档里。8 个分片进程实测下来，排队最久的就是
+        `UPDATE resource SET ..., seen_count=...`（`Lock: transactionid` 等了
+        1 分 55 秒），所以它和标签一样不能用 ORM 自增。
+
+        这里同样用"落库之前先把计数置成一个别处写进来的值"替代真并发。
+        """
+        from funflix.services.extract.rule import RuleExtractor
+
+        url = "https://pan.quark.cn/s/hotshare01"
+        doc = make_doc(1, content=f"名称：爆款剧集\n链接：{url}")
+        session.add(doc)
+        # 假装这份分享已经被别的进程记了 500 次转发。
+        session.add(make_resource(99, share_id="hotshare01", url=url, seen_count=500))
+        await session.commit()
+
+        await parse_batch(session, [doc], RuleExtractor())
+        await session.commit()
+
+        resource = await session.scalar(select(Resource).where(Resource.share_id == "hotshare01"))
+        assert resource is not None
+        await session.refresh(resource)
+        assert resource.seen_count == 501, "应该是在 500 上加 1，而不是被这一批的 1 盖掉"
 
     @pytest.mark.asyncio
     async def test_matches_parse_document_for_independent_titles(self, session) -> None:
@@ -621,10 +653,10 @@ class TestRunnerParseBatch:
 
         real_phase1 = runner_module._persist_phase1
 
-        async def _boom_for_first_doc(session, doc, outcome, report, cache=None):
+        async def _boom_for_first_doc(session, doc, outcome, report, cache, seen_deltas):
             if doc.id == doc_a.id:
                 raise IntegrityError("INSERT", {}, Exception("uq_media_identity"))
-            return await real_phase1(session, doc, outcome, report, cache)
+            return await real_phase1(session, doc, outcome, report, cache, seen_deltas)
 
         monkeypatch.setattr(runner_module, "_persist_phase1", _boom_for_first_doc)
 
@@ -658,10 +690,10 @@ class TestRunnerParseBatch:
 
         real_phase1 = runner_module._persist_phase1
 
-        async def _boom_for_second_doc(session, doc, outcome, report, cache=None):
+        async def _boom_for_second_doc(session, doc, outcome, report, cache, seen_deltas):
             if doc.id == doc_b.id:
                 raise RuntimeError("boom")
-            return await real_phase1(session, doc, outcome, report, cache)
+            return await real_phase1(session, doc, outcome, report, cache, seen_deltas)
 
         monkeypatch.setattr(runner_module, "_persist_phase1", _boom_for_second_doc)
 
@@ -688,8 +720,11 @@ class TestRunnerParseBatch:
         """`persist_extracted` 整批共用一个 `BatchCache`，跨好几个 SAVEPOINT
         分片（chunk）复用。某个 chunk 因异常整体回滚时，它在这个 chunk 期间
         新建、写进缓存的 Tag 不能被下一个 chunk 继续复用——那个对象已经随
-        SAVEPOINT 回滚失效，`media_count` 会读出 `None`，下一个 chunk 里
-        `tag.media_count += 1` 就会炸 `TypeError`。"""
+        SAVEPOINT 回滚失效，库里压根没有对应行，下一个 chunk 把它当"已存在"
+        拿去用，`media_tag` 的 INSERT 就会撞外键。
+
+        顺带守住标签计数的回滚语义：第一个 chunk 整体回滚，它那 20 条文档的
+        `media_tag` 行一行都没留下，计数就一份都不能算进去。"""
         from funflix.services.extract import runner as runner_module
         from funflix.services.extract.rule import RuleExtractor
 
@@ -711,10 +746,10 @@ class TestRunnerParseBatch:
         # 文档把「悬疑」标签建进了共享缓存。
         boom_doc_id = docs[5].id
 
-        async def _boom_once(session, doc, outcome, report, cache=None):
+        async def _boom_once(session, doc, outcome, report, cache, seen_deltas):
             if doc.id == boom_doc_id:
                 raise RuntimeError("boom")
-            return await real_phase1(session, doc, outcome, report, cache)
+            return await real_phase1(session, doc, outcome, report, cache, seen_deltas)
 
         monkeypatch.setattr(runner_module, "_persist_phase1", _boom_once)
 
@@ -730,8 +765,45 @@ class TestRunnerParseBatch:
 
         tags = list(await session.scalars(select(Tag).where(Tag.norm_key == "悬疑")))
         assert len(tags) == 1, "同一个标签跨 chunk 只应该有一行，不该被回滚后的坏对象带出重复/异常"
-        assert tags[0].media_count is not None
-        assert tags[0].media_count >= 1
+        linked = await session.scalar(
+            select(func.count()).select_from(media_tag).where(media_tag.c.tag_id == tags[0].id)
+        )
+        assert linked == 1, "只有第二个 chunk 的那一条文档落了库"
+        # 增量不幂等，所以回滚的 chunk 一份都不能合并进来——算进去就是 6 或 20。
+        assert tags[0].media_count == 1
+
+    @pytest.mark.asyncio
+    async def test_tag_count_is_added_to_not_overwritten(self, session) -> None:
+        """标签计数走算术 UPDATE（`media_count = media_count + :d`），不是绝对值。
+
+        这是**并发正确性**的回归：ORM 的 `tag.media_count += 1` 会被刷成"读到
+        5 就写 6"的绝对值 UPDATE，两个 parse 进程同时挂上同一个标签时，后提交
+        的那个把前一个的 +1 盖掉。生产库只有一千多个标签行、几乎每条文档都会
+        挂上大热标签，所以这不是理论问题。
+
+        这里用"落库之前先把计数置成一个别处写进来的值"来替代真并发：算术
+        UPDATE 必须在那个值上**往上加**，绝对值 UPDATE 则会把它抹掉。
+        """
+        from funflix.services.extract.rule import RuleExtractor
+
+        docs = [
+            make_doc(
+                i, content=f"名称：测试剧集{i}\n标签：#悬疑\n链接：https://pan.quark.cn/s/fk{i:06d}"
+            )
+            for i in range(1, 4)
+        ]
+        session.add_all(docs)
+        # 假装另一个进程已经给「悬疑」攒了 1000 个作品。
+        session.add(Tag(kind=TagKind.GENRE, name="悬疑", norm_key="悬疑", media_count=1000))
+        await session.commit()
+
+        await parse_batch(session, docs, RuleExtractor())
+        await session.commit()
+
+        tag = await session.scalar(select(Tag).where(Tag.norm_key == "悬疑"))
+        assert tag is not None
+        await session.refresh(tag)
+        assert tag.media_count == 1003, "应该是在 1000 上加 3，而不是被这一批的 3 盖掉"
 
     @pytest.mark.asyncio
     async def test_counter_refresh_runs_once_for_the_whole_batch(

@@ -1607,6 +1607,10 @@ def parse(
     ] = max(8, os.cpu_count() or 1),
     doc_id: Annotated[uuid.UUID | None, typer.Option(help="只解析指定文档")] = None,
     force: Annotated[bool, typer.Option(help="忽略缓存，强制重新抽取")] = False,
+    shard: Annotated[
+        str | None,
+        typer.Option(help="分片并行，写成 i/N（如 0/8）：只处理 id 末位落在第 i 片的文档"),
+    ] = None,
 ) -> None:
     """抽取：把原始文本解析成作品与资源。
 
@@ -1619,16 +1623,33 @@ def parse(
     `extract()`（通常是耗时的网络/LLM 调用），一个消费者线程每攒够
     `--write-batch` 条就批量预读去重键、落库、提交一次。两条文档若抽出同一部
     作品会撞库唯一约束，静默回滚重试、不计入失败次数，属预期行为。
+
+    库在远端时（本机到阿里云 RDS 实测往返 131ms）瓶颈是网络往返而不是 CPU，
+    调大 `--concurrency` 不会提速——落库全程只有一个消费者线程。这时用
+    `--shard i/N` 开 N 个进程并行推同一个队列，各片按 id 末位取模互斥，
+    不重不漏。切漏了的后果只是那些文档留在 pending，补跑一遍不带
+    `--shard` 的即可收干净。
     """
     from funflix.base.db import session_scope
     from funflix.models import RawDocument
-    from funflix.services.extract.concurrent_runner import count_pending, run_parse_pipeline
+    from funflix.services.extract.concurrent_runner import (
+        count_pending,
+        parse_shard,
+        run_parse_pipeline,
+    )
     from funflix.services.extract.registry import (
         default_extractor_for,
         get_extractor,
         supported_extractors,
     )
     from funflix.services.extract.runner import parse_document
+
+    shard_spec: tuple[int, int] | None = None
+    if shard is not None:
+        try:
+            shard_spec = parse_shard(shard)
+        except ValueError as exc:
+            _fail(str(exc))
 
     if extractor is not None:
         try:
@@ -1658,7 +1679,7 @@ def parse(
 
         async def _count() -> int:
             async with session_scope() as session:
-                return await count_pending(session, limit=limit)
+                return await count_pending(session, limit=limit, shard=shard_spec)
 
         total = _run(_count)
         if not total:
@@ -1669,7 +1690,8 @@ def parse(
         # 期间会有新文档变成待处理（比如 collect 还在并发写入）。改成跟着
         # 生产者实际入队的条数动态长，分子是消费者已处理（成功或失败）的条数，
         # 两者都是流水线的真实累计计数，不是启动前的一次性快照。
-        bar = tqdm(total=0, desc="解析", unit="条", leave=False, disable=total <= 1)
+        desc = "解析" if shard_spec is None else f"解析[{shard_spec[0]}/{shard_spec[1]}]"
+        bar = tqdm(total=0, desc=desc, unit="条", leave=False, disable=total <= 1)
         bar.set_postfix_str(f"{concurrency} 线程")
 
         def _on_progress(total: int, done: int) -> None:
@@ -1685,6 +1707,7 @@ def parse(
                 write_batch=write_batch,
                 concurrency=concurrency,
                 force=force,
+                shard=shard_spec,
                 on_progress=_on_progress,
             )
         finally:

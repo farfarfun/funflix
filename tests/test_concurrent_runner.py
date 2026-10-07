@@ -20,11 +20,14 @@ from funflix.base.config import Settings
 from funflix.base.enums import ParseStatus, SourceType
 from funflix.models import Base, Media, RawDocument, Resource, utcnow
 from funflix.services.extract.concurrent_runner import (
+    _HEX_DIGITS,
     _ParseConsumer,
     _pipeline_counts,
     _pipeline_pending,
     count_pending,
+    parse_shard,
     run_parse_pipeline,
+    shard_digits,
 )
 from funflix.services.extract.rule import RuleExtractor
 
@@ -106,6 +109,38 @@ class TestRunParsePipeline:
             assert len(media_rows) == 1, "同一部作品被多次 flush 重复建了"
             resource_rows = list(await session.scalars(select(Resource)))
             assert len(resource_rows) == 6
+
+    @pytest.mark.asyncio
+    async def test_sharded_runs_cover_every_document_exactly_once(self, db_url) -> None:
+        """4 片依次跑完，等价于不分片跑一遍：每条文档恰好被处理一次。
+
+        这是 `--shard` 存在的唯一理由，也是它唯一的风险点。生产环境 4 片是
+        并行跑的，这里串行跑——要验的是**谓词把队列切干净了**，不是线程安全
+        （各片进程之间除了数据库没有共享状态）。
+
+        用 `len(reports)` 而不是只看状态：重复解析同一条文档也会让它停在 DONE，
+        只查状态看不出来，报告条数才会露出多出来的那一次。
+        """
+        total_docs, shards = 24, 4
+        async with open_session(db_url) as session:
+            session.add_all([make_doc(n) for n in range(1, total_docs + 1)])
+            await session.commit()
+
+        settings = Settings(database_url=db_url)
+        processed: list[object] = []
+        for i in range(shards):
+            reports = run_parse_pipeline(
+                extractor_name="rule", settings=settings, concurrency=1, shard=(i, shards)
+            )
+            assert all(r.ok for r in reports), [r.error for r in reports if not r.ok]
+            processed.extend(r.document_id for r in reports)
+
+        assert len(processed) == total_docs, "有文档被漏掉或被重复解析了"
+        assert len(set(processed)) == total_docs, "同一条文档出现在多个分片里"
+        async with open_session(db_url) as session:
+            docs = list(await session.scalars(select(RawDocument)))
+            assert {d.parse_status for d in docs} == {ParseStatus.DONE}
+            assert len(list(await session.scalars(select(Media)))) == total_docs
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_extract_and_reports_from_cache(
@@ -341,3 +376,93 @@ class TestCountPending:
         await session.commit()
 
         assert await count_pending(session, limit=2) == 2
+
+
+class TestParseShard:
+    """`--shard i/N` 的解析与校验。"""
+
+    def test_parses_index_and_total(self) -> None:
+        assert parse_shard("0/8") == (0, 8)
+        assert parse_shard("7/8") == (7, 8)
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "3",  # 没有斜杠
+            "a/8",  # 序号不是整数
+            "0/x",  # 总数不是整数
+            "0/0",  # 总片数必须是正数
+            "0/-2",
+            "8/8",  # 序号从 0 开始，上界是开区间
+            "9/8",
+            "-1/8",
+        ],
+    )
+    def test_rejects_malformed_or_out_of_range(self, spec: str) -> None:
+        with pytest.raises(ValueError):
+            parse_shard(spec)
+
+
+class TestShardDigits:
+    """分片必须既不重也不漏——这是多进程并行不重复解析的全部依据。"""
+
+    @pytest.mark.parametrize("total", list(range(1, 17)))
+    def test_every_digit_belongs_to_exactly_one_shard(self, total: int) -> None:
+        buckets = [shard_digits(i, total) for i in range(total)]
+        union: list[str] = [d for bucket in buckets for d in bucket]
+
+        assert sorted(union) == sorted(_HEX_DIGITS), f"{total} 片没有覆盖全部十六进制字符"
+        assert len(union) == len(set(union)), f"{total} 片之间有重叠"
+
+    @pytest.mark.parametrize("total", [1, 2, 4, 8, 16])
+    def test_divisors_of_sixteen_split_evenly(self, total: int) -> None:
+        """16 的因数要严格等量；其余片数允许差一个字符，不额外约束。"""
+        sizes = {len(shard_digits(i, total)) for i in range(total)}
+
+        assert sizes == {16 // total}
+
+
+class TestCountPendingSharded:
+    """分片谓词得在真库上成立。
+
+    谓词是 `lower(substr(id::text, length(id::text), 1))`，依赖主键在该方言下
+    的**文本形态**：PG 上是原生 uuid 转文本（带连字符），SQLite 上是
+    `sa.Uuid` 存的 32 位十六进制串。两边末位字符都是 uuid 的最后一位十六进制数，
+    所以谓词可移植——但这件事只能在真库上跑一遍才算证明，纯单元测试覆盖不到。
+    """
+
+    @pytest.mark.asyncio
+    async def test_shards_partition_the_pending_queue(self, session) -> None:
+        total_docs = 64
+        session.add_all([make_doc(n) for n in range(1, total_docs + 1)])
+        await session.commit()
+
+        assert await count_pending(session, limit=None) == total_docs
+
+        counts = [await count_pending(session, limit=None, shard=(i, 4)) for i in range(4)]
+
+        assert sum(counts) == total_docs, f"4 片加起来漏了或重了：{counts}"
+        assert all(c > 0 for c in counts), f"uuid7 末位随机，64 条不该有空片：{counts}"
+
+    @pytest.mark.asyncio
+    async def test_single_shard_is_the_whole_queue(self, session) -> None:
+        """`N=1` 等价于不分片——谓词应当被整个省掉，而不是退化成某一片。"""
+        session.add_all([make_doc(n) for n in range(1, 11)])
+        await session.commit()
+
+        assert await count_pending(session, limit=None, shard=(0, 1)) == 10
+
+    @pytest.mark.asyncio
+    async def test_shard_respects_the_other_pending_conditions(self, session) -> None:
+        """分片只是**再加**一个谓词，不能放宽状态/退避这两道原有条件。"""
+        from datetime import timedelta
+
+        session.add_all([make_doc(n, parse_status=ParseStatus.DONE) for n in range(1, 21)])
+        session.add_all(
+            [make_doc(n, next_parse_at=utcnow() + timedelta(hours=1)) for n in range(21, 41)]
+        )
+        await session.commit()
+
+        counts = [await count_pending(session, limit=None, shard=(i, 4)) for i in range(4)]
+
+        assert sum(counts) == 0, f"已完成和未到期的文档被分片放进来了：{counts}"
