@@ -44,8 +44,10 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from farlog import getLogger
 from funworker import SKIP, BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from funflix.base.config import Settings, get_settings
@@ -87,6 +89,29 @@ async def count_due(session: AsyncSession, *, recheck_all: bool, limit: int | No
 #: 睡在 `produce()` 里的时间是不响应 `stop()` 的。
 _IDLE_SLEEP = 0.05
 
+#: 一批落库撞上并发写入冲突时，总共尝试几次（含第一次）。
+_FLUSH_RETRIES = 3
+
+#: 落库重试的退避基数（秒），第 n 次重试前睡 `n * 基数`。
+_FLUSH_RETRY_BACKOFF = 0.5
+
+#: Postgres 的并发写入冲突 SQLSTATE：40001 序列化失败、40P01 检测到死锁。
+#: 两者都是**瞬时**的 —— 冲突的另一方已经提交完，重试就过。
+_WRITE_CONFLICT_SQLSTATES = frozenset({"40001", "40P01"})
+
+logger = getLogger("funflix")
+
+
+def _is_write_conflict(err: DBAPIError) -> bool:
+    """判断一个数据库异常是不是「重试就能过」的并发写入冲突。
+
+    看 SQLSTATE 而不是 `isinstance` 具体的驱动异常类：asyncpg 的
+    `DeadlockDetectedError` 会被 SQLAlchemy 包成通用的 `DBAPIError`，具体
+    子类反而抓不到（同 `services/sync/runner.py` 里的说明）。SQLite 没有
+    这些状态码，所以本地测试走不到重试分支 —— 这条路只在 Postgres 上生效。
+    """
+    return getattr(err.orig, "sqlstate", None) in _WRITE_CONFLICT_SQLSTATES
+
 
 class _VerifyProducer(BaseProducer):
     """**按网盘拆队列**：每个网盘一条独立的翻页游标 + 一个本地缓冲区，
@@ -117,6 +142,7 @@ class _VerifyProducer(BaseProducer):
         batch_size: int,
         recheck_all: bool,
         rate_limiter: BlockingRateLimiter,
+        max_seconds: float | None = None,
         name: str | None = None,
     ) -> None:
         """初始化生产者。
@@ -133,6 +159,12 @@ class _VerifyProducer(BaseProducer):
             rate_limiter: 按网盘限速的令牌桶。这里只用它的非阻塞接口
                 `try_acquire`，**不要**换成 `acquire` —— 生产者只有一个线程，
                 在这儿睡等某个网盘就把别的网盘也一起堵住了。
+            max_seconds: 墙上时间预算（秒），到点就停止产出；None 表示不设。
+                跟 `limit` 是两种不同的闸门，**要的是前者**：这条流水线的
+                吞吐由网盘限速决定（阿里 1 次/秒），所以"多少条"换算成
+                "多少时间"取决于队列里各网盘的占比，没法事先定准。
+                GitHub Action 里 job 有硬超时，算错就是整轮被判 cancelled、
+                连已经探完的结论都看不出跑没跑完。
             name: 线程名，透传给 `BaseProducer`。
         """
         super().__init__(output_queue, name=name)
@@ -141,6 +173,7 @@ class _VerifyProducer(BaseProducer):
         self.batch_size = batch_size
         self.recheck_all = recheck_all
         self.rate_limiter = rate_limiter
+        self.max_seconds = max_seconds
 
     def on_start(self) -> None:
         """线程启动时建立专属事件循环、数据库引擎，并重置每个网盘的翻页游标。"""
@@ -158,6 +191,9 @@ class _VerifyProducer(BaseProducer):
         self._last_id: dict[Provider, uuid.UUID] = {p: uuid.UUID(int=0) for p in self._order}
         self._exhausted: dict[Provider, bool] = {p: False for p in self._order}
         self._remaining_limit = self.limit
+        self._deadline = (
+            None if self.max_seconds is None else time.monotonic() + max(0.0, self.max_seconds)
+        )
 
     def on_stop(self) -> None:
         """线程退出前释放数据库引擎并关闭事件循环。"""
@@ -179,8 +215,12 @@ class _VerifyProducer(BaseProducer):
 
         Raises:
             StopIteration: 每个网盘都翻到最后一页、缓冲区也都空了，或者已经吐满
-                `limit` 条。
+                `limit` 条，或者超了 `max_seconds` 的墙上时间预算。
         """
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            # 到点就收工。已经吐出去的那些会被下游正常探完、正常落库 ——
+            # 收尾只等队列排空（见 `run_verify_pipeline` 的轮询），不丢结果。
+            raise StopIteration
         if self._remaining_limit is not None and self._remaining_limit <= 0:
             raise StopIteration
 
@@ -378,6 +418,30 @@ class _VerifyConsumer(BaseBatchConsumer):
         self._aio_loop.run_until_complete(self._flush_batch(items))
 
     async def _flush_batch(self, items: list[dict[str, Any]]) -> None:
+        """落一批，撞上并发写入冲突时重试几次。
+
+        `resource` 同时被别的节点写（CI 里 parse 在重建资源、`db relink-checks`
+        在按 5000 行一批回填历史结论），行锁的加锁顺序跟我们这批不一致就会死锁。
+        实测一轮 323 条里有 2 批（40 条）栽在这上面，异常直接抛出去被
+        `BaseConsumer._loop` 吞掉记个 traceback —— 那 40 条探测白做了（行还是
+        UNCHECKED，下轮重新探一遍）。
+        """
+        for attempt in range(_FLUSH_RETRIES):
+            try:
+                await self._flush_once(items)
+                return
+            except DBAPIError as err:
+                if not _is_write_conflict(err) or attempt == _FLUSH_RETRIES - 1:
+                    raise
+                # 死锁是**瞬时**的：Postgres 只牺牲一方，另一方已经提交完了，
+                # 重试基本就过。退避递增，别抢着跟对面再撞一次。
+                delay = _FLUSH_RETRY_BACKOFF * (attempt + 1)
+                logger.warning(
+                    f"落库撞车（第 {attempt + 1} 次），{delay:.1f}s 后重试这批 {len(items)} 条"
+                )
+                await asyncio.sleep(delay)
+
+    async def _flush_once(self, items: list[dict[str, Any]]) -> None:
         resource_ids = [it["resource_id"] for it in items]
         reports: list[VerifyReport] = []
         async with self._sessionmaker() as session:
@@ -429,6 +493,7 @@ def run_verify_pipeline(
     concurrency: int = 8,
     rate: float = 5.0,
     recheck_all: bool = False,
+    max_seconds: float | None = None,
     settings: Settings | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[VerifyReport]:
@@ -442,6 +507,10 @@ def run_verify_pipeline(
 
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，理由同
     `services/extract/concurrent_runner.py::run_parse_pipeline`。
+
+    `max_seconds` 是**墙上时间**预算：到点后生产者不再吐新的，但本函数要等
+    已经吐出去的全部探完、全部落库才返回，所以实际耗时会略超预算（取决于
+    最后一批探测的网络延迟）。设它的时候给外层超时留余量。
     """
     settings = settings or get_settings()
     num_workers = max(1, concurrency)
@@ -456,12 +525,25 @@ def run_verify_pipeline(
         # 令牌早就花光而请求还排在队里，到达网盘的瞬时速率就跟设定值脱钩了。
         # 卡在 `num_workers * 2`，让生产节奏跟着线程的实际消化速度走。
         input_maxsize=num_workers * 2,
+        # 输出队列也限长，否则探测端会把结果一路堆在队列里跑在落库前面：实测
+        # 60 秒预算的一轮里生产端准时停了（吐了 323 条），但库里撞上并发写入
+        # 锁竞争，落库只跑到 1.3 条/秒，整轮拖到 3 分 35 秒才收尾 —— 时间预算
+        # 就形同虚设了。限长之后反压会一级级顶回生产端（满 → 探测线程阻塞在
+        # put → 输入队列满 → 生产者卡在 `_put`），到点时未落库的尾巴最多几十条。
+        # 代价是整体吞吐被落库速度卡住，但探得比记得快本来就没有意义。
+        #
+        # 这么卡不会把收尾卡死：`Pipeline.stop()` 是先停生产者、再 `drain` 各级
+        # 处理单元、**最后**才给消费者发 STOP，排空期间消费者一直在取数据；
+        # 而 `BaseConsumer._loop` 把 `consume` 的异常吞掉只记日志，消费者线程
+        # 也不会因为一次落库失败就死掉、把上游永久堵在满队列上。
+        output_maxsize=write_batch * 2,
         producer_kwargs={
             "settings": settings,
             "limit": limit,
             "batch_size": batch_size,
             "recheck_all": recheck_all,
             "rate_limiter": BlockingRateLimiter(rate_per_second=rate),
+            "max_seconds": max_seconds,
         },
         consumer_kwargs={
             "settings": settings,

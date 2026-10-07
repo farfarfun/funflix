@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from funflix.base.config import Settings
@@ -371,6 +372,61 @@ class TestProviderQueues:
         assert len(reports) == 3
 
 
+class TestMaxSeconds:
+    """墙上时间预算：到点停止产出，但已经吐出去的要正常探完、正常落库。
+
+    有这个闸门是因为 `--limit` 控不住时长：吞吐由最慢那个网盘的限速决定，
+    「多少条」能跑多久取决于待校验队列里各网盘的占比（线上 77% 是阿里云盘，
+    1 次/秒），事先算不准。GitHub Action 的 `timeout-minutes` 一到就是整轮
+    cancelled，连已经探完的结论都看不出跑没跑完。
+    """
+
+    @pytest.mark.asyncio
+    async def test_budget_expires_without_losing_finished_work(self, db_url, monkeypatch) -> None:
+        monkeypatch.setattr(cr, "get_probe", fake_get_probe)
+        async with open_session(db_url) as session:
+            session.add_all([make_resource(n) for n in range(1, 11)])
+            await session.commit()
+
+        # 1 次/秒 × 10 条 = 跑满要 10 秒，预算只给 2 秒
+        reports = cr.run_verify_pipeline(
+            settings=Settings(database_url=db_url), concurrency=2, rate=1.0, max_seconds=2.0
+        )
+
+        assert 1 <= len(reports) < 10, "预算没起作用（跑完了）或一条都没来得及探"
+        async with open_session(db_url) as session:
+            rows = list(await session.scalars(select(Resource)))
+        # 吐出去的全部落了库，剩下的一条没动——下一轮接着往下走
+        attempted = [r for r in rows if r.check_attempts]
+        assert len(attempted) == len(reports)
+        assert all(r.check_attempts == 1 for r in attempted)
+
+    @pytest.mark.asyncio
+    async def test_zero_budget_stops_before_touching_the_database(self, db_url) -> None:
+        """预算算成 0 或负数时立刻收工，不是当成「不限」。"""
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        async with open_session(db_url) as session:
+            session.add(make_resource(1))
+            await session.commit()
+
+        producer = cr._VerifyProducer(
+            queue.Queue(),
+            settings=Settings(database_url=db_url),
+            limit=None,
+            batch_size=10,
+            recheck_all=False,
+            rate_limiter=BlockingRateLimiter(rate_per_second=0.0),
+            max_seconds=0.0,
+        )
+
+        def body() -> None:
+            with pytest.raises(StopIteration):
+                producer.produce()
+
+        await TestProviderQueues._in_thread(producer, body)
+
+
 class TestPipelinePending:
     def test_pending_sums_both_queue_backlogs(self) -> None:
         """理由同 `tests/test_concurrent_runner.py::TestPipelinePending`。"""
@@ -461,6 +517,76 @@ class TestVerifyConsumerFlushInterval:
             thread.join(timeout=2)
 
         assert flushed == [[{"resource_id": 1}], [{"resource_id": 2}]]
+
+
+class TestFlushRetry:
+    """落库撞上并发写入冲突时重试，而不是把这批探测结果丢掉。
+
+    `resource` 同时被别的节点写（parse 在重建资源、`relink-checks` 在批量回填
+    历史结论），加锁顺序不一致就会死锁。实测线上一轮 323 条里有 40 条栽在这上面。
+    """
+
+    @staticmethod
+    def _conflict(sqlstate: str) -> DBAPIError:
+        orig = Exception("deadlock detected")
+        orig.sqlstate = sqlstate  # type: ignore[attr-defined]
+        return DBAPIError("UPDATE resource ...", {}, orig)
+
+    def _consumer(self) -> _VerifyConsumer:
+        return _VerifyConsumer(
+            queue.Queue(),
+            settings=Settings(database_url="sqlite+aiosqlite:///:memory:"),
+            write_batch=20,
+        )
+
+    @pytest.mark.asyncio
+    async def test_deadlock_is_retried(self, monkeypatch) -> None:
+        consumer = self._consumer()
+        monkeypatch.setattr(cr, "_FLUSH_RETRY_BACKOFF", 0.0)
+        attempts: list[int] = []
+
+        async def flaky(items):
+            attempts.append(len(items))
+            if len(attempts) == 1:
+                raise self._conflict("40P01")
+
+        monkeypatch.setattr(consumer, "_flush_once", flaky)
+        await consumer._flush_batch([{"resource_id": 1}])
+
+        assert attempts == [1, 1], "死锁应该重试一次就过"
+
+    @pytest.mark.asyncio
+    async def test_retries_are_bounded(self, monkeypatch) -> None:
+        """重试不是无限的：对面要是一直占着锁，得报出来而不是卡死整条流水线。"""
+        consumer = self._consumer()
+        monkeypatch.setattr(cr, "_FLUSH_RETRY_BACKOFF", 0.0)
+        attempts: list[int] = []
+
+        async def always_conflict(items):
+            attempts.append(1)
+            raise self._conflict("40001")
+
+        monkeypatch.setattr(consumer, "_flush_once", always_conflict)
+        with pytest.raises(DBAPIError):
+            await consumer._flush_batch([{"resource_id": 1}])
+
+        assert len(attempts) == cr._FLUSH_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_other_database_errors_are_not_retried(self, monkeypatch) -> None:
+        """只重试瞬时冲突。约束违反之类的重试一万次也是同样的结果，白等。"""
+        consumer = self._consumer()
+        attempts: list[int] = []
+
+        async def broken(items):
+            attempts.append(1)
+            raise self._conflict("23505")  # unique_violation
+
+        monkeypatch.setattr(consumer, "_flush_once", broken)
+        with pytest.raises(DBAPIError):
+            await consumer._flush_batch([{"resource_id": 1}])
+
+        assert attempts == [1]
 
 
 class TestCountDue:

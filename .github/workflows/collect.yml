@@ -155,8 +155,17 @@ jobs:
       - name: Relink
         run: uv run $UV_SYNC_EXTRAS funflix db relink-checks --yes
 
+      # 用 `--max-seconds` 而不是靠 `--limit` 卡时长：吞吐由最慢那个网盘的
+      # 限速决定（阿里云盘 1 次/秒），而待校验队列里阿里占了 77%，所以
+      # 「一万条」要跑两个多小时 —— 之前每轮都撞 `timeout-minutes: 120`，
+      # 整个 run 被判 cancelled，别的 job 全绿也看不出来。
+      #
+      # 先用 300 秒（5 分钟）跑通闭环 —— 确认这个节点在 Action 上真的能正常
+      # 收尾、不再被判超时之后，再放大到接近 `timeout-minutes` 的预算。
+      # 到点后生产端停止取新资源，已经探出来的结论照常落库，下一轮顺着
+      # `last_checked_at` 游标接着往下走 —— 少量多次、持续推进。
       - name: Verify
-        run: uv run $UV_SYNC_EXTRAS funflix verify --limit 10000
+        run: uv run $UV_SYNC_EXTRAS funflix verify --max-seconds 300
 
   # 规则搞不定的归一残局交给 LLM：`刀锋战士 / 刀锋战士1 / 刀锋战士2 / 刀锋战士3`
   # 这种一个候选块里好几个候选项的，正则判不出它们是不是同一部作品的不同季。

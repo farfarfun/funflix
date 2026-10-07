@@ -1757,6 +1757,10 @@ def verify(
     recheck_all: Annotated[
         bool, typer.Option("--recheck-all", help="忽略复查时间，重校验全部可校验资源")
     ] = False,
+    max_seconds: Annotated[
+        float | None,
+        typer.Option(help="墙上时间预算（秒），到点就不再取新资源、收尾退出；默认不设"),
+    ] = None,
 ) -> None:
     """校验：探测网盘链接现在还能不能用。
 
@@ -1769,6 +1773,11 @@ def verify(
 
     `--rate` 是全局值，扛不住它的网盘由 `services/verify/runner.py` 的
     `PROVIDER_RATE_LIMITS` 单独下调（目前只有阿里云盘，实测数据在那里）。
+
+    跑在有硬超时的环境里（GitHub Action 的 `timeout-minutes`）要带
+    `--max-seconds`，别用 `--limit` 控时长：吞吐由最慢那个网盘的限速决定，
+    「多少条」能跑多久取决于待校验队列里各网盘的占比，事先算不准，算多了
+    就是整轮被判超时取消。到点后已经探完的结论都已落库，下轮接着往下走。
     """
     from funflix.base.db import session_scope
     from funflix.models import Resource
@@ -1828,6 +1837,7 @@ def verify(
                 concurrency=concurrency,
                 rate=rate,
                 recheck_all=recheck_all,
+                max_seconds=max_seconds,
                 on_progress=_on_progress,
             )
         finally:

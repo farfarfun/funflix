@@ -301,23 +301,33 @@ class TestInvocationConventions:
         ("funflix", "db", "relink-checks"),
     }
 
+    #: 单轮闸门的几种形式，有一个就算合格。
+    #:
+    #: `--max-seconds` 和 `--limit` 一样是闸门，只是量的是时间而不是条数 ——
+    #: `verify` 用的就是它：那条流水线的吞吐由最慢那个网盘的限速决定，
+    #: 「多少条」能跑多久取决于待校验队列里各网盘的占比，用条数算时间算不准，
+    #: 算多了就是整轮撞 `timeout-minutes` 被判 cancelled。
+    _THROTTLES = ("--limit", "--max-seconds")
+
     @pytest.mark.parametrize("call", FUNFLIX_CALLS, ids=_ids(FUNFLIX_CALLS))
     def test_queue_consumers_are_throttled(self, call: UvCall) -> None:
-        """有 `--limit` 的命令都得传 —— 除了上面那两个有记录在案的例外。
+        """能限量/限时的命令都得带上闸门 —— 除了上面那两个有记录在案的例外。
 
-        `--limit` 是单轮处理量的闸门：踩到脏数据死循环重试时，影响范围限于
-        这一批而不是整个队列；`canon resolve` 更直接，它是**钱**的闸门。
+        闸门是单轮处理量的上限：踩到脏数据死循环重试时，影响范围限于这一批
+        而不是整个队列；`canon resolve` 更直接，它是**钱**的闸门。
         """
         command, args = _resolve(call.argv)
-        if "--limit" not in _option_names(command):
+        available = [opt for opt in self._THROTTLES if opt in _option_names(command)]
+        if not available:
             return
+        passed = _passed_options(args)
         if any(call.argv[: len(prefix)] == prefix for prefix in self._UNTHROTTLED):
-            assert "--limit" not in _passed_options(args), (
+            assert not [opt for opt in available if opt in passed], (
                 f"{call.where}：`{' '.join(call.argv)}` 不该限量，见 _UNTHROTTLED 的说明"
             )
             return
-        assert "--limit" in _passed_options(args), (
-            f"{call.where}：`{' '.join(call.argv)}` 漏了 --limit"
+        assert [opt for opt in available if opt in passed], (
+            f"{call.where}：`{' '.join(call.argv)}` 漏了闸门（{' / '.join(available)} 任选其一）"
         )
 
     def test_repair_apply_does_not_force(self) -> None:
