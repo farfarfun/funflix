@@ -224,6 +224,86 @@ class TestRealCorpusRegressions:
         """清单序号 `No 027`，生产库里 266 行且全部在行首。"""
         assert clean_title(raw) == expected
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("金钱游戏 全", "金钱游戏"),  # 全集 / 全40集 被集数正则啃掉一半
+            ("小心许愿 硬", "小心许愿"),  # 硬字幕
+            ("老九门 版", "老九门"),  # 修复版 / 蓝光版
+            ("疾速反击 补", "疾速反击"),  # 补档
+            ("翘楚 完", "翘楚"),  # 完结
+            ("种群 2G 集", "种群"),
+            ("好奇号 杂志 年", "好奇号 杂志"),
+            ("切尔诺贝利 DV&HDR 特效", "切尔诺贝利"),  # 硬字幕特效
+        ],
+    )
+    def test_single_character_noise_residue_is_stripped(self, raw: str, expected: str) -> None:
+        """复合噪声词被啃掉一半剩下的光杆单字，这八个字挂着 853 行 work。"""
+        assert clean_title(raw) == expected
+
+    @pytest.mark.parametrize(
+        "title",
+        ["完美世界", "盗版时代", "集结号", "超能陆战队", "声之形", "全职高手", "补习班"],
+    )
+    def test_single_character_rule_is_token_level_not_substring(self, title: str) -> None:
+        """上一条只在那个字**独立成 token** 时生效，否则这些片名全得洗烂。"""
+        assert clean_title(title) == title
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("雷霆扫毒 11 3GB", "雷霆扫毒"),  # 小数点在前面已被换成空格
+            ("实测给了我2TB", "实测给了我"),
+            ("某片 2GB", "某片"),
+        ],
+    )
+    def test_file_size_is_stripped(self, raw: str, expected: str) -> None:
+        """体积不是作品身份。左边界不能用 `(?<!\\w)` —— `\\w` 在 Python 里含汉字。"""
+        assert clean_title(raw) == expected
+
+    def test_size_rule_does_not_eat_men_in_black(self) -> None:
+        """单位刻意不收 `MiB` —— 整条正则带 `IGNORECASE`，收了 `3 MIB` 就被当体积。"""
+        assert clean_title("黑衣人3 MIB星际战警3") == "黑衣人3 MIB星际战警3"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("镀金时代 豆瓣8 6", "镀金时代"),  # 不带「分」，靠 `豆瓣` 这个标记认
+            ("杀她 KillHer IMDB 8 7", "杀她 KillHer"),
+        ],
+    )
+    def test_marker_led_rating_without_the_unit_is_stripped(self, raw: str, expected: str) -> None:
+        """`豆瓣` / `IMDB` 本身是足够强的标记，不必再要求「分」字兜底。"""
+        assert clean_title(raw) == expected
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("早春晴朗 4KHQHDR60FPS", "早春晴朗"),  # 连写
+            ("花开锦绣 10bi &FLAC无损HiFi声", "花开锦绣"),
+            ("中情局律师 SDR&HDR", "中情局律师"),  # `&` 串起来的
+            ("纽约失婴记 HDR&DV", "纽约失婴记"),
+            ("樱桃新滋味 &Dv", "樱桃新滋味"),  # 只剩半边的 `&`
+        ],
+    )
+    def test_av_spec_run_is_stripped(self, raw: str, expected: str) -> None:
+        """`4KHQHDR` 不能靠逐个剥：摘走 `4K` 之后 `hq` 两边都是字母，`\\bhq\\b` 对不上。"""
+        assert clean_title(raw) == expected
+
+    @pytest.mark.parametrize("title", ["DV时代", "HD世界", "4K先生"])
+    def test_av_spec_run_needs_two_segments(self, title: str) -> None:
+        """单独一段只能按 token 剔 —— 按子串剥会洗烂这些片名。"""
+        assert clean_title(title) == title
+
+    @pytest.mark.parametrize("title", ["Tom & Jerry", "王赫野 & 黄龄 过海"])
+    def test_ampersand_between_real_words_is_kept(self, title: str) -> None:
+        """光杆 `&` 不判噪声：《Tom & Jerry》里它是标题的一部分。
+
+        两边都被剥空剩下的那个 `&`（`花开锦绣 &`）由末尾的 `strip` 收掉，
+        那一步只动首尾，碰不到这里。
+        """
+        assert clean_title(title) == title
+
 
 #: 幂等性用例。前一半是生产库 `repair scan` 实测吐出来的真实标题，
 #: 后一半是各条「剥前缀」规则的正例 —— 它们必须照旧被剥掉，
@@ -264,6 +344,17 @@ _IDEMPOTENCE_CORPUS = (
     "误杀 简英",
     "中国 蓝盔",
     "No 027 唐伯虎点秋香",
+    "金钱游戏 全",
+    "小心许愿 硬",
+    "种群 2G 集",
+    "完美世界",
+    "盗版时代",
+    "雷霆扫毒 11 3GB",
+    "黑衣人3 MIB星际战警3",
+    "镀金时代 豆瓣8 6",
+    "早春晴朗 4KHQHDR60FPS",
+    "切尔诺贝利 DV&HDR 特效",
+    "Tom & Jerry",
 )
 
 
