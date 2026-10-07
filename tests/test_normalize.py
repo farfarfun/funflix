@@ -124,6 +124,106 @@ class TestRealCorpusRegressions:
         """`:导演你有病` 是真片名。靠 `strip_scrape_labels()` 的 start < 2 闸挡住。"""
         assert clean_title(":导演你有病 導演你有病") == "导演你有病 導演你有病"
 
+    def test_year_with_its_suffix_is_stripped_before_tokenizing(self) -> None:
+        """`2001年剧情片` 整条剥掉，不能只摘走年份。
+
+        `_YEAR_RE` 排在 token 级剔除**之后**，摘走 `2001` 就收工了，留下的
+        `年剧情片` 再也没人看一眼 —— 而它其实就在 `_TOKEN_NOISE` 里，只是
+        轮不到。生产库 83,820 行 work 里有 17,753 行（21%）顶着这个残渣，
+        每个写法单独裂一行。见 `_YEAR_SUFFIX_RE`。
+        """
+        assert clean_title("某片 2001年剧情片") == "某片"
+        assert clean_title("1998年香港电影 喜剧片 整容日记") == "整容日记"
+        # 季号照旧保留 —— 它是作品身份的一部分
+        assert clean_title("某剧 2024年 第2季") == "某剧 第2季"
+
+    def test_bare_year_character_is_kept(self) -> None:
+        """`_YEAR_SUFFIX_RE` 只认带四位年份的写法：光杆「年」是正常汉字。"""
+        assert clean_title("年会不能停") == "年会不能停"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("真心半解 8 0分", "真心半解"),  # 小数点在前面已被换成空格
+            ("莲花楼 豆瓣8 5分", "莲花楼"),
+            ("某片 7.5分", "某片"),
+        ],
+    )
+    def test_rating_is_stripped(self, raw: str, expected: str) -> None:
+        """评分不是作品身份：同一部片评分变一下就多裂一行。生产库里 1,603 行。"""
+        assert clean_title(raw) == expected
+
+    @pytest.mark.parametrize("title", ["分手大师", "某纪录片 120分钟", "第9分队", "三分之一"])
+    def test_rating_rule_does_not_eat_other_uses_of_the_character(self, title: str) -> None:
+        """「分」前面有数字还不够，后面跟着量词就不是评分。见 `_RATING_RE`。"""
+        assert "分" in clean_title(title)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("刀锋战士13部全", "刀锋战士"),
+            ("敢死队4部", "敢死队"),
+            ("黑客帝国 4部全", "黑客帝国"),
+            # 前导的 `共` 要一起吃掉，不然留个尾巴
+            ("某系列 共5部", "某系列"),
+            # 整条都是元信息的那 20 行，洗成空串交给 `looks_like_junk_title` 判删
+            ("共16部 ,2部", ""),
+        ],
+    )
+    def test_boxset_quantifier_is_stripped(self, raw: str, expected: str) -> None:
+        """「打包了几部」不是作品身份 —— `刀锋战士13部全` 自己占了一个 work。"""
+        assert clean_title(raw) == expected
+
+    @pytest.mark.parametrize("title", ["西游记 第3部", "第 3部 某片", "俱乐部风云", "第三部曲"])
+    def test_boxset_rule_keeps_the_part_number(self, title: str) -> None:
+        """`第N部` 必须留下：它跟 `第N季` 一样是作品身份的一部分。"""
+        assert "部" in clean_title(title)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("◎译 名 曼哈顿 曼克顿", "曼哈顿 曼克顿"),
+            # 整页字段：挑 `◎片 名` 的值，后面的元数据字段全扔掉
+            ("◎片 名 大话西游之月光宝盒 ◎年 代 1995 ◎产 地 中国香港", "大话西游之月光宝盒"),
+            # 片名字段不在第一个也要挑对（全角空格被 NFKC 换成普通空格）
+            ("◎年　代 1995 ◎译　名 大话西游 ◎产　地 中国香港", "大话西游"),
+            # 第一个 `◎` 前面已经有片名 —— 按截断处理
+            ("大话西游 ◎年 代 1995 ◎产 地 中国香港", "大话西游"),
+        ],
+    )
+    def test_dump_fields_keep_only_the_title_field(self, raw: str, expected: str) -> None:
+        """`◎` 打头的等宽字段页不带冒号，`_SCRAPE_CUT_RE` 一条都切不到。
+
+        生产库里 3,884 行 work 把整页字段串成一行当标题存着。见 `_cut_dump_fields`。
+        """
+        assert clean_title(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw", ["误杀 简英", "某片 繁英", "某片 国日英多", "某片 简 幕", "某片 英特效"]
+    )
+    def test_language_combination_token_is_stripped(self, raw: str) -> None:
+        """语言/字幕组合是**开放**的，穷举字面量永远补不齐。见 `_LANG_COMBO_RE`。"""
+        assert clean_title(raw) in {"误杀", "某片"}
+
+    @pytest.mark.parametrize("title", ["中国机长", "英雄本色", "简爱", "三国演义", "中国 蓝盔"])
+    def test_language_rule_is_token_level_not_substring(self, title: str) -> None:
+        """这些片名的头两个字正好落在那个字符集里，按子串剥会洗烂。"""
+        assert clean_title(title) == title
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("No 027 唐伯虎点秋香", "唐伯虎点秋香"),
+            ("No 1024 狂飙", "狂飙"),
+            # 锚在 `^` 上，行中的 `No` 不动；`Nobody` 后面没有数字，对不上
+            ("Room No 237", "Room No 237"),
+            ("Nobody 的故事", "Nobody 的故事"),
+        ],
+    )
+    def test_list_number_prefix_is_stripped(self, raw: str, expected: str) -> None:
+        """清单序号 `No 027`，生产库里 266 行且全部在行首。"""
+        assert clean_title(raw) == expected
+
 
 #: 幂等性用例。前一半是生产库 `repair scan` 实测吐出来的真实标题，
 #: 后一半是各条「剥前缀」规则的正例 —— 它们必须照旧被剥掉，
@@ -150,6 +250,20 @@ _IDEMPOTENCE_CORPUS = (
     "电视剧：师兄太稳健 (2026)",
     "全民攻防:我有签到系统 作者:奏光 txt",
     "Some.Title.2024.1080p.WEB-DL.H265",
+    # 这一批是 2026-10 那轮生产库噪声扫描新加的规则，每条都得盯幂等
+    "某片 2001年剧情片",
+    "1998年香港电影 喜剧片 整容日记",
+    "年会不能停",
+    "真心半解 8 0分",
+    "莲花楼 豆瓣8 5分",
+    "某纪录片 120分钟",
+    "刀锋战士13部全",
+    "西游记 第3部",
+    "◎译 名 曼哈顿 曼克顿",
+    "◎片 名 大话西游之月光宝盒 ◎年 代 1995 ◎产 地 中国香港",
+    "误杀 简英",
+    "中国 蓝盔",
+    "No 027 唐伯虎点秋香",
 )
 
 
