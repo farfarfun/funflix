@@ -65,6 +65,29 @@
   版本戳是深层重解析的廉价预筛 —— 213 万份文档不可能每次改规则都全量重跑。
   `PARSE_RULES_VERSION` 手工 bump，**刻意不用源码哈希**：改个注释不该让 213 万份
   文档重排队。
+- **`funflix parse --shard i/N`**（`services/extract/concurrent_runner.py::shard_condition`）。
+  落库全程只有一个消费者线程，所以单进程调大 `--concurrency` 不会提速 —— 瓶颈是
+  每条文档那两次数据库往返，不是抽取的 CPU。要提吞吐只能多开进程，而多开进程
+  必须分片：否则各进程的翻页游标从同一处起步，把同一批文档重复解析一遍。
+  按 `id` **末位十六进制字符**取模分片 —— uuid7 的低 74 位是随机的，末位因此均匀
+  （213 万行实测每片 6.25%±2%），而高位是时间戳、拿去分片会让各片的文档按入库
+  时间聚堆。谓词互斥、零额外往返；漏跑一片只是把那片文档留在 `pending`。
+- 迁移 `e5f6a7b8c9d0`：索引 `ix_raw_document_parse_scan (last_parsed_at NULLS FIRST, id)`。
+  parse 的翻页是 keyset 分页，排序键就是这两列；没有这个索引，213 万行的全表
+  排序每翻一页重做一遍。**PostgreSQL 专有** —— SQLite 的索引语法里声明不了
+  `NULLS FIRST`，所以迁移里按方言跳过。
+- `tests/test_pipeline_workflow.py`：把 `.github/workflows/collect.yml` 当代码测 ——
+  解析出每条 `uv` 调用，拿去跟 click 的命令树逐个核对（命令、子命令、每个选项
+  真的存在），再核对几条「怎么调」的约定：有 `--apply` 的必须传（漏了就是
+  **绿着什么也不写**的 dry-run，无人值守时最隐蔽）、有 `--yes` 的必须传（runner
+  没有 tty，漏了会挂到 timeout）、有 `--limit` 的必须传（`repair scan` 是记录在案
+  的例外）、`repair apply` 不许传 `--force`、分片号是 `0..N-1` 的完整覆盖且分母跟
+  矩阵对得上、每个 job 都有 timeout 和**各自**的 concurrency group、以及看门狗的
+  阈值大于 cron 间隔。为此给 `dev` extra 加了 `pyyaml`（运行时代码不碰 yaml）。
+- `tests/test_normalize.py::TestCleanTitleIdempotent`：`clean_title` 的幂等性用例，
+  语料一半是生产库 `repair scan` 实测吐出来的真实标题。见「修复」里那两条 ——
+  这条性质此前只写在 `repair/plan.py` 的 docstring 里（「`clean_title` 的每一步都是
+  减法」），没有任何东西守着。
 
 ### 变更
 
@@ -80,6 +103,23 @@
   executemany：生产库有 848,416 个去重链接，原先就是 84 万次网络往返，全量重建
   卡在这一步要跑到天荒地老。现在一条流式查询读出每个链接的最新结论，按 5,000
   行一批走带 `bindparam` 的 UPDATE，往返降到 170 次左右。
+- **`collect.yml` 补成五个并列节点，并把「每轮刷一小批」落实到每一步。**
+  `parse` 改成 4 片矩阵（`--shard ${{ matrix.shard }}/4 --limit 5000`，
+  `fail-fast: false`，concurrency group **带片号** —— 不带的话四片会被 GitHub 当成
+  同一组、push 时互相取消，只剩一片真的在跑）；新增 `canon` job
+  （`resolve --limit 200` 攒裁决、`merge` 落库，两步分开，`--limit` 在这里是**钱**
+  的闸门）；`verify` 在探测前插一步 `db relink-checks` —— `link_check` 和
+  `resource` 之间没有外键，重解析出来的新 resource 虽然 `check_status` 是
+  UNCHECKED，库里却存着它（按 provider + share_id 认）历史上最后一次的结论，
+  先填完能省掉几十万次无谓探测。
+- **`collect.yml` 每个 job 的 `uv sync` 和每一条 `uv run` 都带上 `--extra zh`**
+  （`canon` job 另加 `--extra llm`）。`uv sync` 不带 extra 时**不装** opencc，而
+  `normalize._to_simplified()` 在 opencc 缺失时原样返回、不报错 —— 于是 Action 侧
+  把 `唐伯虎點秋香` 归一到「點」、本地归一到「点」，同一部剧解析出两行 work，
+  正是这套流水线要消灭的那种重复。又因为 `uv run` 每次都按**本次请求的** extra
+  重新同步环境（前一步装好的会被下一步一条光秃秃的 `uv run` 卸掉），必须每条
+  都带。统一走 workflow 级的 `env.UV_SYNC_EXTRAS`，由
+  `tests/test_pipeline_workflow.py::TestExtras` 守着。
 - **搜索的主体从 `Media` 改成 `Work`**（`services/search.py`）：两个后端都返回
   `list[Work]`，`search_media`/`count_media` 改名为 `search_works`/`count_works`。
   资源筛选（`valid_only` / `provider`）因此要多穿一层，走完
@@ -111,6 +151,38 @@
 
 ### 修复
 
+- **`clean_title` 不幂等，每轮 repair 吃掉片名开头一个拉丁字母**
+  （`services/text/normalize.py`）。剥「表格残留的单字母列名」那条规则是
+  `^\s*[a-z]\s+`，不管后面是什么都剥：`E T 外星人` → `T 外星人` → `外星人`，
+  `K Pop 猎魔女团` → `Pop 猎魔女团`。这不是「显示难看」级别的问题 —— `repair scan`
+  每 2 小时拿**库里存着的** `media.title` 重新 `clean_title` 一遍判标题漂移，而
+  `media.original_title` 全库为空，所以这是一条无人值守的数据销毁回路，一天削 12 个
+  字母。加了「后面必须紧跟汉字」的约束（`(?=[一-鿿])`）—— 真正要剥的是
+  `D 大主宰 动漫版`、`L 狼的孩子雨和雪`、`G 灌篮高手` 这种中文片名前挂的列名，
+  而会被误伤的 `K Pop`、`E T`、`G I G N` 后面跟的都是拉丁字母。
+- **同一个回路的第二条：数字前缀规则把被拆开的文件大小当行号。**
+  `^\s*\d{3,8}\s+` 遇上 `大小：440.41MB`（走到这条规则时点号已经被换成空格、
+  成了 `440 41MB`）会剥成 `41MB`。而 `looks_like_junk_title('440 41MB')` 是 `False`，
+  所以它不会被 `repair/plan.py` 判成删除、会真的进 retitle 循环。加了 `(?!\d)`。
+- **`tag.media_count` 的丢更新与锁串行化**（`services/extract/runner.py`）。ORM 的
+  `tag.media_count += 1` 会刷成绝对值（读到 5 就写 `SET media_count = 6`），两个
+  parse 进程同时处理挂了同一标签的文档时，后提交的把前一个的 +1 盖掉 —— 这正是
+  `maintenance.recount_tags` 存在的原因。更要命的是锁：生产库只有一千多个标签行，
+  而几乎每条文档都挂「夸克」「电视剧」这类大热标签，自增发生在落库阶段二、行锁
+  要一直握到外层事务提交（一整批上百条文档、好几秒），于是所有分片进程在那几行上
+  排队。实测 8 个分片进程跑出 2.6 条/s，**比单进程的 4.6 条/s 还慢**，
+  `pg_blocking_pids` 上就是 `UPDATE tag SET media_count=...` 的
+  `Lock: transactionid`，最长等了 57 秒。改成把增量攒在 dict 里、收尾时一条
+  `media_count = media_count + CASE ...` 算术 UPDATE（`_apply_tag_count_deltas`）：
+  加法由数据库在持有行锁时自己算，没有丢更新窗口，行锁窗口也降到毫秒级。
+- **`resource.seen_count` 同病同治**（`_apply_resource_seen_deltas`）。改完标签之后
+  `pg_blocking_pids` 榜首换成了 `UPDATE resource SET last_seen_at=..., seen_count=...`，
+  等待 1 分 55 秒 —— `resource` 有近两百万行、看着不像热行，但分享链接是**被反复
+  转发**的，爆款那一份会出现在成百上千条文档里。增量的键是 ORM 对象而不是 id：
+  增量在阶段一攒，那时新建的行还没 flush、`id` 要到 flush 才赋上。
+- `services/text/normalize.py` 的 OpenCC 转换器改成 `functools.lru_cache` 只建一次。
+  原先每次 `_to_simplified()` 都 `OpenCC("t2s")`，而那个构造函数要加载繁简字典 ——
+  profile 下来它就是解析的 CPU 热点：全量解析的基准从 53.988s 降到 2.249s（24 倍）。
 - **`title_canon` 的键空间错配**（`services/extract/runner.py`）。parse 时的防回退
   查询用的是 `item.norm_key`（逐标题身份），而 `canon/resolver.py` 落裁决行用的是
   `series_norm_key`（系列身份），`canon/apply.py` 回头也按 `series_norm_key` 匹配。

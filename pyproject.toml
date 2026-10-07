@@ -69,6 +69,9 @@ dev = [
     "pytest-asyncio>=0.23",
     "respx>=0.21",
     "ruff>=0.6",
+    # 只给 tests/test_pipeline_workflow.py 用：把 .github/workflows/*.yml 读进来，
+    # 逐条核对流水线里写的命令和选项在 CLI 里真的存在。运行时代码不碰 yaml。
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

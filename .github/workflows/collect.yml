@@ -13,11 +13,28 @@ on:
 permissions:
   contents: read
 
+env:
+  # **`zh` extra 不是可选的，哪个节点漏了都会算出不一样的归一键。**
+  # `normalize._to_simplified()` 在 opencc 缺失时原样返回，而 `norm_key` /
+  # `series_norm_key` 都会调它 —— 装了 opencc 的环境把 `唐伯虎點秋香` 归一到
+  # 「点」，没装的归一到「點」，于是同一部剧在两个环境下解析会建出两行 work。
+  # 本地开发环境装了它，流水线早先只跑 `uv sync`（不带 extra）、没装，
+  # 这正是「搜索结果重复」最难查的一种来源。
+  #
+  # `uv run` 自己也会按请求的 extra 同步环境，所以 `uv sync` 和每一条
+  # `uv run` 必须带同一组 extra，否则后一条会把前一条装好的 opencc 卸掉。
+  # 统一走这个变量，少一处写漏的机会。
+  UV_SYNC_EXTRAS: --extra zh
+
 jobs:
-  # collect/parse/verify/repair 各消费自己的队列（采集水位 / 待解析文档 /
-  # 待校验资源 / 待修复 media），互不依赖对方产出的结果才能跑，所以拆成四个
-  # 独立 job 并行执行，而不是一个 job 里顺序跑四步——一步卡住不该拖着后面
-  # 几步一起等。
+  # collect/parse/verify/canon/repair 各消费自己的队列（采集水位 / 待解析文档 /
+  # 待校验资源 / 待裁决候选块 / 待修复 media），互不依赖对方产出的结果才能跑，
+  # 所以拆成几个独立 job 并行执行，而不是一个 job 里顺序跑几步——一步卡住不该
+  # 拖着后面几步一起等。
+  #
+  # 每个节点都只刷一小批（`--limit`），一轮刷不完下一轮接着刷：队列里的
+  # pending 行本身就是断点。所以这套流水线不需要编排，也不需要「全量重建」
+  # 那种一次性长跑 —— 213 万份待解析文档就是这么慢慢磨完的。
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -36,7 +53,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: uv sync
+        run: uv sync $UV_SYNC_EXTRAS
 
       # 数据库地址、采集源凭证等都不进仓库，运行前从远端密钥库拉到本地。
       # secret 里若混入尾随空白（复制粘贴常见），会被解析进库名导致连接失败，先 trim 掉。
@@ -45,16 +62,34 @@ jobs:
           FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
         run: |
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
-          uv run funsecret load "$url"
+          uv run $UV_SYNC_EXTRAS funsecret load "$url"
 
       - name: Collect
-        run: uv run funflix collect --limit 10000
+        run: uv run $UV_SYNC_EXTRAS funflix collect --limit 10000
 
+  # 分 4 片并行。落库全程只有一个消费者线程，所以单进程调大 `--concurrency`
+  # 不会提速 —— 瓶颈是每条文档那两次数据库往返，不是抽取的 CPU。要提吞吐只能
+  # 多开进程，而多开进程必须分片，否则各进程的翻页游标从同一处起步、
+  # 把同一批文档重复解析一遍。各片按 `id` 末位十六进制字符取模，互斥且均匀
+  # （见 `services/extract/concurrent_runner.py::shard_condition`）。
+  #
+  # **为什么是 4 片 × 5000 条**：单片 5000 条在最坏情况下也远远跑不到
+  # 120 分钟的 timeout —— 节点被 timeout 掐掉本身是安全的（分片不写库，
+  # 掐掉只是让剩下的文档留在 pending），但每轮都红会把真实故障埋掉。
+  # 一轮 2 万条、一天 12 轮，这就是「少量多次」该有的量级；要加速改 `--limit`
+  # 比改片数安全，片数越多越容易在热行上互相等锁。
   parse:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      # 一片挂了不影响其它片 —— 每片是独立的一批文档，没有共享产出。
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     concurrency:
-      group: pipeline-parse
+      # 组名必须带上片号。不带的话四片会被 GitHub 当成同一组，
+      # push 触发时互相取消，只剩一片真的在跑。
+      group: pipeline-parse-${{ matrix.shard }}
       cancel-in-progress: ${{ github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v5
@@ -66,19 +101,19 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: uv sync
+        run: uv sync $UV_SYNC_EXTRAS
 
       - name: Load secrets
         env:
           FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
         run: |
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
-          uv run funsecret load "$url"
+          uv run $UV_SYNC_EXTRAS funsecret load "$url"
 
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
       # 影响范围有限，不会一次把所有待解析的都搭进去。
       - name: Parse
-        run: uv run funflix parse --limit 20000
+        run: uv run $UV_SYNC_EXTRAS funflix parse --shard ${{ matrix.shard }}/4 --limit 5000
 
   verify:
     runs-on: ubuntu-latest
@@ -96,20 +131,79 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: uv sync
+        run: uv sync $UV_SYNC_EXTRAS
 
       - name: Load secrets
         env:
           FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
         run: |
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
-          uv run funsecret load "$url"
+          uv run $UV_SYNC_EXTRAS funsecret load "$url"
+
+      # 探测之前先把**已经知道答案**的链接填上。`link_check` 和 `resource`
+      # 之间没有外键，`resource` 被重建完全不影响它，所以重解析出来的新
+      # resource 虽然 `check_status` 是默认的 UNCHECKED，库里却存着它
+      # （按 provider + share_id 认）历史上最后一次的校验结论。
+      #
+      # 没有 `--limit`，因为它本身就有界：一条流式查询读出每个链接的最新结论、
+      # 按 5000 行一批 executemany，84 万个链接约 170 次往返。而且**只改
+      # UNCHECKED 的行**，所以幂等、每轮跑都安全 —— 真实探测过的结论不会被
+      # 历史覆盖回去。
+      #
+      # 这一步刻意排在 Verify 前面：填完之后 verify 的待办队列就只剩真正没有
+      # 历史结论的链接，省掉几十万次无谓探测。
+      - name: Relink
+        run: uv run $UV_SYNC_EXTRAS funflix db relink-checks --yes
 
       - name: Verify
-        run: uv run funflix verify --limit 10000
+        run: uv run $UV_SYNC_EXTRAS funflix verify --limit 10000
+
+  # 规则搞不定的归一残局交给 LLM：`刀锋战士 / 刀锋战士1 / 刀锋战士2 / 刀锋战士3`
+  # 这种一个候选块里好几个候选项的，正则判不出它们是不是同一部作品的不同季。
+  #
+  # 两步刻意分开：`resolve` 只往 `title_canon` 写裁决、不动 media 一个字段，
+  # `merge` 才落库。裁决是花钱买来的，落盘之后可以人工抽查再应用，而且
+  # `title_canon` 是完整审计记录 —— 重跑 parse 或新数据入库都不会把已经并好的
+  # 东西重新拆开。
+  canon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: pipeline-canon
+      cancel-in-progress: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+
+      # 这个 job 多一个 `llm` extra（openai 客户端），其余节点用不到。
+      - name: Install
+        run: uv sync $UV_SYNC_EXTRAS --extra llm
+
+      - name: Load secrets
+        env:
+          FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
+        run: |
+          url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
+          uv run $UV_SYNC_EXTRAS --extra llm funsecret load "$url"
+
+      # `--limit` 是**钱的闸门**，不只是时间的：一个块一次调用。已经 decided
+      # 的键会被跳过，所以每轮都只打残局、不重复付费，一轮打不完下一轮接着打。
+      - name: Resolve
+        run: uv run $UV_SYNC_EXTRAS --extra llm funflix canon resolve --apply --yes --limit 200
+
+      # 应用的是**之前每一轮**攒下来的裁决，不只是这一轮的，所以 resolve 挂了
+      # （比如 LLM 网关抽风）它照样要跑完 —— job 整体仍然是红的，不会掩盖问题。
+      - name: Merge
+        if: ${{ !cancelled() }}
+        run: uv run $UV_SYNC_EXTRAS --extra llm funflix canon merge --apply --yes
 
   # 解析规则永远加不完，每加一条就留下一批「按旧规则算出来、现在看是错的」
-  # media。这个 job 就是把那批数据慢慢刷对，所以它和上面三个完全并列、
+  # media。这个 job 就是把那批数据慢慢刷对，所以它和上面几个完全并列、
   # 不设 needs：它消费的是自己的 repair_task 队列。
   #
   # 和 parse 重叠的后果是自愈的——parse 若重新插回一行 repair 刚删的垃圾
@@ -131,28 +225,38 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Install
-        run: uv sync
+        run: uv sync $UV_SYNC_EXTRAS
 
       - name: Load secrets
         env:
           FUNSECRET_LOAD_URL: ${{ secrets.FUNSECRET_LOAD_URL }}
         run: |
           url="$(printf '%s' "$FUNSECRET_LOAD_URL" | tr -d '[:space:]')"
-          uv run funsecret load "$url"
+          uv run $UV_SYNC_EXTRAS funsecret load "$url"
 
       # 只读 media + 只写 repair_task。规则没变时零写入，所以每轮都跑没有成本。
+      #
+      # **这一步不能加 `--limit`。** 它有这个选项，但翻页游标不跨进程持久化、
+      # 每次都从 `media.id` 最小的那头重新开始，加了 limit 就等于永远只扫前
+      # N 行、后面的数据再也修不到。全表扫是按主键翻页的有界查询，两小时一轮
+      # 扛得住。要分轮磨得先给它一个存游标的地方。
+      #
+      # 这一步能无人值守的前提是 `clean_title` **幂等** —— 它拿库里存着的
+      # （已经洗过的）`media.title` 重算一遍判漂移，不幂等的话每轮都会检出
+      # 同一批行、改掉一点，而 `media.original_title` 全库为空、改掉找不回来。
+      # 见 `tests/test_normalize.py::TestCleanTitleIdempotent`。
       - name: Scan
-        run: uv run funflix repair scan --apply
+        run: uv run $UV_SYNC_EXTRAS funflix repair scan --apply
 
       # 破坏性的一半。**刻意不传 --force**：爆炸半径闸门（删除 > 全库 5% 或
       # 重挂 > 20% 就拒绝）在无人值守的自动流水线上是最后一道防线，一次规则
       # 写错不该被自动放行。真超限了这一步会红，人去核对 scan 的样例再决定。
       - name: Apply
-        run: uv run funflix repair apply --apply --yes --limit 5000
+        run: uv run $UV_SYNC_EXTRAS funflix repair apply --apply --yes --limit 5000
 
       # 深层修复：把规则版本过期的文档打回 parse 队列，由 parse job 按它自己
       # 的节奏消化。这一步和上面那步互不依赖，所以 apply 被闸门拦住时它照样
       # 要跑完（job 整体仍然是红的，不会掩盖问题）。
       - name: Requeue
         if: ${{ !cancelled() }}
-        run: uv run funflix repair requeue --apply --yes --limit 50000
+        run: uv run $UV_SYNC_EXTRAS funflix repair requeue --apply --yes --limit 50000
