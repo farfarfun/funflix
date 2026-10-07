@@ -100,6 +100,13 @@
 
 ### 变更
 
+- **`merge_media_rows` 容忍「要并的行已经被别的节点删了」**
+  （`services/canon/merge.py`）。CI 里 canon 和 repair 是两个并行 job：canon
+  merge 删 media 行，而 repair apply 用的是几十分钟前 `scan` 算出来的计划，
+  于是 `rows[loser_id]` 抛 `KeyError` 一路冒到 CLI，`repair apply` 整步退出 1
+  （实测 2026-10-07 那轮跑了 22 分 48 秒后挂掉）。现在缺的败者当成已经并掉、
+  跳过；连存活行都没了就整组不并，留给下一轮 scan 重新规划 —— 换个存活行等于
+  换掉上游「目标身份上坐着哪一行」的结论。
 - **`verify` 新增 `--max-seconds` 墙上时间预算，CI 里改用它替掉 `--limit 10000`。**
   CI 的 verify 节点每轮都撞在 `timeout-minutes: 120` 上，整个 run 被判
   `cancelled` —— 别的四个节点全绿也看不出来。`--limit` 控不住时长：吞吐由最慢

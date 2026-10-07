@@ -14,12 +14,15 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+from farlog import getLogger
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import MediaType
 from funflix.models import Media, media_resource, media_tag
 from funflix.models.media import UNKNOWN_YEAR
+
+logger = getLogger("funflix")
 
 #: 合并时从败者补到存活行上的可空字段。只在存活行该字段为空时才补。
 _FILLABLE = ("original_title", "poster_url", "overview", "tmdb_id", "douban_id", "imdb_id")
@@ -130,6 +133,13 @@ async def merge_media_rows(
     """把 `media_ids` 并成一行，返回 (存活行 id, 统计)。
 
     只 flush 不 commit —— 调用方按组提交，这样中断时不会留下半并完的组。
+
+    `media_ids` 是**快照**：算出这一组到真的来并，中间隔着别的步骤甚至别的
+    节点（CI 里 canon 和 repair 是两个并行 job，canon merge 删 media 行，
+    repair apply 拿的是几十分钟前 scan 算出来的计划）。所以这里对「id 指向的
+    行已经没了」是容错的：缺的那几行当成已经并掉，跳过；连存活行都没了就整组
+    不并，留给下一轮重新规划 —— 实测不容错的后果是 `KeyError` 冒到 CLI，
+    `repair apply` 整步退出 1，这一轮**其余已经并好的组也跟着回滚**。
     """
     stats = MergeStats()
     if len(media_ids) < 2:
@@ -137,8 +147,19 @@ async def merge_media_rows(
 
     survivor_id = survivor_id or await pick_survivor(session, media_ids)
     rows = {m.id: m for m in await session.scalars(select(Media).where(Media.id.in_(media_ids)))}
+    if survivor_id not in rows:
+        # 存活行自己被删了，没有能并进去的目标。败者留在原身份上，
+        # 下一轮 scan 会重新规划 —— 比随便换个存活行安全：这一组的
+        # 身份归属是上游按「存活行坐在哪」算出来的，换人等于换结论。
+        logger.warning(
+            f"合并跳过：存活行 {survivor_id} 已不存在，{len(media_ids) - 1} 个败者留待下轮"
+        )
+        return survivor_id, stats
+
     survivor = rows[survivor_id]
-    loser_ids = [mid for mid in media_ids if mid != survivor_id]
+    loser_ids = [mid for mid in media_ids if mid != survivor_id and mid in rows]
+    if gone := len(media_ids) - 1 - len(loser_ids):
+        logger.info(f"合并时有 {gone} 个败者已不存在（别的节点先并掉了），跳过")
 
     for loser_id in loser_ids:
         moved, dropped = await _move_links(session, loser_id, survivor_id)

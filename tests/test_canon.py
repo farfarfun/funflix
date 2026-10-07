@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import itertools
+import uuid
 
 import pytest
 from sqlalchemy import func, select
@@ -321,6 +322,56 @@ class TestMergeMediaRows:
         kept, stats = await merge_media_rows(session, [lone.id])
         assert kept == lone.id
         assert stats.merged == 0
+
+    @pytest.mark.asyncio
+    async def test_a_loser_that_vanished_is_skipped(self, session) -> None:
+        """并的是快照：别的节点可能先把其中几行删了。
+
+        CI 里 canon 和 repair 是两个并行 job，canon merge 删 media 行，而
+        repair apply 用的是几十分钟前 scan 算出来的计划。实测这里抛了
+        `KeyError`、一路冒到 CLI，`repair apply` 整步退出 1，
+        **那一轮其余已经并好的组也跟着回滚**。
+        """
+        survivor, alive_loser = _media("大主宰"), _media("大主宰 年番")
+        session.add_all([survivor, alive_loser])
+        await session.flush()
+        await session.commit()
+        vanished = uuid.uuid4()  # 并到一半被别的节点删掉的那一行
+
+        kept, stats = await merge_media_rows(
+            session, [survivor.id, alive_loser.id, vanished], survivor_id=survivor.id
+        )
+        await session.commit()
+
+        assert kept == survivor.id
+        # 还在的那个照并，没了的那个跳过
+        assert stats.merged == 1
+        assert await session.scalar(select(func.count()).select_from(Media)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_survivor_cancels_the_whole_group(self, session) -> None:
+        """存活行自己被删了就整组不并 —— 换个存活行等于换上游的结论。
+
+        这一组的身份归属是 `assign._pass` 按「目标身份上坐着哪一行」算出来的，
+        那一行没了，就该让下一轮 scan 重新看现在是谁坐在那儿。
+        """
+        loser_a, loser_b = _media("大主宰 年番"), _media("大主宰 S02")
+        session.add_all([loser_a, loser_b])
+        await session.flush()
+        await session.commit()
+        vanished_survivor = uuid.uuid4()
+
+        kept, stats = await merge_media_rows(
+            session,
+            [vanished_survivor, loser_a.id, loser_b.id],
+            survivor_id=vanished_survivor,
+        )
+        await session.commit()
+
+        assert kept == vanished_survivor
+        assert stats.merged == 0
+        # 败者原样留着，等下一轮重新规划
+        assert await session.scalar(select(func.count()).select_from(Media)) == 2
 
 
 class TestAbsorbAttributes:
