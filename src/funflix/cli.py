@@ -721,6 +721,9 @@ def canon_resolve(
     只送候选项 ≥2 的候选块（实测约 4,900 个）。单候选项的块没有可并的对象，
     送过去纯烧钱。已经是 `decided` 的键会被跳过，所以中断后重跑只打残局，
     不重复付费。
+
+    每轮开头还会先免费沉淀一批：字面恰好等于某个**已知作品键**的未裁决键，
+    答案已经在库里了，不必再问模型（见 `services/canon/sediment.py`）。
     """
     from funflix.base.db import session_scope
     from funflix.services.canon import resolve_canon
@@ -741,6 +744,7 @@ def canon_resolve(
     report = _run(_do)
     _table(
         [
+            ["沉淀免费判掉", report.settled],
             ["扫描 media", report.scanned],
             ["候选块总数", report.blocks],
             ["够格送裁决", report.blocks_eligible],

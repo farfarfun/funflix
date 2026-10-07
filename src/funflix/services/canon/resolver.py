@@ -27,6 +27,13 @@
 超大块按 `MAX_ENTRIES_PER_CALL` 拆页，但**顺序跑**并把前几页已经定下来的
 作品名回传给模型（见 `_decided_context`）—— 不然第 2 页可能给出
 `大主宰 年番` 而第 1 页给的是 `大主宰`，字面不同就并不到一起去。
+
+## 先沉淀，再花钱
+
+每轮开头先跑 `canon/sediment.py`：上几轮买到的作品身份，能免费判掉那些
+**字面恰好等于某个已知作品键**的未裁决键（模型判出「这些键都属于 `大主宰`」
+的同时就已经确立了 `大主宰` 是个规范作品名）。沉淀掉的键并进 `done`，
+本轮不再送进调用。
 """
 
 from __future__ import annotations
@@ -46,6 +53,7 @@ from funflix.models import Media
 from funflix.models.canon import CANON_PROMPT_VERSION, CanonState, TitleCanon
 from funflix.models.media import UNKNOWN_YEAR
 from funflix.services.canon import prompts
+from funflix.services.canon import sediment as sediment_mod
 from funflix.services.extract.llm.client import (
     LLMCallError,
     LLMClient,
@@ -102,6 +110,8 @@ class CanonDecision:
 @dataclass(slots=True)
 class ResolveReport:
     scanned: int = 0
+    #: 开跑前靠「字面等于已知作品键」免费判掉的键数（见 `canon/sediment.py`）
+    settled: int = 0
     #: 全部候选块数（含单候选项的）
     blocks: int = 0
     #: 够格送 LLM 的块数（≥2 个候选项且还有未裁决的 key）
@@ -359,6 +369,11 @@ async def resolve_canon(
     整块跳过。所以中断后重跑只打残局，不重复付费。
     """
     report = ResolveReport(dry_run=dry_run)
+
+    # 先沉淀再花钱：上几轮买到的作品身份能免费判掉一批键，它们就不必再进调用了。
+    sediment, settled = await sediment_mod.settle_known_works(session, apply=not dry_run)
+    report.settled = sediment.settled if not dry_run else sediment.matched
+
     blocks = await _scan_blocks(session, report)
 
     if key is not None:
@@ -370,6 +385,8 @@ async def resolve_canon(
             select(TitleCanon.norm_key).where(TitleCanon.status == CanonState.DECIDED)
         )
     )
+    # dry-run 时沉淀没真的落库，手动并进来，免得报出的待送块数虚高
+    done |= settled
 
     pending: list[tuple[str, list[CanonEntry]]] = []
     for block, entries in blocks.items():

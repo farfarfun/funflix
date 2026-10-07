@@ -1180,3 +1180,133 @@ class TestAssignIdentities:
 
         survivor = await session.scalar(select(Media).where(Media.work_id == work.id))
         assert survivor.title == "大主宰"
+
+
+class TestSettleKnownWorks:
+    """知识沉淀：买过一次的作品身份要能免费复用，但只认字面相等。
+
+    这一步没有模型兜底，判错一次就是一次误并（不可逆）。所以这些断言分两半：
+    该沉淀的必须沉淀下来（否则白花钱重复问），不该沉淀的必须一个都不碰。
+    """
+
+    async def _settle(self, session, *, apply: bool = True):
+        from funflix.services.canon.sediment import settle_known_works
+
+        report, keys = await settle_known_works(session, apply=apply)
+        return report, keys
+
+    @pytest.mark.asyncio
+    async def test_bare_work_name_inherits_the_decided_identity(self, session) -> None:
+        """模型判出「`大主宰2` 属于《大主宰》」时，也就确立了 `大主宰` 是个规范作品名。
+
+        于是后来冒出的光杆 `大主宰` 键不必再问模型 —— 答案已经在库里。
+        """
+        session.add(_canon("大主宰2", work_title="大主宰", season=2, media_type=MediaType.ANIME))
+        session.add(
+            TitleCanon(norm_key="大主宰", status=CanonState.PENDING, work_title="大主宰 第3季")
+        )
+        await session.commit()
+
+        report, keys = await self._settle(session)
+
+        assert report.settled == 1
+        assert keys == {"大主宰"}
+        row = await session.get(TitleCanon, "大主宰")
+        assert row.status == CanonState.DECIDED
+        assert row.work_title == "大主宰"
+        assert row.work_norm_key == "大主宰"
+        assert row.media_type is MediaType.ANIME, "类型是作品级属性，要继承"
+        assert row.model == "sediment:known-work"
+        assert row.confidence is None, "不是模型给的置信度，不能编一个"
+
+    @pytest.mark.asyncio
+    async def test_season_and_year_are_not_inherited(self, session) -> None:
+        """季和年都是**季级**属性，继承兄弟行的值就是错的。
+
+        `season` 这一列的语义是「这个键锁定了哪一季」，光杆作品名没锁定任何一季；
+        继承了就等于把整部剧钉死在第 2 季上（理由同 `lookup.pending_row`）。
+        年份同理 —— 第 1 季 2020、第 3 季 2023，拿兄弟行的年份填进来必然错。
+        """
+        session.add(_canon("大主宰2", work_title="大主宰", season=2, year=2022))
+        session.add(TitleCanon(norm_key="大主宰", status=CanonState.PENDING))
+        await session.commit()
+
+        await self._settle(session)
+
+        row = await session.get(TitleCanon, "大主宰")
+        assert row.season is None
+        assert row.year == UNKNOWN_YEAR
+
+    @pytest.mark.asyncio
+    async def test_similar_but_different_keys_are_left_alone(self, session) -> None:
+        """只认字面相等。前缀/包含关系的区分要读语义，那是花钱请模型的理由。"""
+        session.add(_canon("大主宰2", work_title="大主宰"))
+        for key in ("天命大主宰", "大主宰动态漫", "从大主宰开始打卡"):
+            session.add(TitleCanon(norm_key=key, status=CanonState.PENDING))
+        await session.commit()
+
+        report, keys = await self._settle(session)
+
+        assert report.settled == 0
+        assert keys == set()
+        for key in ("天命大主宰", "大主宰动态漫", "从大主宰开始打卡"):
+            row = await session.get(TitleCanon, key)
+            assert row.status == CanonState.PENDING
+
+    @pytest.mark.asyncio
+    async def test_junk_decisions_are_not_a_source_of_truth(self, session) -> None:
+        """判成垃圾的裁决没有作品身份可继承，不能拿它去沉淀。"""
+        session.add(_canon("大主宰", work_title=None, work_norm_key=None, is_junk=True))
+        session.add(TitleCanon(norm_key="斗破苍穹", status=CanonState.PENDING))
+        await session.commit()
+
+        report, _keys = await self._settle(session)
+
+        assert report.known_works == 0
+        assert report.settled == 0
+
+    @pytest.mark.asyncio
+    async def test_already_decided_rows_are_not_rewritten(self, session) -> None:
+        """已裁决的行是花钱买来的，沉淀不能覆盖它 —— 那会把季号抹掉。"""
+        session.add(_canon("大主宰", work_title="大主宰"))
+        session.add(_canon("大主宰2", work_title="大主宰", season=2))
+        await session.commit()
+
+        report, _keys = await self._settle(session)
+
+        assert report.settled == 0
+        row = await session.get(TitleCanon, "大主宰2")
+        assert row.season == 2
+        assert row.model != "sediment:known-work"
+
+    @pytest.mark.asyncio
+    async def test_dry_run_counts_without_writing(self, session) -> None:
+        session.add(_canon("大主宰2", work_title="大主宰"))
+        session.add(TitleCanon(norm_key="大主宰", status=CanonState.PENDING))
+        await session.commit()
+
+        report, keys = await self._settle(session, apply=False)
+
+        assert report.matched == 1
+        assert report.settled == 0
+        assert keys == {"大主宰"}, "dry-run 也要把命中的键报出来，否则待送块数虚高"
+        row = await session.get(TitleCanon, "大主宰")
+        assert row.status == CanonState.PENDING
+
+    @pytest.mark.asyncio
+    async def test_work_title_pick_is_deterministic(self, session) -> None:
+        """同一个作品键底下挂着几种写法时，取哪个必须是确定的。
+
+        不确定的话同一批数据重跑会写出不同的 `work_title`，搜索结果跟着抖。
+        """
+        # 三行同属一个作品键，但 `work_title` 有两种写法（不同字面洗出同一个键）
+        session.add(_canon("大主宰2", work_title="大主宰", work_norm_key="大主宰"))
+        session.add(_canon("大主宰3", work_title="大主宰", work_norm_key="大主宰"))
+        session.add(_canon("大主宰ii", work_title="大主宰 年番", work_norm_key="大主宰"))
+        session.add(TitleCanon(norm_key="大主宰", status=CanonState.PENDING))
+        await session.commit()
+
+        await self._settle(session)
+
+        row = await session.get(TitleCanon, "大主宰")
+        assert row.work_title == "大主宰", "取出现次数最多的写法"
