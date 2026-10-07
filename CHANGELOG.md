@@ -273,6 +273,18 @@
 
 ### 修复
 
+- **一次死锁就让 `repair apply` 每轮只排掉 500 条**（`services/repair/apply.py`）。
+  rehome 按 `CHUNK=500` 分批提交，但整步没有并发冲突兜底：一轮领 5000 条分 10
+  批，第二批撞上 `DeadlockDetectedError` 就让整步退出 1，**后面 8 批一条都不跑**。
+  并行节点是死锁的来源 —— canon job、parse 四个分片和 repair 同时在改同一批
+  media 行，加锁顺序对不上 Postgres 就判死锁、牺牲掉一方（调用链
+  `assign_identities` → `merge_media_rows`）。实测后果是 pending 队列从 9,564
+  涨到 11,854 而不是在排空：每轮新检出的比排掉的多。现在每批独立退避重试
+  （复用 `base/dbconflict.py` 的判据和参数），重试耗尽也只把这一批留在
+  pending、继续下一批，并计入 `report.failed`。两处容易踩的坑写进了注释：
+  重跑前要把报告计数退回批次开始的值（不退就把失败那次算两遍），以及回滚会
+  让会话里**所有** ORM 对象过期，过期对象再读 `task.media_id` 会在构造查询的
+  同步代码里触发 IO、直接抛 `MissingGreenlet`，所以每批开跑前显式重载任务行。
 - **`canon resolve` 落库撞主键，整轮裁决全丢**（`services/canon/resolver.py`）。
   生产 Action 实测 `UniqueViolationError: duplicate key value violates unique
   constraint "pk_title_canon"`。`_persist` 是「先查 `existing` 再写」，但入参

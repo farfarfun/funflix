@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from funflix.base.enums import MediaType, ParseStatus, Provider, Quality, SourceType
 from funflix.models import Media, RawDocument, Resource, Work, media_resource, utcnow
@@ -37,6 +37,7 @@ from funflix.services.repair import (
     requeue_stale_documents,
     scan_media,
 )
+from funflix.services.repair import apply as apply_mod
 from funflix.services.text.normalize import extract_season, series_norm_key
 
 _SEQ = itertools.count()
@@ -666,6 +667,155 @@ class TestApply:
         await session.commit()
         report = await apply_repairs(session, dry_run=False, force=True)
         assert report.deleted == 1
+
+
+class TestRehomeSurvivesDeadlocks:
+    """并行节点撞死锁时，**一批**失败不能带走其余批次。
+
+    CI 里 canon / parse 四个分片 / repair 是并行 job，都在改同一批 media 行，
+    加锁顺序对不上 Postgres 就判死锁。实测代价：一轮领 5000 条、按
+    `CHUNK=500` 分批提交，第二批一死锁就让 `repair apply` 整步退出 1，于是
+    **每轮只排掉第一批 500 条**，pending 越积越多（9,564 → 11,854）而不是在
+    排空。SQLite 没有死锁状态码，所以这里拿形状一样的异常注进去。
+    """
+
+    def _deadlock(self) -> DBAPIError:
+        """造一个 `is_write_conflict` 认得的异常：看 SQLSTATE，不看驱动类型。"""
+        orig = Exception("deadlock detected")
+        orig.sqlstate = "40P01"  # type: ignore[attr-defined]
+        return DBAPIError("UPDATE media ...", {}, orig)
+
+    async def _pending_rehomes(self, session, titles: list[str]) -> None:
+        """每个干净标题配一行顶着**旧作品键**的 media，外加一个 pending rehome。
+
+        夹具得用带噪声的 `media.title`，否则 `_stale_key` 算出来的旧键跟新键
+        一样，根本构造不出 `key_drift`（见它的断言）。
+        """
+        for title in titles:
+            dirty = f"{title} 作者:某人"
+            media = await _media_row(session, dirty, work_norm_key=_stale_key(dirty))
+            session.add(
+                RepairTask(
+                    kind=RepairKind.REHOME,
+                    symptom=RepairSymptom.KEY_DRIFT,
+                    media_id=media.id,
+                    payload={
+                        "title": title,
+                        "work_norm_key": series_norm_key(title),
+                        "work_title": title,
+                        "season": NO_SEASON,
+                        "media_type": MediaType.MOVIE.value,
+                        "year": UNKNOWN_YEAR,
+                    },
+                    status=RepairState.PENDING,
+                    detected_at=utcnow(),
+                )
+            )
+        await session.commit()
+
+    @pytest.mark.asyncio
+    async def test_transient_deadlock_is_retried_and_the_batch_lands(
+        self, session, monkeypatch
+    ) -> None:
+        """冲突是瞬时的（对面已经提交完了），重跑一次就该过。"""
+        await self._pending_rehomes(session, ["流浪地球"])
+
+        real = apply_mod.assign_identities
+        calls = {"n": 0}
+
+        async def flaky(*args, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise self._deadlock()
+            return await real(*args, **kw)
+
+        monkeypatch.setattr(apply_mod, "assign_identities", flaky)
+        monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+        assert calls["n"] == 2
+        assert report.rehomed == 1
+        assert report.failed == 0
+        work = await session.scalar(
+            select(Work).where(Work.norm_key == series_norm_key("流浪地球"))
+        )
+        assert work is not None
+
+    @pytest.mark.asyncio
+    async def test_one_deadlocked_batch_does_not_take_down_the_others(
+        self, session, monkeypatch
+    ) -> None:
+        """重试耗尽的那一批留在 pending，后面的批次照常落库。
+
+        这是「少量多次、持续性完善」能成立的前提：卡住的那批下一轮再来，
+        而不是每轮都在同一个地方倒下。
+        """
+        titles = ["流浪地球", "疯狂的外星人", "我不是药神"]
+        await self._pending_rehomes(session, titles)
+        monkeypatch.setattr(apply_mod, "CHUNK", 1)
+        monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
+
+        real = apply_mod.assign_identities
+        seen: list[str] = []
+
+        async def flaky(session_, targets, **kw):
+            # 第一批（`CHUNK=1`，按 detected_at 排序就是「流浪地球」那条）
+            # 每次都死锁；后两批正常。
+            title = str(next(iter(kw.get("extra_titles", {}).values()), ""))
+            seen.append(title)
+            if title == "流浪地球":
+                raise self._deadlock()
+            return await real(session_, targets, **kw)
+
+        monkeypatch.setattr(apply_mod, "assign_identities", flaky)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+
+        assert report.failed == 1
+        assert report.rehomed == 2
+        # 失败那批的任务留在 pending，没被标成 applied
+        pending = list(
+            await session.scalars(
+                select(RepairTask).where(RepairTask.status == RepairState.PENDING)
+            )
+        )
+        assert len(pending) == 1
+        assert pending[0].payload["title"] == "流浪地球"
+        landed = {
+            w.norm_key
+            for w in await session.scalars(
+                select(Work).where(Work.norm_key.in_([series_norm_key(t) for t in titles]))
+            )
+        }
+        assert landed == {series_norm_key("疯狂的外星人"), series_norm_key("我不是药神")}
+
+    @pytest.mark.asyncio
+    async def test_counters_are_not_double_counted_across_retries(
+        self, session, monkeypatch
+    ) -> None:
+        """重跑前计数要退回批次开始的值 —— 不退就把失败那次的改动算两遍。
+
+        报告里的数字是人判断「这一轮到底动了多少行」的唯一依据。
+        """
+        await self._pending_rehomes(session, ["流浪地球", "疯狂的外星人"])
+        monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
+
+        real = apply_mod.assign_identities
+        calls = {"n": 0}
+
+        async def flaky(session_, targets, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # 先真的搬完、把计数顶上去，再死锁 —— 这才会暴露重复计数
+                await real(session_, targets, **kw)
+                raise self._deadlock()
+            return await real(session_, targets, **kw)
+
+        monkeypatch.setattr(apply_mod, "assign_identities", flaky)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+        assert report.rehomed == 2
+        assert report.failed == 0
 
 
 class TestApplyKeyScope:

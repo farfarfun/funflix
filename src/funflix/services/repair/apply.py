@@ -27,13 +27,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from farlog import getLogger
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.dbconflict import (
+    WRITE_CONFLICT_ATTEMPTS,
+    WRITE_CONFLICT_BACKOFF,
+    is_write_conflict,
+)
 from funflix.base.enums import MediaType
 from funflix.models import Media, Work
 from funflix.models.base import utcnow
@@ -44,6 +51,8 @@ from funflix.services.canon.purge import delete_media_rows
 from funflix.services.counters import refresh_media_counters, refresh_work_counters
 from funflix.services.repair.plan import plan_key
 from funflix.services.text.normalize import norm_key as per_title_key
+
+logger = getLogger("funflix")
 
 CHUNK = 500
 
@@ -271,6 +280,116 @@ async def _ensure_work(session: AsyncSession, task: RepairTask, report: ApplyRep
     return work.id
 
 
+#: 批次重跑前要退回去的计数字段。死锁让整批回滚，计数不退回就会把失败
+#: 那次的改动算两遍 —— 报告里的数字是人判断「这轮到底动了多少行」的唯一依据。
+_BATCH_COUNTERS = (
+    "skipped",
+    "rehomed",
+    "merged",
+    "links_moved",
+    "links_dropped",
+    "parked",
+    "works_created",
+    "works_existing",
+)
+
+
+async def _load_tasks(session: AsyncSession, ids: list[uuid.UUID]) -> list[RepairTask]:
+    """按给定顺序把任务行重新读出来。
+
+    回滚会让会话里的 ORM 对象**全部过期**（跟 `expire_on_commit` 无关），
+    而异步会话不做隐式懒加载 —— 过期对象再读 `task.media_id` 会在构造查询的
+    同步代码里触发一次 IO，直接抛 `MissingGreenlet`。所以每批开跑前都显式
+    拉一次，不去推断「这个对象现在还新不新鲜」。
+    """
+    rows = {
+        task.id: task
+        for task in await session.scalars(select(RepairTask).where(RepairTask.id.in_(ids)))
+    }
+    return [rows[task_id] for task_id in ids if task_id in rows]
+
+
+async def _rehome_batch(
+    session: AsyncSession, batch: list[RepairTask], report: ApplyReport
+) -> tuple[set[uuid.UUID], set[uuid.UUID]]:
+    """搬一批并提交。整批成败一致，所以可以整批重跑。"""
+    now = utcnow()
+    touched: set[uuid.UUID] = set()
+    survivors: set[uuid.UUID] = set()
+
+    alive = set(
+        await session.scalars(select(Media.id).where(Media.id.in_([t.media_id for t in batch])))
+    )
+    targets: dict[uuid.UUID, tuple[uuid.UUID, int]] = {}
+    titles: dict[uuid.UUID, str] = {}
+    for task in batch:
+        if task.media_id not in alive:
+            task.status = RepairState.SKIPPED
+            task.applied_at = now
+            report.skipped += 1
+            continue
+        work_id = await _ensure_work(session, task, report)
+        targets[task.media_id] = (work_id, int(task.payload["season"]))  # type: ignore[arg-type]
+        title = task.payload.get("title")
+        if title:
+            titles[task.media_id] = str(title)[:500]
+
+    if targets:
+        stats = await assign_identities(session, targets, extra_titles=titles)
+        report.rehomed += stats.moved
+        report.merged += stats.merged
+        report.links_moved += stats.links_moved
+        report.links_dropped += stats.links_dropped
+        report.parked += stats.parked
+        touched |= stats.touched_works
+        survivors |= stats.merged_into
+
+    for task in batch:
+        if task.status == RepairState.PENDING:
+            task.status = RepairState.APPLIED
+            task.applied_at = now
+    # 按批提交：中断时这一批要么整个应用完，要么完全没动。
+    await session.commit()
+    return touched, survivors
+
+
+async def _rehome_batch_with_retry(
+    session: AsyncSession, ids: list[uuid.UUID], report: ApplyReport
+) -> tuple[set[uuid.UUID], set[uuid.UUID]] | None:
+    """搬一批，撞上并发写入冲突就退避重跑。`None` 表示这批没搬成。
+
+    没用 `retry_on_write_conflict`：那个通用壳子要求 `op` 自己保证重跑前
+    事务回到可用状态（见它的文档），而这里的恢复动作 —— 回滚、把计数退回
+    批次开始的值、把过期的任务行重新拉出来 —— 只能在**捕获到冲突之后**做。
+    """
+    before = {name: getattr(report, name) for name in _BATCH_COUNTERS}
+    what = f"这批 {len(ids)} 个改归属任务"
+    for attempt in range(WRITE_CONFLICT_ATTEMPTS):
+        batch = await _load_tasks(session, ids)
+        if not batch:
+            return set(), set()
+        try:
+            return await _rehome_batch(session, batch, report)
+        except Exception as err:
+            if not is_write_conflict(err):
+                raise
+            # 死锁会把事务打进 aborted 状态，不回滚的话下一句 execute 直接报
+            # 「current transaction is aborted」。计数也要退回去，否则失败那次
+            # 的改动会被算两遍。
+            await session.rollback()
+            for name, value in before.items():
+                setattr(report, name, value)
+            if attempt == WRITE_CONFLICT_ATTEMPTS - 1:
+                logger.warning(
+                    f"{what}连续撞车 {WRITE_CONFLICT_ATTEMPTS} 次，留在 pending 待下一轮"
+                )
+                return None
+            delay = WRITE_CONFLICT_BACKOFF * (attempt + 1)
+            logger.warning(f"{what}落库撞车（第 {attempt + 1} 次），{delay:.1f}s 后重试")
+            await asyncio.sleep(delay)
+    return None  # pragma: no cover
+
+
 async def _apply_rehomes(
     session: AsyncSession,
     tasks: list[RepairTask],
@@ -283,47 +402,31 @@ async def _apply_rehomes(
     拆成两步的话，中途崩溃会留下「标题已经改了、身份还没搬」的半成品，
     下一轮 scan 看到的是一个它自己造出来的新症状。
 
+    每批**单独扛并发写入冲突**。这一批搬的 media 行，并行的 canon job 和
+    parse 四个分片同时也在改，加锁顺序对不上，Postgres 就判死锁、牺牲掉一方
+    （实测 `DeadlockDetectedError`，调用链 `assign_identities` →
+    `merge_media_rows`）。冲突是瞬时的，退避重跑基本就过；重试耗尽也只把这
+    一批留在 pending、继续下一批 —— 让它冒到命令层的代价实测是**每轮只排掉
+    第一批 500 条**：一轮领 5000 条、分 10 批，第二批一死锁整步就退出 1，
+    pending 于是越积越多（9,564 → 11,854）而不是在排空。
+
     返回 `(touched_works, survivors)` 给收尾重算用。
     """
     touched: set[uuid.UUID] = set()
     survivors: set[uuid.UUID] = set()
-    now = utcnow()
+    # 只留主键往下传，ORM 对象由每批自己重新加载 —— 失败批次的回滚会让
+    # **整个会话**里的任务行过期，后面的批次不能再依赖手上这些对象还可读。
+    ids = [task.id for task in tasks]
 
-    for start in range(0, len(tasks), CHUNK):
-        batch = tasks[start : start + CHUNK]
-        alive = set(
-            await session.scalars(select(Media.id).where(Media.id.in_([t.media_id for t in batch])))
-        )
-        targets: dict[uuid.UUID, tuple[uuid.UUID, int]] = {}
-        titles: dict[uuid.UUID, str] = {}
-        for task in batch:
-            if task.media_id not in alive:
-                task.status = RepairState.SKIPPED
-                task.applied_at = now
-                report.skipped += 1
-                continue
-            work_id = await _ensure_work(session, task, report)
-            targets[task.media_id] = (work_id, int(task.payload["season"]))  # type: ignore[arg-type]
-            title = task.payload.get("title")
-            if title:
-                titles[task.media_id] = str(title)[:500]
-
-        if targets:
-            stats = await assign_identities(session, targets, extra_titles=titles)
-            report.rehomed += stats.moved
-            report.merged += stats.merged
-            report.links_moved += stats.links_moved
-            report.links_dropped += stats.links_dropped
-            report.parked += stats.parked
-            touched |= stats.touched_works
-            survivors |= stats.merged_into
-
-        for task in batch:
-            if task.status == RepairState.PENDING:
-                task.status = RepairState.APPLIED
-                task.applied_at = now
-        # 按批提交：中断时这一批要么整个应用完，要么完全没动。
-        await session.commit()
+    for start in range(0, len(ids), CHUNK):
+        batch_ids = ids[start : start + CHUNK]
+        outcome = await _rehome_batch_with_retry(session, batch_ids, report)
+        if outcome is None:
+            report.failed += len(batch_ids)
+            continue
+        batch_touched, batch_survivors = outcome
+        touched |= batch_touched
+        survivors |= batch_survivors
         if on_progress is not None:
             on_progress(report.rehomed)
 
