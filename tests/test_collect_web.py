@@ -308,3 +308,61 @@ async def test_follows_torrent_intermediate_page() -> None:
     await client.aclose()
 
     assert scan_known_links(result.messages[0].text)[0].share_id == info_hash
+
+
+#: 电驴链接的真实形状。urllib 把 `//` 后面那段当 netloc，看见 `[` 就按 IPv6
+#: 字面量处理、找不到配对的 `]`，于是抛 `Invalid IPv6 URL`；`|` 还会另外触发
+#: 「netloc 含非法字符」。两种都是 ValueError。
+_ED2K_HREFS = (
+    "ed2k://|file|[电影]冰与火之歌.S06E01.HD720P.mkv|1234567|0123456789abcdef|/",
+    "ed2k://|file|权力的游戏.mkv|999|fedcba9876543210|/",
+    "http://[不是IPv6/x.html",
+)
+
+
+@pytest.mark.parametrize("bad_href", _ED2K_HREFS)
+@pytest.mark.asyncio
+async def test_unparsable_href_does_not_abort_the_whole_source(bad_href: str) -> None:
+    """一个解析不了的 href 只能跳过它自己，不能掀翻整轮采集。
+
+    6v520 / dygang / meijumi / 66yingshi 这些站以电驴链接为主，而列表页上
+    本来就混着大量根本不该跟进的 href。此前 `urljoin` 抛出的 ValueError 一路
+    冒到 `fetch` 外面，生产库里 16 个启用中的 web 源长期卡在
+    `ValueError: Invalid IPv6 URL` 上、一条数据都采不到。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                "<title>每日合集</title><p>剧集甲</p>"
+                f'<a href="{bad_href}">电驴</a>'
+                '<a href="https://pan.quark.cn/s/good">网盘地址</a>'
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = Source(
+        id=1,
+        source_type=SourceType.WEB,
+        url="https://media.example/collections",
+        identifier="https://media.example/collections",
+        max_pages_per_fetch=5,
+        extra={},
+    )
+    result = await WebCollector(client).fetch(source)
+    await client.aclose()
+
+    # 同一页上那条正常的链接照旧要采到 —— 不是「不报错就行」，是坏 href
+    # 旁边的好数据不能跟着丢。
+    assert scan_known_links(result.messages[0].text)[0].share_id == "good"
+
+
+def test_normalize_identifier_rejects_unparsable_url_without_raising() -> None:
+    """`normalize_identifier` 是探测接口，不认就返回 None，不能抛。
+
+    它的 `detect_priority` 是所有采集器里最大的、排在探测链最后兜底，在这儿
+    抛异常等于 `funflix source add` 递进来一个畸形地址就把整条链断掉。
+    """
+    assert WebCollector.normalize_identifier("http://[不是IPv6/x") is None
+    assert WebCollector.normalize_identifier(_ED2K_HREFS[0]) is None

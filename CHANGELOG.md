@@ -91,6 +91,10 @@
 
 ### 变更
 
+- `PARSE_RULES_VERSION` bump 到 `rules-v2`（`models/raw.py`）。上面两条
+  `clean_title` 幂等性修复收紧了「剥前缀」规则，产出会变，按该常量的约定必须
+  bump。实际效果：`repair requeue` 据此把 40,384 份已解析完、版本对不上的文档
+  打回了 parse 队列。
 - **删掉 `scripts/canon-rollout.sh`（587 行）和 `tests/test_canon_rollout_script.py`。**
   它整套设计（COPY binary 备份、停 Action、九个人工闸门、迁移 B 收口）是为「原地改
   89 万行历史数据」服务的，而历史数据不需要保留 —— 只有采集（`raw_document`）和
@@ -151,6 +155,34 @@
 
 ### 修复
 
+- **一个 `ed2k://` 链接就让整个采集源这一轮全废**（`services/collect/web.py`）。
+  `urljoin` / `urlsplit` 遇上 `ed2k://|file|[电影]冰与火之歌.mkv|123|abc|/` 这种
+  href 会抛 `ValueError: Invalid IPv6 URL` —— urllib 把 `//` 后面那段当 netloc，
+  看见 `[` 就按 IPv6 字面量解析、找不到配对的 `]`。异常从 `_detail_message` /
+  `fetch` 的列表循环里一路冒出来，整个源这轮采集到此为止，**同一页上正常的
+  夸克链接也一起丢**。实测生产库里 16 个启用中的 web 源长期卡在这一条错误上。
+  改成 `_resolve` / `_path` 两个小包装，解析不了就返回 `None` / 空串跳过这条
+  href；`_canonical_url` 同样兜住，因为它背的 `normalize_identifier` 是约定了
+  「判不出就返回 None」的检测接口。修完 66yingshi / 6v520 / dygang / meijumi
+  全部恢复出数，剩下 6 个源的失败都是真实的外部原因（DNS 没了、404、503、
+  接口改版）。
+- **夸克 `41004 文件不存在` 被判成 ERROR，5.7 万条链接永远探不出结论**
+  （`services/verify/quark.py`）。它是生产库 `link_check` 里第二多的失效码
+  （57,697 条），却不在 `_GONE_CODES` 表上，于是落到 ERROR —— 而 ERROR 的语义是
+  「判不出来，排退避重试」，这批链接每轮都被重新探一遍，还挤掉真正待校验链接的
+  名额。它与 `41006 分享不存在` 的区别只是夸克那边分享还在、里面的文件被删了，
+  对使用者是一样的：点进去拿不到东西。码表与文案兜底表同时补上。刻意**不**收
+  `15000 inner error`（HTTP 500，88 条）—— 那是服务端抽风，重试才是对的。
+  UC 网盘共用这套 `classify`，一处修两个网盘都好。
+- **阿里云盘在默认 5 次/秒下几乎全被风控**（`services/verify/runner.py`）。
+  `verify --limit 300` 实测 238 条返回 `{"code":"TooManyRequests"}`，生产库因此
+  积压 14,284 条 `rate_limited` 资源。限速原先是一个全局值，而各网盘的耐受度差
+  一个数量级：同一批 25 条阿里分享，2 次/秒仍有 11 条被限流，1 次/秒降到 2 条，
+  0.5 次/秒为 0；夸克在 5 次/秒下毫无限流迹象（10,980 valid / 6,585 invalid）。
+  所以加的是**按网盘覆盖**（`PROVIDER_RATE_LIMITS`，两个限流器实现共用一张折算
+  逻辑），而不是把全局值调慢 —— 夸克才是队列里的大头。阿里取 1 次/秒而不是
+  0.5：被限流的响应不会误判成失效，只是白跑一次，要最大化的是单位时间内**探出
+  结论**的条数（1.0 × 92% > 0.5 × 100%）。
 - **`clean_title` 不幂等，每轮 repair 吃掉片名开头一个拉丁字母**
   （`services/text/normalize.py`）。剥「表格残留的单字母列名」那条规则是
   `^\s*[a-z]\s+`，不管后面是什么都剥：`E T 外星人` → `T 外星人` → `外星人`，

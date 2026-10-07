@@ -23,7 +23,9 @@ from funflix.models.base import Base, JsonType, PkType, TimestampMixin, UTCDateT
 #:
 #: 和 `CANON_PROMPT_VERSION`（归一 prompt）、`extract/llm/prompts.py` 的
 #: `PROMPT_VERSION`（绑在 `extraction` 表缓存键上）都是独立的东西，不要混用。
-PARSE_RULES_VERSION = "rules-v1"
+#: v1 → v2：`clean_title` 的两条「剥前缀」规则收紧了（单字母列名要求后面紧跟汉字、
+#: 数字行号要求后面不是数字），产出会变，所以按上面的约定 bump。
+PARSE_RULES_VERSION = "rules-v2"
 
 if TYPE_CHECKING:
     from funflix.models.extraction import Extraction

@@ -1747,7 +1747,9 @@ def verify(
         typer.Option(help="处理单元并发线程数（并发探测，不碰数据库），默认取 max(8, CPU 核数)"),
     ] = max(8, os.cpu_count() or 1),
     resource_id: Annotated[uuid.UUID | None, typer.Option(help="只校验指定资源")] = None,
-    rate: Annotated[float, typer.Option(help="每个网盘每秒最多几次请求")] = 5.0,
+    rate: Annotated[
+        float, typer.Option(help="每个网盘每秒最多几次请求（个别网盘另有更慢的下调值）")
+    ] = 5.0,
     recheck_all: Annotated[
         bool, typer.Option("--recheck-all", help="忽略复查时间，重校验全部可校验资源")
     ] = False,
@@ -1760,6 +1762,9 @@ def verify(
     `probe.check()`，一个消费者线程每攒够 `--write-batch` 条就批量落库、
     提交一次。默认限速已提到 5/秒——打太快可能触发网盘风控，被限流的响应会
     误判成链接失效；这是接受该风险换取速度的选择，见 README。
+
+    `--rate` 是全局值，扛不住它的网盘由 `services/verify/runner.py` 的
+    `PROVIDER_RATE_LIMITS` 单独下调（目前只有阿里云盘，实测数据在那里）。
     """
     from funflix.base.db import session_scope
     from funflix.models import Resource

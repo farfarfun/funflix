@@ -4,6 +4,9 @@
 
 - 有效：`{"status":200,"code":0,"data":{"stoken":...,"title":...,"expired_type":1,...}}`
 - 失效：`{"status":404,"code":41006,"message":"分享不存在"}`
+- 失效：`{"status":404,"code":41004,"message":"文件不存在"}`（分享还在、里面的文件被删了）
+- 服务端抽风：`{"status":500,"code":15000,"message":"inner error, requestId ..."}`
+  —— 刻意**不**收进任何码表，它该走 ERROR 退避重试（生产库里只有 88 条）。
 
 **这是逆向出来的私有接口，会随网盘改版失效。**
 所以 `classify` 判不出来时返回 `None`，由骨架归到 ERROR 而不是 INVALID ——
@@ -17,15 +20,21 @@ from typing import Any
 from funflix.base.enums import CheckStatus, Provider
 from funflix.services.verify.base import AnonymousHttpProbe, CheckOutcome, LinkRef
 
-#: 明确表示"这个分享没了"的业务码
-_GONE_CODES = {41006, 41007, 41008, 41031}
+#: 明确表示"这个分享没了"的业务码。
+#:
+#: `41004 文件不存在` 是生产库里**第二多**的失效码（`link_check` 里 57,697 条），
+#: 此前不在表上、落到 ERROR —— 而 ERROR 的语义是「判不出来，排退避重试」，
+#: 于是这 5.7 万条链接每轮都被重新探一遍，永远探不出结论，还挤掉了真正待校验
+#: 链接的名额。它和 `41006 分享不存在` 的区别只是夸克那边分享还在、分享里的
+#: 文件被删了，对使用者是一样的：点进去拿不到东西。
+_GONE_CODES = {41004, 41006, 41007, 41008, 41031}
 #: 明确表示"要提取码"的业务码
 _NEED_PASSWORD_CODES = {41005}
 #: 被限流 / 风控
 _RATE_LIMITED_CODES = {40001, 41013, 429}
 
 #: 业务码判不出来时，用返回文案兜底
-_GONE_HINTS = ("分享不存在", "已失效", "已删除", "已取消", "违规", "过期")
+_GONE_HINTS = ("分享不存在", "文件不存在", "已失效", "已删除", "已取消", "违规", "过期")
 _PASSWORD_HINTS = ("提取码", "密码", "访问码")
 _RATE_HINTS = ("频繁", "限制", "稍后")
 

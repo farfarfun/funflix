@@ -65,6 +65,17 @@ class TestQuarkClassify:
         outcome = quark_classify({"code": 41006, "message": "分享不存在"}, 404)
         assert outcome.status is CheckStatus.INVALID
 
+    def test_deleted_file_is_invalid(self) -> None:
+        """`41004 文件不存在`：分享还在、分享里的文件被删了。
+
+        对使用者和 `41006` 没区别（点进去拿不到东西），所以同样判 INVALID。
+        此前它落到 ERROR —— 而 ERROR 的语义是「判不出来，排退避重试」，于是
+        生产库里 57,697 条这样的链接每轮都被重探一遍、永远探不出结论，
+        还挤掉了真正待校验链接的名额。
+        """
+        outcome = quark_classify({"status": 404, "code": 41004, "message": "文件不存在"}, 404)
+        assert outcome.status is CheckStatus.INVALID
+
     def test_banned_sharer_is_invalid(self) -> None:
         outcome = quark_classify({"code": 41031, "message": "分享者用户封禁链接查看受限"}, 403)
         assert outcome.status is CheckStatus.INVALID
@@ -396,5 +407,62 @@ class TestRateLimiter:
     async def test_zero_rate_disables_limiting(self) -> None:
         from funflix.services.verify.runner import RateLimiter
 
-        limiter = RateLimiter(rate_per_second=0)
+        limiter = RateLimiter(rate_per_second=0, overrides={})
         await limiter.acquire(Provider.QUARK)  # 不应阻塞
+
+
+class TestProviderRateOverrides:
+    """按网盘覆盖限速，见 `runner.PROVIDER_RATE_LIMITS`。
+
+    两个限流器实现（async / 线程版）共享同一张折算逻辑，所以除了那条验证
+    "覆盖值真的会卡住请求"的计时断言，其余都对两个实现各跑一遍。
+    """
+
+    def _classes(self) -> tuple[type, type]:
+        from funflix.services.verify.runner import BlockingRateLimiter, RateLimiter
+
+        return RateLimiter, BlockingRateLimiter
+
+    def test_alipan_is_slower_than_the_global_default(self) -> None:
+        # 阿里云盘在默认 5 次/秒下实测 300 条有 238 条返回 TooManyRequests，
+        # 必须单独调慢；真要改这个值，先把 runner.py 里那张实测表重测一遍。
+        from funflix.services.verify.runner import PROVIDER_RATE_LIMITS
+
+        assert PROVIDER_RATE_LIMITS[Provider.ALIPAN] < 5.0
+
+    def test_override_applies_to_listed_provider_only(self) -> None:
+        for cls in self._classes():
+            limiter = cls(rate_per_second=10.0, overrides={Provider.ALIPAN: 2.0})
+            assert limiter._interval_for(Provider.ALIPAN) == pytest.approx(0.5), cls
+            assert limiter._interval_for(Provider.QUARK) == pytest.approx(0.1), cls
+
+    def test_empty_overrides_leaves_one_global_rate(self) -> None:
+        for cls in self._classes():
+            limiter = cls(rate_per_second=10.0, overrides={})
+            assert limiter._interval_for(Provider.ALIPAN) == pytest.approx(0.1), cls
+
+    def test_default_overrides_are_the_production_table(self) -> None:
+        from funflix.services.verify.runner import PROVIDER_RATE_LIMITS
+
+        for cls in self._classes():
+            limiter = cls(rate_per_second=10.0)
+            expected = 1.0 / PROVIDER_RATE_LIMITS[Provider.ALIPAN]
+            assert limiter._interval_for(Provider.ALIPAN) == pytest.approx(expected), cls
+
+    def test_override_actually_gates_requests(self) -> None:
+        import time
+
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        limiter = BlockingRateLimiter(rate_per_second=1000.0, overrides={Provider.ALIPAN: 20.0})
+        started = time.monotonic()
+        for _ in range(3):
+            limiter.acquire(Provider.ALIPAN)
+        # 3 次请求至少要间隔 2 个 50ms 周期
+        assert time.monotonic() - started >= 0.09
+
+        # 没被覆盖的网盘仍按全局速率走，不受阿里的慢速牵连
+        started = time.monotonic()
+        for _ in range(3):
+            limiter.acquire(Provider.QUARK)
+        assert time.monotonic() - started < 0.09

@@ -50,6 +50,37 @@ def _host(url: str) -> str:
     return (urlsplit(url).hostname or "").lower().removeprefix("www.")
 
 
+def _resolve(base: str, href: str) -> str | None:
+    """把页面里的 href 解析成绝对地址。解析不了就返回 None。
+
+    `urljoin` / `urlsplit` 对**不是 URL 的字符串**不是宽容的，它们会抛
+    `ValueError`。影视站列表页里这种 href 很常见 —— 电驴链接长这样：
+
+        ed2k://|file|[电影]冰与火之歌.S06E01.mkv|1234567|abc...|/
+
+    urllib 解析时把 `//` 后面那段当 netloc，看见里面的 `[` 就按 IPv6 字面量
+    处理、找不到配对的 `]`，于是抛 `Invalid IPv6 URL`（`|` 也会另外触发
+    「netloc 含非法字符」）。
+
+    一个 href 抛异常，整个源这一轮采集就全废了 —— 实测生产库里 16 个启用中的
+    web 源长期卡在这一条错误上（6v520 / dygang / meijumi / 66yingshi 这些站，
+    恰恰都是以电驴链接为主的）。而列表页上本来就混着大量根本不该跟进的 href，
+    所以正确的处理是**跳过这一个**，不是让它掀翻整轮。
+    """
+    try:
+        return urljoin(base, href)
+    except ValueError:
+        return None
+
+
+def _path(href: str) -> str:
+    """取 href 的路径部分，取不到就当空串。理由同 `_resolve`。"""
+    try:
+        return urlsplit(href).path
+    except ValueError:
+        return ""
+
+
 def _decode(payload: bytes) -> str:
     match = _CHARSET_RE.search(payload[:5000])
     encoding = match.group(1).decode("ascii", errors="ignore") if match else "utf-8"
@@ -195,7 +226,14 @@ def _torrent_magnet(payload: bytes, name: str) -> str | None:
 
 
 def _canonical_url(url: str) -> str | None:
-    parts = urlsplit(url.strip())
+    # 这是 `normalize_identifier` 的实现，而那是**探测**接口：所有采集器依次被问
+    # 「这个地址归你吗」。它的契约是「不认就返回 None」，所以解析不了也必须走
+    # 返回值而不是抛异常 —— 否则 `funflix source add` 递进来一个畸形地址，
+    # 整条探测链会在这儿断掉（本采集器的 detect_priority 最大、排在最后兜底）。
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
     if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
         return None
     clean, _fragment = urldefrag(urlunsplit(parts))
@@ -253,9 +291,12 @@ class WebCollector(SupportsProgress):
         attachment_links: list[str] = []
         requests = 1
         attachments = [
-            (urljoin(url, href), label)
+            (resolved, label)
             for href, label in page.links
-            if label.lower().endswith(".torrent") or _ATTACHMENT_RE.search(urlsplit(href).path)
+            # 两处都要兜 ValueError：`urlsplit(href)` 自己就会在电驴链接上炸，
+            # 见 `_resolve` 的 docstring。
+            if (resolved := _resolve(url, href)) is not None
+            and (label.lower().endswith(".torrent") or _ATTACHMENT_RE.search(_path(href)))
         ]
         for attachment_url, label in attachments[:5]:
             torrent = await client.get(attachment_url, headers={"User-Agent": DEFAULT_UA})
@@ -317,7 +358,9 @@ class WebCollector(SupportsProgress):
                     -max((len(value) for value in re.findall(r"\d+", item[0])), default=0),
                 ),
             ):
-                url = urljoin(str(response.url), href)
+                url = _resolve(str(response.url), href)
+                if url is None:
+                    continue
                 if _host(url) == _host(str(response.url)) and (
                     detail_pattern.search(url) or href in listing.content_links
                 ):

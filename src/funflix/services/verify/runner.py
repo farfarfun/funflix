@@ -34,6 +34,54 @@ _RECHECK_TTL: dict[CheckStatus, timedelta | None] = {
 #: 连续这么多次判定失效后，不再浪费请求
 _INVALID_CONFIRM_TIMES = 2
 
+#: 按网盘覆盖限速（次/秒），覆盖 `--rate` 给的全局值。只写**实测扛不住全局速率**
+#: 的网盘，没列进来的沿用全局值。
+#:
+#: 阿里云盘在 `--rate 5.0`（默认值）下实测 300 条里 238 条返回
+#: `{"code":"TooManyRequests"}`，生产库因此积压了 14,284 条 `rate_limited` 资源。
+#: 对同一批 25 条阿里分享按不同速率各探一轮：
+#:
+#: | 速率    | invalid | valid | rate_limited |
+#: |---------|---------|-------|--------------|
+#: | 2.0 次/秒 | 13      | 1     | **11**       |
+#: | 1.0 次/秒 | 21      | 1     | **2**        |
+#: | 0.5 次/秒 | 23      | 1     | **0**        |
+#:
+#: 取 1.0 而不是 0.5：被限流的响应不会误判成失效（`INVALID` 要求明确的业务码），
+#: 只是白跑一次、排退避重试，所以这里要最大化的是**单位时间内探出结论的条数**。
+#: 1.0 次/秒 × 92% ≈ 0.92 条/秒，优于 0.5 次/秒 × 100% = 0.5 条/秒。
+#:
+#: 夸克在 5.0 次/秒下没有限流迹象（生产库 10,980 valid / 6,585 invalid），
+#: 所以是按网盘覆盖，而不是把全局速率调慢 —— 夸克才是队列里的大头。
+PROVIDER_RATE_LIMITS: dict[Provider, float] = {
+    Provider.ALIPAN: 1.0,
+}
+
+
+def _interval_table(
+    rate_per_second: float, overrides: dict[Provider, float] | None
+) -> tuple[float, dict[Provider, float]]:
+    """把"全局速率 + 按网盘覆盖"折算成"全局间隔 + 按网盘间隔"。
+
+    覆盖值与全局值独立：`rate_per_second=0`（不限流）不会解除覆盖 —— 覆盖表里
+    的网盘是**实测会被风控**的，这是正确性下限，不是调优参数。要彻底关掉，
+    显式传 `overrides={}`。
+
+    Args:
+        rate_per_second: 全局速率（次/秒），小于等于 0 表示不限流。
+        overrides: 按网盘覆盖的速率；`None` 表示用 `PROVIDER_RATE_LIMITS`，
+            传空字典可显式关掉覆盖。
+
+    Returns:
+        `(默认间隔秒数, {网盘: 间隔秒数})`，间隔为 0 即该网盘不限流。
+    """
+
+    def to_interval(rate: float) -> float:
+        return 1.0 / rate if rate > 0 else 0.0
+
+    table = PROVIDER_RATE_LIMITS if overrides is None else overrides
+    return to_interval(rate_per_second), {p: to_interval(r) for p, r in table.items()}
+
 
 class RateLimiter:
     """每个网盘一个令牌桶。
@@ -41,18 +89,30 @@ class RateLimiter:
     探针打的是网盘的私有接口，打太快会触发风控 —— 一旦被限流，
     返回的响应会被误判成"链接失效"，把整库资源误杀。限流是正确性问题，
     不只是礼貌问题。
+
+    各网盘的耐受度差一个数量级，所以速率也是按网盘算的，见
+    `PROVIDER_RATE_LIMITS`。
     """
 
-    def __init__(self, rate_per_second: float = 1.0) -> None:
+    def __init__(
+        self,
+        rate_per_second: float = 1.0,
+        *,
+        overrides: dict[Provider, float] | None = None,
+    ) -> None:
         """初始化限流器。
 
         Args:
             rate_per_second: 每个网盘每秒允许的最大请求数；小于等于 0 时
                 不限流。
+            overrides: 按网盘覆盖的速率，默认取 `PROVIDER_RATE_LIMITS`。
         """
-        self._interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
+        self._interval, self._intervals = _interval_table(rate_per_second, overrides)
         self._locks: dict[Provider, asyncio.Lock] = {}
         self._last: dict[Provider, float] = {}
+
+    def _interval_for(self, provider: Provider) -> float:
+        return self._intervals.get(provider, self._interval)
 
     async def acquire(self, provider: Provider) -> None:
         """按该网盘的令牌桶节奏阻塞等待，直到可以发起下一次请求。
@@ -64,15 +124,16 @@ class RateLimiter:
         Args:
             provider: 即将请求的网盘类型。
         """
-        if self._interval <= 0:
+        interval = self._interval_for(provider)
+        if interval <= 0:
             return
         lock = self._locks.setdefault(provider, asyncio.Lock())
         async with lock:
             loop = asyncio.get_running_loop()
             now = loop.time()
             elapsed = now - self._last.get(provider, 0.0)
-            if elapsed < self._interval:
-                await asyncio.sleep(self._interval - elapsed)
+            if elapsed < interval:
+                await asyncio.sleep(interval - elapsed)
             self._last[provider] = asyncio.get_running_loop().time()
 
 
@@ -85,17 +146,26 @@ class BlockingRateLimiter:
     才是全局生效，不会被并发线程数放大。
     """
 
-    def __init__(self, rate_per_second: float = 1.0) -> None:
+    def __init__(
+        self,
+        rate_per_second: float = 1.0,
+        *,
+        overrides: dict[Provider, float] | None = None,
+    ) -> None:
         """初始化限流器。
 
         Args:
             rate_per_second: 每个网盘每秒允许的最大请求数；小于等于 0 时
                 不限流。
+            overrides: 按网盘覆盖的速率，默认取 `PROVIDER_RATE_LIMITS`。
         """
-        self._interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
+        self._interval, self._intervals = _interval_table(rate_per_second, overrides)
         self._dict_lock = threading.Lock()
         self._locks: dict[Provider, threading.Lock] = {}
         self._last: dict[Provider, float] = {}
+
+    def _interval_for(self, provider: Provider) -> float:
+        return self._intervals.get(provider, self._interval)
 
     def _lock_for(self, provider: Provider) -> threading.Lock:
         with self._dict_lock:
@@ -115,13 +185,14 @@ class BlockingRateLimiter:
         Args:
             provider: 即将请求的网盘类型。
         """
-        if self._interval <= 0:
+        interval = self._interval_for(provider)
+        if interval <= 0:
             return
         with self._lock_for(provider):
             now = time.monotonic()
             elapsed = now - self._last.get(provider, 0.0)
-            if elapsed < self._interval:
-                time.sleep(self._interval - elapsed)
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
             self._last[provider] = time.monotonic()
 
 
