@@ -131,6 +131,7 @@ class TestRealCorpusRegressions:
 _IDEMPOTENCE_CORPUS = (
     "E T 外星人 简 幕",
     "K Pop 猎魔女团 国日英多",
+    "C 语言高级课程",
     "G I G N:精英部队",
     "大小：440.41MB",
     "长安三万里 IMAX Enhanced DTS UHD9 1",
@@ -189,6 +190,31 @@ class TestCleanTitleIdempotent:
     def test_single_letter_prefix_only_strips_before_han(self, raw: str, expected: str) -> None:
         """区分「列名 + 中文片名」和「片名本身以单字母开头」只能靠后面是不是汉字。"""
         assert clean_title(raw) == expected
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "C 语言高级课程",
+            "C 程序设计",
+            "C 罗传奇",
+            "A 计划",
+            "X 战警 逆转未来",
+            "K 歌情人",
+            "O 记实录",
+            "W 两个世界",
+        ],
+    )
+    def test_whitelisted_letter_titles_keep_their_first_letter(self, title: str) -> None:
+        """「后面是汉字」这道约束挡不住首字母真属于片名的那些，白名单兜住。
+
+        实测 `C 语言高级课程` 被剥成了 `语言高级课程`。白名单按字母+词配对，
+        所以放过的只是 `C 语言`，`D 语言` 照旧当列名残留剥掉（见下一条）。
+        """
+        assert clean_title(title) == title
+
+    def test_whitelist_is_paired_to_the_letter(self) -> None:
+        """白名单认的是「这个字母 + 这个词」，不是光认后面那个词。"""
+        assert clean_title("D 语言高级课程") == "语言高级课程"
 
     def test_junk_titles_may_still_shrink(self) -> None:
         """垃圾标题不要求幂等 —— 它走的是 `delete`，不是 `retitle`。
