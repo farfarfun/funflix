@@ -582,7 +582,13 @@ def db_relink_checks(
             return await relink_checks(session)
 
     report = _run(_do)
-    _table([["恢复状态", report.hydrated]], ["项", "数量"])
+    rows: list[list[object]] = [["恢复状态", report.hydrated]]
+    if report.conflicted:
+        rows.append(["撞车放弃", report.conflicted])
+    _table(rows, ["项", "数量"])
+    if report.conflicted:
+        # 不算失败：这些行留在 UNCHECKED，verify 会照常探，只是省不下那次请求。
+        _warn(f"有 {report.conflicted} 行撞并发写入冲突、重试耗尽，留给 verify 正常探测")
     _ok("校验状态恢复完成")
 
 

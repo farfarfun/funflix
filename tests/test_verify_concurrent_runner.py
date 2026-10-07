@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from funflix.base import dbconflict
 from funflix.base.config import Settings
 from funflix.base.enums import CheckStatus, Provider
 from funflix.models import Base, Resource, utcnow
@@ -524,6 +525,9 @@ class TestFlushRetry:
 
     `resource` 同时被别的节点写（parse 在重建资源、`relink-checks` 在批量回填
     历史结论），加锁顺序不一致就会死锁。实测线上一轮 323 条里有 40 条栽在这上面。
+
+    重试的通用语义（重试几次、哪些状态码才重试）在 `test_dbconflict.py` 里测，
+    这里只盯住「落库这条路真的接上了那个重试器」。
     """
 
     @staticmethod
@@ -542,7 +546,7 @@ class TestFlushRetry:
     @pytest.mark.asyncio
     async def test_deadlock_is_retried(self, monkeypatch) -> None:
         consumer = self._consumer()
-        monkeypatch.setattr(cr, "_FLUSH_RETRY_BACKOFF", 0.0)
+        monkeypatch.setattr(dbconflict, "WRITE_CONFLICT_BACKOFF", 0.0)
         attempts: list[int] = []
 
         async def flaky(items):
@@ -554,23 +558,6 @@ class TestFlushRetry:
         await consumer._flush_batch([{"resource_id": 1}])
 
         assert attempts == [1, 1], "死锁应该重试一次就过"
-
-    @pytest.mark.asyncio
-    async def test_retries_are_bounded(self, monkeypatch) -> None:
-        """重试不是无限的：对面要是一直占着锁，得报出来而不是卡死整条流水线。"""
-        consumer = self._consumer()
-        monkeypatch.setattr(cr, "_FLUSH_RETRY_BACKOFF", 0.0)
-        attempts: list[int] = []
-
-        async def always_conflict(items):
-            attempts.append(1)
-            raise self._conflict("40001")
-
-        monkeypatch.setattr(consumer, "_flush_once", always_conflict)
-        with pytest.raises(DBAPIError):
-            await consumer._flush_batch([{"resource_id": 1}])
-
-        assert len(attempts) == cr._FLUSH_RETRIES
 
     @pytest.mark.asyncio
     async def test_other_database_errors_are_not_retried(self, monkeypatch) -> None:

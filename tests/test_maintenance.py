@@ -12,7 +12,9 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 
+from funflix.base import dbconflict
 from funflix.base.enums import CheckStatus, MediaType, ParseStatus, Provider, Quality, SourceType
 from funflix.models import (
     LinkCheck,
@@ -609,3 +611,51 @@ class TestRelinkChecks:
             select(Resource).where(Resource.check_status == CheckStatus.UNCHECKED)
         )
         assert list(remaining) == []
+
+    async def test_a_batch_that_keeps_deadlocking_is_skipped(self, session, monkeypatch) -> None:
+        """一批撞车重试耗尽，只放弃这批、继续往下走，**不能把整个命令带崩**。
+
+        这个函数做的是「省一遍重探」的优化：放弃的行留在 UNCHECKED，verify
+        会照常去探，结论一样。而让异常冒出去的代价是整个 verify job 在
+        `Relink` 这一步退出 1 —— 实测线上就这么丢了一整轮，后面的
+        `funflix verify` 一条都没跑（run 37626929998）。
+        """
+        monkeypatch.setattr(maintenance, "_RELINK_BATCH", 2)
+        monkeypatch.setattr(dbconflict, "WRITE_CONFLICT_BACKOFF", 0.0)
+        for n in range(20, 24):  # 两个满批
+            session.add(
+                LinkCheck(
+                    provider=Provider.QUARK,
+                    share_id=f"s{n:06d}",
+                    url=f"https://pan.quark.cn/s/s{n:06d}",
+                    checked_at=utcnow(),
+                    status=CheckStatus.VALID,
+                )
+            )
+            session.add(_resource(n))
+        await session.commit()
+
+        real_execute = session.execute
+        seen = 0
+
+        async def flaky(stmt, params=None, *args, **kwargs):
+            """第一批（只有第一批）每次都撞死锁，第二批正常落。"""
+            nonlocal seen
+            if isinstance(params, list):
+                seen += 1
+                if seen <= dbconflict.WRITE_CONFLICT_ATTEMPTS:
+                    orig = Exception("deadlock detected")
+                    orig.sqlstate = "40P01"  # type: ignore[attr-defined]
+                    raise DBAPIError("UPDATE resource ...", {}, orig)
+            return await real_execute(stmt, params, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", flaky)
+        report = await relink_checks(session)
+        monkeypatch.undo()
+
+        assert report.conflicted == 2, "放弃的那一批要如实报出来"
+        assert report.hydrated == 2, "另一批照常恢复"
+        remaining = await session.scalars(
+            select(Resource.share_id).where(Resource.check_status == CheckStatus.UNCHECKED)
+        )
+        assert len(list(remaining)) == 2, "放弃的行留在 UNCHECKED，交给 verify 正常探测"

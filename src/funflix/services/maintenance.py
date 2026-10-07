@@ -9,9 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import cast
 
+from farlog import getLogger
 from sqlalchemy import Table, bindparam, delete, func, select, text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.dml import Update
 
+from funflix.base.dbconflict import is_write_conflict, retry_on_write_conflict
 from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus, Provider
 from funflix.models import (
     Base,
@@ -31,6 +35,8 @@ from funflix.services.text.normalize import classify_tag
 from funflix.services.verify.base import CheckOutcome
 from funflix.services.verify.runner import _next_check_at
 
+logger = getLogger("funflix")
+
 #: 重建时保留的表。采集源是**配置**，不是采集回来的数据。
 #:
 #: `user` 同理 —— 登录账号是身份配置，不是流水线产物。它原先在清空清单里，
@@ -40,7 +46,11 @@ from funflix.services.verify.runner import _next_check_at
 PRESERVED_TABLES = frozenset({"source", "user", "alembic_version"})
 
 #: `relink_checks` 每次往返携带的行数。见那里关于 84 万次往返的说明。
-_RELINK_BATCH = 5_000
+#:
+#: 从 5000 降到 2000 是为了缩小跟并行节点撞死锁的窗口：一条 UPDATE 带多少行就
+#: 同时持有多少把行锁，而 CI 里 parse 正在写同一批 `resource`。往返次数从
+#: 170 次涨到 425 次，在这个量级上无所谓；真撞上了，一批的重试代价也小一半多。
+_RELINK_BATCH = 2_000
 
 
 def data_tables(keep_documents: bool = False, purge_checks: bool = False) -> list[str]:
@@ -165,9 +175,15 @@ async def reset_pipeline_data(
 
 @dataclass(slots=True)
 class RelinkReport:
-    """`relink_checks` 的执行结果：从历史校验记录恢复了校验状态的 resource 数。"""
+    """`relink_checks` 的执行结果：从历史校验记录恢复了校验状态的 resource 数。
+
+    Attributes:
+        hydrated: 成功恢复了校验状态的 resource 数。
+        conflicted: 撞并发写入冲突、重试耗尽后放弃的行数（见 `relink_checks`）。
+    """
 
     hydrated: int = 0
+    conflicted: int = 0
 
 
 async def relink_checks(session: AsyncSession) -> RelinkReport:
@@ -261,6 +277,7 @@ async def relink_checks(session: AsyncSession) -> RelinkReport:
     ).where(ranked.c.rn == 1)
     rows = await session.stream(latest)
 
+    conflicted = 0
     batch: list[dict[str, object]] = []
     async for provider, share_id, status, checked_at in rows:
         batch.append(
@@ -273,15 +290,47 @@ async def relink_checks(session: AsyncSession) -> RelinkReport:
             }
         )
         if len(batch) >= _RELINK_BATCH:
-            await session.execute(stmt, batch)
+            conflicted += await _flush_relink_batch(session, stmt, batch)
             batch.clear()
     if batch:
-        await session.execute(stmt, batch)
+        conflicted += await _flush_relink_batch(session, stmt, batch)
 
     await session.commit()
     # 逐行数不出来（executemany 的 rowcount 不可靠），用前后差值 —— 这是精确的，
     # 因为本函数是把 resource 从 `UNCHECKED` 改走的唯一来源。
-    return RelinkReport(hydrated=unchecked_before - await _unchecked_count(session))
+    return RelinkReport(
+        hydrated=unchecked_before - await _unchecked_count(session), conflicted=conflicted
+    )
+
+
+async def _flush_relink_batch(
+    session: AsyncSession, stmt: Update, batch: list[dict[str, object]]
+) -> int:
+    """落一批回填，撞车就重试；重试耗尽则放弃这批，返回放弃的行数。
+
+    **一批失败不能把整个函数带走。** 这个函数做的是「省一遍重探」的优化：
+    放弃的那些行留在 `UNCHECKED`，verify 会照常去探，结论一样，只是多花
+    一次网络请求。而让异常冒出去的代价大得多 —— 实测是整个 verify job 在
+    `Relink` 这一步退出 1，后面的 `funflix verify` 一条都没跑。
+
+    开 SAVEPOINT 而不是直接 `execute`：死锁会把当前事务打进 aborted 状态，
+    不回滚的话后面每一批都会报「current transaction is aborted」，等于一次
+    撞车废掉整轮。回滚到 SAVEPOINT 就能把事务救回来，前面已经落好的批次
+    也不受影响（它们在更外层的事务里，commit 在函数末尾）。
+    """
+
+    async def _once() -> None:
+        async with session.begin_nested():
+            await session.execute(stmt, batch)
+
+    try:
+        await retry_on_write_conflict(_once, what=f"relink 这批 {len(batch)} 行")
+    except DBAPIError as err:
+        if not is_write_conflict(err):
+            raise
+        logger.warning(f"relink 这批 {len(batch)} 行撞车重试耗尽，放弃（留给 verify 正常探测）")
+        return len(batch)
+    return 0
 
 
 async def _unchecked_count(session: AsyncSession) -> int:

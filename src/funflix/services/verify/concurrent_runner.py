@@ -47,11 +47,11 @@ from typing import Any
 from farlog import getLogger
 from funworker import SKIP, BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
 from sqlalchemy import func, or_, select
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from funflix.base.config import Settings, get_settings
 from funflix.base.db import create_engine
+from funflix.base.dbconflict import retry_on_write_conflict
 from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, Provider
 from funflix.models import Resource, utcnow
 from funflix.services.extract.runner import keyset_after
@@ -89,28 +89,7 @@ async def count_due(session: AsyncSession, *, recheck_all: bool, limit: int | No
 #: 睡在 `produce()` 里的时间是不响应 `stop()` 的。
 _IDLE_SLEEP = 0.05
 
-#: 一批落库撞上并发写入冲突时，总共尝试几次（含第一次）。
-_FLUSH_RETRIES = 3
-
-#: 落库重试的退避基数（秒），第 n 次重试前睡 `n * 基数`。
-_FLUSH_RETRY_BACKOFF = 0.5
-
-#: Postgres 的并发写入冲突 SQLSTATE：40001 序列化失败、40P01 检测到死锁。
-#: 两者都是**瞬时**的 —— 冲突的另一方已经提交完，重试就过。
-_WRITE_CONFLICT_SQLSTATES = frozenset({"40001", "40P01"})
-
 logger = getLogger("funflix")
-
-
-def _is_write_conflict(err: DBAPIError) -> bool:
-    """判断一个数据库异常是不是「重试就能过」的并发写入冲突。
-
-    看 SQLSTATE 而不是 `isinstance` 具体的驱动异常类：asyncpg 的
-    `DeadlockDetectedError` 会被 SQLAlchemy 包成通用的 `DBAPIError`，具体
-    子类反而抓不到（同 `services/sync/runner.py` 里的说明）。SQLite 没有
-    这些状态码，所以本地测试走不到重试分支 —— 这条路只在 Postgres 上生效。
-    """
-    return getattr(err.orig, "sqlstate", None) in _WRITE_CONFLICT_SQLSTATES
 
 
 class _VerifyProducer(BaseProducer):
@@ -421,25 +400,17 @@ class _VerifyConsumer(BaseBatchConsumer):
         """落一批，撞上并发写入冲突时重试几次。
 
         `resource` 同时被别的节点写（CI 里 parse 在重建资源、`db relink-checks`
-        在按 5000 行一批回填历史结论），行锁的加锁顺序跟我们这批不一致就会死锁。
+        在按批回填历史结论），行锁的加锁顺序跟我们这批不一致就会死锁。
         实测一轮 323 条里有 2 批（40 条）栽在这上面，异常直接抛出去被
         `BaseConsumer._loop` 吞掉记个 traceback —— 那 40 条探测白做了（行还是
         UNCHECKED，下轮重新探一遍）。
+
+        重跑是干净的：`_flush_once` 每次自己开一个新会话，上一次失败的事务
+        随 `async with` 退出就回滚掉了，不用操心 aborted 状态。
         """
-        for attempt in range(_FLUSH_RETRIES):
-            try:
-                await self._flush_once(items)
-                return
-            except DBAPIError as err:
-                if not _is_write_conflict(err) or attempt == _FLUSH_RETRIES - 1:
-                    raise
-                # 死锁是**瞬时**的：Postgres 只牺牲一方，另一方已经提交完了，
-                # 重试基本就过。退避递增，别抢着跟对面再撞一次。
-                delay = _FLUSH_RETRY_BACKOFF * (attempt + 1)
-                logger.warning(
-                    f"落库撞车（第 {attempt + 1} 次），{delay:.1f}s 后重试这批 {len(items)} 条"
-                )
-                await asyncio.sleep(delay)
+        await retry_on_write_conflict(
+            lambda: self._flush_once(items), what=f"这批 {len(items)} 条校验结论"
+        )
 
     async def _flush_once(self, items: list[dict[str, Any]]) -> None:
         resource_ids = [it["resource_id"] for it in items]

@@ -100,6 +100,18 @@
 
 ### 变更
 
+- **并发写入冲突的重试提成公用件 `base/dbconflict.py`，`db relink-checks` 撞车
+  不再把整个 verify job 带走。** 实测 2026-10-07 13:14 那轮（run 37626929998）
+  `Relink` 这一步在 5000 行一批的 `UPDATE resource` 上被 Postgres 判了死锁，
+  异常冒到命令层、整步退出 1 —— 后面的 `funflix verify` **一条都没跑**，白丢
+  一整轮。三处改动：(1) 判定 + 退避重试从 `verify/concurrent_runner.py` 搬进
+  `base/dbconflict.py`，`relink_checks` 和 verify 落库共用；(2) relink 每批包在
+  `begin_nested()` 里 —— 死锁会把事务打进 aborted 状态，不回滚到 SAVEPOINT
+  的话后面每批都报 `current transaction is aborted`，一次撞车废掉整轮；
+  (3) 一批重试耗尽**只放弃这批**并计入 `RelinkReport.conflicted`，不抛异常：
+  这个函数做的是「省一遍重探」的优化，放弃的行留在 `UNCHECKED`，verify 会照常
+  去探，结论一样。`_RELINK_BATCH` 顺带从 5000 降到 2000，缩小跟并行 parse
+  抢行锁的窗口（往返 170 → 425 次，这个量级上无所谓）。
 - **`merge_media_rows` 容忍「要并的行已经被别的节点删了」**
   （`services/canon/merge.py`）。CI 里 canon 和 repair 是两个并行 job：canon
   merge 删 media 行，而 repair apply 用的是几十分钟前 `scan` 算出来的计划，
