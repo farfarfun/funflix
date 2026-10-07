@@ -10,6 +10,7 @@ from funflix.services.text.normalize import (
     extract_size_bytes,
     extract_year,
     guess_media_type,
+    looks_like_junk_title,
     norm_key,
     strip_title_marker,
 )
@@ -122,6 +123,86 @@ class TestRealCorpusRegressions:
     def test_field_label_at_the_very_start_is_not_cut(self) -> None:
         """`:导演你有病` 是真片名。靠 `strip_scrape_labels()` 的 start < 2 闸挡住。"""
         assert clean_title(":导演你有病 導演你有病") == "导演你有病 導演你有病"
+
+
+#: 幂等性用例。前一半是生产库 `repair scan` 实测吐出来的真实标题，
+#: 后一半是各条「剥前缀」规则的正例 —— 它们必须照旧被剥掉，
+#: 修幂等性不能把规则本身修没了。
+_IDEMPOTENCE_CORPUS = (
+    "E T 外星人 简 幕",
+    "K Pop 猎魔女团 国日英多",
+    "G I G N:精英部队",
+    "大小：440.41MB",
+    "长安三万里 IMAX Enhanced DTS UHD9 1",
+    "周杰伦 太阳之子全专辑 MP3 附音乐播放器 foobar 椒盐音乐 官方MV 4K",
+    "小森林:夏秋篇 REMUX",
+    "唐伯虎點秋香2之四大才子 粤语",
+    "007803 诛天大主宰",
+    "text 诛天大主宰",
+    "D 大主宰 动漫版",
+    "L 狼的孩子雨和雪",
+    "G 灌篮高手",
+    "A计划",
+    "K歌情人",
+    "X战警 天启",
+    "名称 大主宰 年番2",
+    "电视剧：师兄太稳健 (2026)",
+    "全民攻防:我有签到系统 作者:奏光 txt",
+    "Some.Title.2024.1080p.WEB-DL.H265",
+)
+
+
+class TestCleanTitleIdempotent:
+    """`clean_title` 必须是幂等的：洗过一遍的标题再洗一遍不能再变。
+
+    这不是洁癖，是 `repair` 节点能不能无人值守跑的前提。
+    `services/repair/plan.py` 每轮都拿库里存着的 `media.title`（**已经洗过的**）
+    重算一遍 `clean_title`，不等于原值就落一条 `retitle` 任务。规则只要不幂等，
+    每一轮都会检出同一批行、改一点、下一轮再改一点 —— 而
+    `media.original_title` 全库为空，改掉就找不回来了。
+
+    生产库实测踩到的两条（都已在 `_JUNK_PREFIX_RES` 里修掉）：
+
+    * `E T 外星人` → `T 外星人` → `外星人`，每轮吃掉一个首字母。
+    * `大小：440.41MB` → `440 41MB` → `41MB`，第二轮把 `440` 当行号剥了。
+    """
+
+    @pytest.mark.parametrize("title", _IDEMPOTENCE_CORPUS)
+    def test_second_pass_changes_nothing(self, title: str) -> None:
+        once = clean_title(title)
+        assert clean_title(once) == once
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            # 单字母列名后面跟汉字 —— 这才是这条规则要对付的东西，照旧剥掉
+            ("D 大主宰 动漫版", "大主宰"),
+            ("L 狼的孩子雨和雪", "狼的孩子雨和雪"),
+            ("G 灌篮高手", "灌篮高手"),
+            ("007803 诛天大主宰", "诛天大主宰"),
+            # 单字母后面是拉丁词 —— 那是片名自己的一部分，不能动
+            ("K Pop 猎魔女团", "K Pop 猎魔女团"),
+            ("E T 外星人", "E T 外星人"),
+            ("D Blade Runner", "D Blade Runner"),
+        ],
+    )
+    def test_single_letter_prefix_only_strips_before_han(self, raw: str, expected: str) -> None:
+        """区分「列名 + 中文片名」和「片名本身以单字母开头」只能靠后面是不是汉字。"""
+        assert clean_title(raw) == expected
+
+    def test_junk_titles_may_still_shrink(self) -> None:
+        """垃圾标题不要求幂等 —— 它走的是 `delete`，不是 `retitle`。
+
+        `repair/plan.py` 先判 `looks_like_junk_title(new_title)` 再判标题漂移，
+        所以这类行一轮就被删掉，不会卷进"改一点、再改一点"的回路。
+        这条用例把这个前提钉住：下面这个分享 ID 每一步都仍然判为垃圾。
+        """
+        raw = "1942762757558784044_aeWVVxu726g3waa-"
+        once = clean_title(raw)
+        assert clean_title(once) != once
+        assert looks_like_junk_title(raw)
+        assert looks_like_junk_title(once)
+        assert looks_like_junk_title(clean_title(once))
 
 
 class TestNormKey:

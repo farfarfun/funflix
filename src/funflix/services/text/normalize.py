@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
 from collections import Counter
+from typing import Any
 
 from funflix.base.enums import MediaType, Quality
 
@@ -680,12 +682,31 @@ _URL_FRAGMENT_RE = re.compile(
 #: 没带冒号所以 `_TITLE_PREFIX_RE` 没认出来的引导词（`名称 大主宰 年番2`）、
 #: 以及采集层遗留的单字母/`text` 列名（`D 大主宰 动漫版`、`text 诛天大主宰`）。
 _JUNK_PREFIX_RES = (
-    re.compile(r"^\s*\d{3,8}\s+"),
+    # 行号/编号列。`(?!\d)` 和下面那条的汉字约束是同一个目的 —— 保证本函数幂等。
+    # `大小：440.41MB` 走到这里已经是 `440 41MB`（点号在前面被换成了空格），
+    # 少了这道约束就会被当成「行号 440 + 标题 41MB」再剥一次，
+    # 于是 `clean_title` 调两遍得到两个不同的结果。真的行号后面跟的是片名，
+    # 不会是另一串数字。
+    re.compile(r"^\s*\d{3,8}\s+(?!\d)"),
     re.compile(rf"^\s*(?:{'|'.join(_TITLE_MARKERS)})\s+", re.IGNORECASE),
     # 表格残留的单字母列名：`D 大主宰 动漫版`、`L 狼的孩子雨和雪`、`G 灌篮高手`。
-    # **必须跟空格**才剥 —— 《A计划》《K歌情人》《O记实录》里的首字母是
-    # 紧贴片名的，不带空格，不会落进这一条。
-    re.compile(r"^\s*[a-z]\s+", re.IGNORECASE),
+    #
+    # 两道约束，各挡一类误伤：
+    #
+    # 1. **必须跟空格**才剥 —— 《A计划》《K歌情人》《O记实录》里的首字母是
+    #    紧贴片名的，不带空格，不会落进这一条。
+    # 2. **后面必须紧跟汉字**（`(?=[一-鿿]）`）—— 列名后面跟的是中文片名，
+    #    这是它和「片名本身以单字母开头的拉丁文标题」唯一的区别。少了这道
+    #    约束会出两种事故，生产库 `repair scan` 实测都真的发生了：
+    #
+    #    * **误删片名的一部分**：`K Pop 猎魔女团` → `Pop 猎魔女团`。
+    #    * **本函数不再幂等**，这个更要命。`repair scan` 每轮都拿库里存着的
+    #      `media.title` 重算一遍 `clean_title`，于是
+    #      `E T 外星人` → `T 外星人` → `外星人`：**每跑一轮吃掉一个字母**，
+    #      而 `media.original_title` 全库为空，吃掉就找不回来了。无人值守的
+    #      repair 节点每 2 小时一轮，这是条数据销毁回路。
+    #      `tests/test_normalize.py::TestCleanTitleIdempotent` 守着这条性质。
+    re.compile(r"^\s*[a-z]\s+(?=[一-鿿])", re.IGNORECASE),
 )
 
 #: 识别集数信息时用的全集模式 —— 这里要认季+集与光杆季号，
@@ -879,13 +900,41 @@ def norm_key(title: str) -> str:
     return "".join(ch for ch in text if ch.isalnum())
 
 
-def _to_simplified(text: str) -> str:
-    """繁体转简体。opencc 是可选依赖，缺失时原样返回。"""
+@functools.lru_cache(maxsize=1)
+def _opencc_converter() -> Any | None:
+    """惰性建一次 `OpenCC("t2s")` 并缓存。opencc 是可选依赖，缺失时返回 None。
+
+    **这个缓存是必须的，不是优化。** `OpenCC.__init__` 会把 t2s 的词典从磁盘
+    读进来（三个 JSON，每次构造 3 次 `open`），生产库 300 条文档的 cProfile：
+
+        2292/1146   25.013s   opencc.py:122(_add_dictionaries)
+             1146    0.085s   opencc.py:36(__init__)       cumtime 48.014s
+             3258    0.088s   opencc.py:80(_convert)      cumtime  0.388s
+             1146    2.046s   normalize.py:_to_simplified  cumtime 50.555s
+        总计 53.988s
+
+    53.988s 里 50.5s 花在 `_to_simplified`，而其中 48s 是**重复加载词典**，
+    真正的转换只占 0.388s。`norm_key`/`series_norm_key` 每条标题都要调一次，
+    一条文档有十几个链接，于是一条文档就重建十几次 OpenCC。
+    改成缓存之后这一项归零，批量解析从 CPU 瓶颈回到数据库往返瓶颈。
+
+    线程安全：`concurrent_runner` 在线程池里跑抽取。构造期两个线程可能各建一个
+    实例（`lru_cache` 不加锁），但两个实例等价、最终只留一个；建好之后
+    `convert` 只读那几个 dict，没有可变状态。
+    """
     try:
         from opencc import OpenCC
     except ImportError:
+        return None
+    return OpenCC("t2s")
+
+
+def _to_simplified(text: str) -> str:
+    """繁体转简体。opencc 是可选依赖，缺失时原样返回。"""
+    converter = _opencc_converter()
+    if converter is None:
         return text
-    return OpenCC("t2s").convert(text)
+    return converter.convert(text)
 
 
 # --- 元信息提取 -------------------------------------------------------------
