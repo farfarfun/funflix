@@ -31,7 +31,12 @@ from funflix.services.canon import (
 )
 from funflix.services.canon.merge import absorb_attributes, pick_survivor
 from funflix.services.canon.purge import is_junk_media_title
-from funflix.services.canon.resolver import CanonEntry, validate_decisions
+from funflix.services.canon.resolver import (
+    CanonDecision,
+    CanonEntry,
+    _persist,
+    validate_decisions,
+)
 from funflix.services.counters import (
     refresh_counters_for_media,
     refresh_media_counters,
@@ -877,6 +882,73 @@ class TestResolveValidation:
         decisions, stats = validate_decisions({"decisions": "nope"}, self.ENTRIES)
         assert decisions == []
         assert stats["missing"] == 3
+
+
+class TestPersistDecisions:
+    """落库那一步。`validate_decisions` 只保证**块内**的 key 不重复。"""
+
+    def _decision(self, key: str, title: str, confidence: float) -> CanonDecision:
+        return CanonDecision(
+            key=key,
+            work_norm_key=series_norm_key(title),
+            work_title=title,
+            season=None,
+            media_type=MediaType.MOVIE,
+            year=UNKNOWN_YEAR,
+            is_junk=False,
+            confidence=confidence,
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_key_from_two_blocks_does_not_violate_the_primary_key(self, session) -> None:
+        """同一个 key 被两个候选块各裁一遍 —— 不能 `add` 两行同主键。
+
+        `series_norm_key` 会丢掉尾部的拉丁别名而 `block_key` 留着，于是
+        《疯狂的外星人》和《疯狂的外星人 Crazy Alien》归一到同一个 key、
+        却分进两个块。两块各返一条裁决，而这个 key 在 `title_canon` 里还
+        没有行（新采进来的作品就是这样），先查后写那步查不到，commit 就炸
+        `UniqueViolationError: pk_title_canon`。生产库里 104,527 个 key
+        有 621 个横跨多块，这是必然会踩到的。
+        """
+        n, junk = await _persist(
+            session,
+            [
+                self._decision("疯狂的外星人", "疯狂的外星人", 0.7),
+                self._decision("疯狂的外星人", "疯狂的外星人", 0.9),
+            ],
+            "test-model",
+        )
+        assert n == 1
+        assert junk == 0
+        rows = list(await session.scalars(select(TitleCanon)))
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_more_confident_of_two_verdicts_wins(self, session) -> None:
+        """两块给出矛盾裁决时按置信度取，不按它们恰好的到达顺序取。"""
+        await _persist(
+            session,
+            [
+                self._decision("碧蓝之海", "碧蓝之海 OVA", 0.4),
+                self._decision("碧蓝之海", "碧蓝之海", 0.95),
+            ],
+            "test-model",
+        )
+        row = await session.scalar(select(TitleCanon))
+        assert row.work_title == "碧蓝之海"
+
+    @pytest.mark.asyncio
+    async def test_existing_row_is_updated_in_place(self, session) -> None:
+        """key 已经有行时是更新，不是插第二行。"""
+        session.add(_canon("葬送的芙莉莲", work_title="旧答案", status=CanonState.PENDING))
+        await session.commit()
+
+        await _persist(session, [self._decision("葬送的芙莉莲", "葬送的芙莉莲", 0.9)], "test-model")
+
+        rows = list(await session.scalars(select(TitleCanon)))
+        assert len(rows) == 1
+        assert rows[0].work_title == "葬送的芙莉莲"
+        assert rows[0].status is CanonState.DECIDED
 
 
 def _canon(key: str, **kw) -> TitleCanon:

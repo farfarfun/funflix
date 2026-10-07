@@ -312,9 +312,25 @@ async def _persist(
 
     没用 PG 的 `ON CONFLICT` —— 这段要同时跑在 SQLite 的测试库上，而量级
     （几千条）完全撑得起先查再写。
+
+    入参**允许同一个 key 出现多次**，这里按置信度留最高的那条。一个
+    `series_norm_key` 会横跨两个候选块：它丢掉尾部的拉丁别名，而 `block_key`
+    留着，所以《疯狂的外星人》和《疯狂的外星人 Crazy Alien》归一到同一个
+    key、却分在两个块里（实测生产库 104,527 个 key 里有 621 个这样）。两个
+    块各自裁一遍，`flat` 里就有两条同 key 的裁决 —— 若这个 key 在
+    `title_canon` 里还没有行（新采进来的作品就是这样，`canon rebuild` 不在
+    定时流水线里），`existing` 查不到，就会 `add` 两行同主键，commit 时炸
+    `UniqueViolationError: pk_title_canon`。
     """
     if not decisions:
         return 0, 0
+
+    best: dict[str, CanonDecision] = {}
+    for decision in decisions:
+        incumbent = best.get(decision.key)
+        if incumbent is None or decision.confidence > incumbent.confidence:
+            best[decision.key] = decision
+    decisions = list(best.values())
 
     keys = [d.key for d in decisions]
     existing = {

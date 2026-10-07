@@ -273,6 +273,20 @@
 
 ### 修复
 
+- **`canon resolve` 落库撞主键，整轮裁决全丢**（`services/canon/resolver.py`）。
+  生产 Action 实测 `UniqueViolationError: duplicate key value violates unique
+  constraint "pk_title_canon"`。`_persist` 是「先查 `existing` 再写」，但入参
+  `flat` 是把各个候选块的裁决**平铺拼起来**的，而 `validate_decisions` 只保证
+  块内的 key 不重复。一个 `series_norm_key` 会横跨两个块：它丢掉尾部的拉丁
+  别名而 `block_key` 留着，于是《疯狂的外星人》和
+  《疯狂的外星人 Crazy Alien》归一到同一个 key、却分进
+  `疯狂的外星人` 和 `疯狂的外星人crazyalien` 两个块（实测生产库 104,527 个
+  key 里有 621 个这样）。两块各返一条裁决，若这个 key 在 `title_canon` 里还
+  没有行 —— 新采进来的作品就是这样，`canon rebuild` 不在定时流水线里 ——
+  `existing` 两次都查不到，就 `add` 两行同主键，commit 时炸。因为落库是
+  `asyncio.gather` 全跑完之后一次性做的，一条冲突把**整轮**（含已经付过钱的
+  那几百个块）一起回滚。现在 `_persist` 先按 key 去重、取置信度最高的那条
+  裁决，两块给出矛盾结论时不看它们恰好的到达顺序。
 - **LLM 网关一个 429 就让 `canon resolve` 整轮白花钱**
   （`services/extract/llm/client.py`）。`extract()` 的契约写着「调用失败一律抛
   `LLMCallError`」，调用方（`canon/resolver.py`、`extract/runner.py`）也只接这一种，
