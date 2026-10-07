@@ -195,6 +195,31 @@ class BlockingRateLimiter:
                 time.sleep(interval - elapsed)
             self._last[provider] = time.monotonic()
 
+    def try_acquire(self, provider: Provider) -> bool:
+        """`acquire` 的非阻塞版：令牌就绪就消费掉并返回 True，否则立刻返回 False。
+
+        给**按网盘拆队列**的生产端用（见
+        `services/verify/concurrent_runner.py::_VerifyProducer`）：调用方手上有好
+        几个网盘的活，哪个网盘的令牌就绪就先干哪个，不能为了等某一个网盘把线程
+        睡在这里 —— 阻塞版 `acquire` 放在处理单元线程里正是这么把整条流水线拖慢的。
+
+        Args:
+            provider: 即将请求的网盘类型。
+
+        Returns:
+            True 表示已经占用了这一轮的令牌，调用方应当立即发请求；False 表示
+            该网盘还在冷却，**没有**消费任何令牌。
+        """
+        interval = self._interval_for(provider)
+        if interval <= 0:
+            return True
+        with self._lock_for(provider):
+            now = time.monotonic()
+            if now - self._last.get(provider, 0.0) < interval:
+                return False
+            self._last[provider] = now
+            return True
+
 
 @dataclass(slots=True)
 class VerifyReport:

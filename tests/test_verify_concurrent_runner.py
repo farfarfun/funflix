@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 import pytest
@@ -217,6 +219,156 @@ class TestRunVerifyPipeline:
 
         assert len(reports) == 1
         assert reports[0].resource_id == pending_resource.id
+
+
+class TestProviderQueues:
+    """生产者按网盘拆队列：慢网盘的冷却不能挡住快网盘的活。
+
+    这是整条流水线吞吐的要害。限流以前在处理单元线程里阻塞着做，阿里云盘
+    （1 次/秒）会把线程一个个占去睡觉，夸克（5 次/秒，队列里的大头）只能排在
+    后面干等——实测 300 条跑了 5 分 05 秒，整体退化成 1 条/秒。
+    """
+
+    def _producer(self, db_url: str, *, batch_size: int, limiter) -> cr._VerifyProducer:
+        return cr._VerifyProducer(
+            queue.Queue(),
+            settings=Settings(database_url=db_url),
+            limit=None,
+            batch_size=batch_size,
+            recheck_all=False,
+            rate_limiter=limiter,
+        )
+
+    @staticmethod
+    def _in_thread(producer: cr._VerifyProducer, body):
+        """在独立线程里跑生产者的 `on_start`/`produce`/`on_stop`。
+
+        生产者自己建事件循环、用 `run_until_complete` 同步查库，不能在测试本身的
+        事件循环里调（`asyncio_mode=auto`，测试函数是跑在循环里的）。生产环境里
+        它也正是独占一个线程，所以这么测跟实际跑法一致。
+        """
+
+        def run():
+            producer.on_start()
+            try:
+                return body()
+            finally:
+                producer.on_stop()
+
+        return asyncio.to_thread(run)
+
+    @pytest.mark.asyncio
+    async def test_cooling_provider_does_not_block_the_others(self, db_url) -> None:
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        async with open_session(db_url) as session:
+            session.add(make_resource(1, provider=Provider.ALIPAN, share_id="ali001"))
+            session.add_all([make_resource(n) for n in range(2, 5)])
+            await session.commit()
+
+        # 夸克不限速，阿里 1 次/秒
+        limiter = BlockingRateLimiter(rate_per_second=0.0, overrides={Provider.ALIPAN: 1.0})
+        # 先把阿里这一秒的令牌替它用掉，模拟"阿里正在冷却"
+        assert limiter.try_acquire(Provider.ALIPAN) is True
+
+        producer = self._producer(db_url, batch_size=10, limiter=limiter)
+        got = await self._in_thread(producer, lambda: [producer.produce() for _ in range(3)])
+
+        # 三条夸克一条不落地吐了出来，没有一轮因为阿里在冷却而空转
+        assert [item["provider"] for item in got] == [Provider.QUARK] * 3
+        # 阿里那条还在它自己的缓冲区里排着，没被丢掉
+        assert len(producer._buffers[Provider.ALIPAN]) == 1
+
+    @pytest.mark.asyncio
+    async def test_each_provider_pages_on_its_own_cursor(self, db_url) -> None:
+        """翻页游标也得按网盘各自一条，否则一页全是慢网盘时快网盘的缓冲区一直是空的。"""
+        import datetime as dt
+
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        old = utcnow() - dt.timedelta(days=30)
+        async with open_session(db_url) as session:
+            # 阿里这两条排在全局顺序（last_checked_at, id）的最前面
+            session.add_all(
+                [
+                    make_resource(
+                        n,
+                        provider=Provider.ALIPAN,
+                        share_id=f"ali{n:03d}",
+                        check_status=CheckStatus.INVALID,
+                        last_checked_at=old,
+                        next_check_at=old,
+                    )
+                    for n in (1, 2)
+                ]
+            )
+            session.add(make_resource(3))
+            await session.commit()
+
+        # batch_size=1：共享一条游标的话，第一页只会是最早的那条阿里，
+        # 夸克的缓冲区此刻必然是空的。
+        producer = self._producer(
+            db_url, batch_size=1, limiter=BlockingRateLimiter(rate_per_second=0.0)
+        )
+
+        def body() -> dict[Provider, uuid.UUID]:
+            # 吐到没得吐为止。`produce` 一吐出东西就返回，所以要跑够轮数才能让
+            # 轮转把每个网盘都轮到。
+            for _ in range(20):
+                try:
+                    producer.produce()
+                except StopIteration:
+                    break
+            return dict(producer._last_id)
+
+        cursors = await self._in_thread(producer, body)
+
+        # 两个网盘各自的游标都往前走了：各翻各的页。共享一条游标时，
+        # 第一页（batch_size=1）只会是最早的那条阿里，夸克要等阿里翻完才轮得到。
+        zero = uuid.UUID(int=0)
+        assert cursors[Provider.ALIPAN] != zero
+        assert cursors[Provider.QUARK] != zero
+
+    @pytest.mark.asyncio
+    async def test_mixed_providers_all_get_verified(self, db_url, monkeypatch) -> None:
+        """端到端：轮转不能把任何一个网盘落下，也不能重复吐。"""
+        monkeypatch.setattr(cr, "get_probe", fake_get_probe)
+        async with open_session(db_url) as session:
+            session.add(make_resource(1, provider=Provider.ALIPAN, share_id="ali001"))
+            session.add(make_resource(2, provider=Provider.UC, share_id="uc001"))
+            session.add_all([make_resource(n) for n in range(3, 6)])
+            # 不可校验的网盘照旧不进队列
+            session.add(make_resource(9, provider=Provider.BAIDU, share_id="baidu1"))
+            await session.commit()
+
+        reports = cr.run_verify_pipeline(
+            settings=Settings(database_url=db_url), concurrency=2, rate=0.0
+        )
+
+        assert len(reports) == 5
+        async with open_session(db_url) as session:
+            rows = list(await session.scalars(select(Resource)))
+            by_provider = {r.provider: r for r in rows}
+            assert by_provider[Provider.BAIDU].check_attempts == 0
+            assert all(r.check_attempts == 1 for r in rows if r.provider is not Provider.BAIDU), (
+                "重复校验了同一条资源"
+            )
+
+    @pytest.mark.asyncio
+    async def test_limit_counts_rows_across_all_providers(self, db_url, monkeypatch) -> None:
+        """`--limit` 是「总共吐出几条」，不是「每个网盘各几条」。"""
+        monkeypatch.setattr(cr, "get_probe", fake_get_probe)
+        async with open_session(db_url) as session:
+            session.add(make_resource(1, provider=Provider.ALIPAN, share_id="ali001"))
+            session.add(make_resource(2, provider=Provider.UC, share_id="uc001"))
+            session.add_all([make_resource(n) for n in range(3, 8)])
+            await session.commit()
+
+        reports = cr.run_verify_pipeline(
+            settings=Settings(database_url=db_url), concurrency=2, rate=0.0, limit=3
+        )
+
+        assert len(reports) == 3
 
 
 class TestPipelinePending:

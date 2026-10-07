@@ -10,10 +10,14 @@
 线程私有缓存一份即可，`_probe_for` 按 provider 缓存，同一线程内的多次
 `check()` 复用同一个探针实例，探针内部的 httpx client 也就跟着复用，
 省掉每次请求重建 TCP/TLS 连接的开销（实测每次约 1.3s，是校验环节的真正瓶颈，
-不是限流）；线程退出时 `on_stop` 显式关掉缓存里每个探针的连接池。限流器要
-跨线程共享同一个 `BlockingRateLimiter` 实例（`asyncio.Lock` 版的 `RateLimiter`
-绑在各自线程的事件循环上，不能跨线程用），这样"每个网盘每秒最多几次请求"
-才是全局生效。
+不是限流）；线程退出时 `on_stop` 显式关掉缓存里每个探针的连接池。
+
+限流**不在**处理单元线程里，而是由生产者按网盘拆队列、各自按自己的速率吐数据
+（见 `_VerifyProducer`）。放在处理单元里会出队头阻塞：阿里云盘只扛得住
+1 次/秒，线程们会挨个睡在它那把锁上，把夸克（队列里的大头，扛得住 5 次/秒）
+一起拖住，整体吞吐退化成最慢那个网盘的速率。用的是同步的
+`BlockingRateLimiter` 而不是 `asyncio.Lock` 版的 `RateLimiter`——后者绑在
+各自线程的事件循环上，不能跨线程用。
 
 落库逻辑（写 `LinkCheck`、推进 `resource.check_status`/`next_check_at`、
 刷新作品的 `valid_resource_count`）留给消费者线程，复用
@@ -40,7 +44,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
-from funworker import BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
+from funworker import SKIP, BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -76,8 +80,33 @@ async def count_due(session: AsyncSession, *, recheck_all: bool, limit: int | No
     return min(total, limit) if limit is not None else total
 
 
+#: 所有网盘的令牌都没就绪时，生产者空转一轮前睡多久（秒）。
+#:
+#: 睡得短是为了两件事：吐出时机跟令牌就绪时刻的偏差不超过这个值（最慢的网盘
+#: 也是 1 次/秒，50ms 的粒度够用），以及 `BaseProducer._loop` 能及时看到停止信号 ——
+#: 睡在 `produce()` 里的时间是不响应 `stop()` 的。
+_IDLE_SLEEP = 0.05
+
+
 class _VerifyProducer(BaseProducer):
-    """按 `(last_checked_at, id)` 复合游标翻页读取待校验资源，逐条吐给处理单元线程池。"""
+    """**按网盘拆队列**：每个网盘一条独立的翻页游标 + 一个本地缓冲区，
+    由各网盘自己的令牌桶决定下一条吐谁。
+
+    为什么不是一条共享队列 —— 限流是按网盘算的（见
+    `runner.PROVIDER_RATE_LIMITS`），而阿里云盘只扛得住 1 次/秒、夸克扛得住
+    5 次/秒。共享队列 + 在**处理单元线程里**阻塞限流的话，8 个线程会挨个卡在
+    阿里那把锁上睡觉，排在后面的夸克链接（队列里的大头）只能干等：实测 300 条
+    以阿里为主的资源跑了 5 分 05 秒，整条流水线被压到 1 条/秒 —— 等于整体吞吐
+    被**最慢的那个网盘**决定。
+
+    拆开之后限流挪到生产端，而且用的是非阻塞的 `try_acquire`：哪个网盘的令牌
+    就绪就吐哪个，都没就绪才让生产者自己睡 `_IDLE_SLEEP`。处理单元线程因此
+    永远在做真正的网络请求，整体吞吐变成**各网盘速率之和**。
+
+    还有一个副作用是必须的：翻页游标也得按网盘各自一条。共享一条游标时，
+    「下一页」是按全局 `(last_checked_at, id)` 取的，一页里可能全是阿里 ——
+    那夸克的缓冲区就一直是空的，拆队列也白拆。
+    """
 
     def __init__(
         self,
@@ -87,6 +116,7 @@ class _VerifyProducer(BaseProducer):
         limit: int | None,
         batch_size: int,
         recheck_all: bool,
+        rate_limiter: BlockingRateLimiter,
         name: str | None = None,
     ) -> None:
         """初始化生产者。
@@ -97,9 +127,12 @@ class _VerifyProducer(BaseProducer):
             settings: 数据库等运行配置，`on_start` 建立专属引擎时使用。
             limit: 本次最多产出的资源条数；None 表示不限，翻页到没有更多
                 待校验资源为止。
-            batch_size: 每次翻页查询的条数。
+            batch_size: 每个网盘每次翻页查询的条数。
             recheck_all: True 时忽略 `next_check_at`，把所有可校验 provider
                 的资源都当成待处理（强制全量复查）；False 时只取到期的。
+            rate_limiter: 按网盘限速的令牌桶。这里只用它的非阻塞接口
+                `try_acquire`，**不要**换成 `acquire` —— 生产者只有一个线程，
+                在这儿睡等某个网盘就把别的网盘也一起堵住了。
             name: 线程名，透传给 `BaseProducer`。
         """
         super().__init__(output_queue, name=name)
@@ -107,48 +140,78 @@ class _VerifyProducer(BaseProducer):
         self.limit = limit
         self.batch_size = batch_size
         self.recheck_all = recheck_all
+        self.rate_limiter = rate_limiter
 
     def on_start(self) -> None:
-        """线程启动时建立专属事件循环、数据库引擎，并重置翻页游标。"""
+        """线程启动时建立专属事件循环、数据库引擎，并重置每个网盘的翻页游标。"""
         self._aio_loop = asyncio.new_event_loop()
         self._engine = create_engine(self.settings)
         self._sessionmaker = async_sessionmaker(
             self._engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
         )
-        self._buffer: list[dict[str, Any]] = []
-        self._last_ts: Any = None
+        self._order = list(CHECKABLE_PROVIDERS)
+        self._turn = 0
+        self._buffers: dict[Provider, list[dict[str, Any]]] = {p: [] for p in self._order}
+        self._last_ts: dict[Provider, Any] = {p: None for p in self._order}
         # 全零 UUID 当"比任何真实 UUIDv7 都小"的哨兵，理由同
         # `services/extract/concurrent_runner.py::_ParseProducer.on_start`。
-        self._last_id: uuid.UUID = uuid.UUID(int=0)
+        self._last_id: dict[Provider, uuid.UUID] = {p: uuid.UUID(int=0) for p in self._order}
+        self._exhausted: dict[Provider, bool] = {p: False for p in self._order}
         self._remaining_limit = self.limit
-        self._exhausted = False
 
     def on_stop(self) -> None:
         """线程退出前释放数据库引擎并关闭事件循环。"""
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
+    def _next_provider(self) -> Provider:
+        """轮转取下一个网盘。轮转而不是固定顺序，否则排在前面的网盘会一直抢到名额。"""
+        provider = self._order[self._turn % len(self._order)]
+        self._turn += 1
+        return provider
+
     def produce(self) -> Any:
-        """吐出下一条待校验资源；本地缓冲区空了就同步翻一页。
+        """吐出下一条「所属网盘此刻允许发请求」的待校验资源。
 
         Returns:
-            描述一条待校验资源的字典（resource_id/provider/share_id/url/passcode）。
+            描述一条待校验资源的字典（resource_id/provider/share_id/url/passcode）；
+            还有活但所有网盘都在冷却时返回 `SKIP`，这一轮不往下游塞东西。
 
         Raises:
-            StopIteration: 已翻到最后一页且缓冲区为空，流水线生产端结束。
+            StopIteration: 每个网盘都翻到最后一页、缓冲区也都空了，或者已经吐满
+                `limit` 条。
         """
-        if not self._buffer and not self._exhausted:
-            self._aio_loop.run_until_complete(self._fetch_page())
-        if not self._buffer:
+        if self._remaining_limit is not None and self._remaining_limit <= 0:
             raise StopIteration
-        return self._buffer.pop(0)
 
-    async def _fetch_page(self) -> None:
-        fetch_n = self.batch_size
-        if self._remaining_limit is not None:
-            fetch_n = min(fetch_n, self._remaining_limit)
-        if fetch_n <= 0:
-            self._exhausted = True
+        # 每个网盘至多试一次：拿不到令牌就换下一个，不在这里等。
+        for _ in range(len(self._order)):
+            provider = self._next_provider()
+            if not self._buffers[provider] and not self._exhausted[provider]:
+                self._aio_loop.run_until_complete(self._fetch_page(provider))
+            if not self._buffers[provider]:
+                continue
+            if not self.rate_limiter.try_acquire(provider):
+                continue
+            if self._remaining_limit is not None:
+                self._remaining_limit -= 1
+            return self._buffers[provider].pop(0)
+
+        if all(self._exhausted.values()) and not any(self._buffers.values()):
+            raise StopIteration
+
+        time.sleep(_IDLE_SLEEP)
+        return SKIP
+
+    async def _fetch_page(self, provider: Provider) -> None:
+        """给某一个网盘翻一页，填进它自己的缓冲区。
+
+        刻意**不**按 `_remaining_limit` 去削这一页的条数：`limit` 现在是在吐出
+        时扣的（见 `produce`），而一页里多读的那些行只是没被吐出去而已 ——
+        它们的 `next_check_at` 没动，下一轮照样是待校验的。反过来按剩余额度削页，
+        会让最后几轮退化成一条一条查库。
+        """
+        if self._remaining_limit is not None and self._remaining_limit <= 0:
             return
 
         now = utcnow()
@@ -157,26 +220,31 @@ class _VerifyProducer(BaseProducer):
                 await session.scalars(
                     select(Resource)
                     .where(
+                        Resource.provider == provider,
                         *_due_conditions(now, recheck_all=self.recheck_all),
                         keyset_after(
-                            Resource.last_checked_at, Resource.id, self._last_ts, self._last_id
+                            Resource.last_checked_at,
+                            Resource.id,
+                            self._last_ts[provider],
+                            self._last_id[provider],
                         ),
                     )
+                    # 没有能同时支撑 `provider =` 和这个排序的索引，PG 会扫一遍
+                    # 再排序。`resource` 全表只有 4 万行（对比 `raw_document` 的
+                    # 213 万），实测毫秒级，不值得为它加一条复合索引。
                     .order_by(Resource.last_checked_at.nulls_first(), Resource.id)
-                    .limit(fetch_n)
+                    .limit(self.batch_size)
                 )
             )
             if not rows:
-                self._exhausted = True
+                self._exhausted[provider] = True
                 return
 
-            self._last_ts = rows[-1].last_checked_at
-            self._last_id = rows[-1].id
-            if self._remaining_limit is not None:
-                self._remaining_limit -= len(rows)
+            self._last_ts[provider] = rows[-1].last_checked_at
+            self._last_id[provider] = rows[-1].id
 
             for row in rows:
-                self._buffer.append(
+                self._buffers[provider].append(
                     {
                         "resource_id": row.id,
                         "provider": row.provider,
@@ -188,16 +256,12 @@ class _VerifyProducer(BaseProducer):
 
 
 class _VerifyProcessor(BaseProcessor):
-    """并发跑 `probe.check()`，不碰数据库。"""
+    """并发跑 `probe.check()`，不碰数据库，**也不限流**。
 
-    def __init__(self, *, rate_limiter: BlockingRateLimiter) -> None:
-        """初始化处理单元。
-
-        Args:
-            rate_limiter: 所有处理单元线程共享的同一个限流器实例，用来让
-                "每个网盘每秒最多几次请求"在全局（而非单线程）生效。
-        """
-        self.rate_limiter = rate_limiter
+    限流在生产端（见 `_VerifyProducer`）：吐出来的每一条都已经占掉了它所属
+    网盘的令牌，拿到就该立刻发请求。这里不能再 `acquire` 一次 —— 一次
+    `acquire` 消费一个令牌，两头都收的话实际速率会变成设定值的一半。
+    """
 
     def on_start(self) -> None:
         """线程启动时建立专属事件循环，并初始化本线程的探针缓存。"""
@@ -220,7 +284,7 @@ class _VerifyProcessor(BaseProcessor):
         return self._probe_cache[provider]
 
     def process(self, item: dict[str, Any]) -> Any:
-        """对一条待校验资源执行限流 + 探测。
+        """对一条待校验资源执行探测（限流已在生产端做完）。
 
         没有对应探针时直接判 UNSUPPORTED，不发起请求。探针 `check` 本身已经
         兜底了自己的异常，这里再加一层防御性 try/except，防止未来新探针
@@ -247,7 +311,6 @@ class _VerifyProcessor(BaseProcessor):
                 "probe_name": "unsupported",
             }
 
-        self.rate_limiter.acquire(provider)
         ref = LinkRef(
             provider=provider, share_id=item["share_id"], url=item["url"], passcode=item["passcode"]
         )
@@ -373,30 +436,32 @@ def run_verify_pipeline(
 
     同步阻塞函数——funworker 本身是阻塞式设计，不需要外层 `asyncio.run` 包装。
     生产/消费两端各自持有专属的 `AsyncEngine` + 事件循环（见模块 docstring），
-    处理单元线程池并发数由 `concurrency` 控制，全部线程共享同一个
-    `BlockingRateLimiter`。消费者最多攒 `write_batch` 条或每 `flush_interval`
-    秒批量落库一次，取先满足的那个条件。
+    处理单元线程池并发数由 `concurrency` 控制。限流归生产者一个人管（按网盘
+    拆队列，见 `_VerifyProducer`），处理单元拿到就发请求。消费者最多攒
+    `write_batch` 条或每 `flush_interval` 秒批量落库一次，取先满足的那个条件。
 
     `on_progress(total_enqueued, total_done)` 每 0.5 秒轮询一次，理由同
     `services/extract/concurrent_runner.py::run_parse_pipeline`。
     """
     settings = settings or get_settings()
-    rate_limiter = BlockingRateLimiter(rate_per_second=rate)
-
-    def processor_factory() -> _VerifyProcessor:
-        """构造处理单元实例，闭包捕获所有线程共享的 `rate_limiter`。"""
-        return _VerifyProcessor(rate_limiter=rate_limiter)
+    num_workers = max(1, concurrency)
 
     pipeline = Pipeline.build(
         _VerifyProducer,
-        processor_factory,
+        _VerifyProcessor,
         _VerifyConsumer,
-        num_workers=max(1, concurrency),
+        num_workers=num_workers,
+        # 输入队列限长。限流挪到生产端之后，「已经占了令牌」和「请求真的发出去」
+        # 之间隔着这条队列：队列无界的话生产者会按速率一路把几百条灌进去，
+        # 令牌早就花光而请求还排在队里，到达网盘的瞬时速率就跟设定值脱钩了。
+        # 卡在 `num_workers * 2`，让生产节奏跟着线程的实际消化速度走。
+        input_maxsize=num_workers * 2,
         producer_kwargs={
             "settings": settings,
             "limit": limit,
             "batch_size": batch_size,
             "recheck_all": recheck_all,
+            "rate_limiter": BlockingRateLimiter(rate_per_second=rate),
         },
         consumer_kwargs={
             "settings": settings,
