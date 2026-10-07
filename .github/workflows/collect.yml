@@ -160,12 +160,17 @@ jobs:
       # 「一万条」要跑两个多小时 —— 之前每轮都撞 `timeout-minutes: 120`，
       # 整个 run 被判 cancelled，别的 job 全绿也看不出来。
       #
-      # 先用 300 秒（5 分钟）跑通闭环 —— 确认这个节点在 Action 上真的能正常
-      # 收尾、不再被判超时之后，再放大到接近 `timeout-minutes` 的预算。
+      # 4800 秒 = 80 分钟。先用 300 秒在 Action 上跑通闭环量过账：那一轮
+      # Verify 这一步实际用了 5 分 07 秒 —— 只超预算 7 秒，收尾的尾巴很短
+      # （输出队列限长的功劳，见 `concurrent_runner.py`），所以预算可以按
+      # 线性放大。留的余量：Relink 实测 4 分 15 秒、历史最慢约 21 分钟，
+      # 按 25 分钟算，25 + 80 + 收尾 ≈ 106 分钟，`timeout-minutes: 120`
+      # 还剩十几分钟缓冲。
+      #
       # 到点后生产端停止取新资源，已经探出来的结论照常落库，下一轮顺着
       # `last_checked_at` 游标接着往下走 —— 少量多次、持续推进。
       - name: Verify
-        run: uv run $UV_SYNC_EXTRAS funflix verify --max-seconds 300
+        run: uv run $UV_SYNC_EXTRAS funflix verify --max-seconds 4800
 
   # 规则搞不定的归一残局交给 LLM：`刀锋战士 / 刀锋战士1 / 刀锋战士2 / 刀锋战士3`
   # 这种一个候选块里好几个候选项的，正则判不出它们是不是同一部作品的不同季。
