@@ -31,6 +31,7 @@ from funflix.services.canon import (
     purge_junk_media,
     rebuild_works,
 )
+from funflix.services.canon import merge as merge_mod
 from funflix.services.canon import resolver as resolver_mod
 from funflix.services.canon.merge import absorb_attributes, pick_survivor
 from funflix.services.canon.purge import is_junk_media_title
@@ -317,6 +318,43 @@ class TestMergeMediaRows:
         assert await session.scalar(select(func.count()).select_from(Media)) == 1
         # 资源一条都没丢
         assert await session.scalar(select(func.count()).select_from(Resource)) == 2
+
+    @pytest.mark.asyncio
+    async def test_links_are_moved_with_a_conflict_tolerant_insert(self, session) -> None:
+        """迁移语句必须自己带 `ON CONFLICT`，而不是靠子查询先排重复。
+
+        这一条盯的是**语句形状**，不是行为 —— 因为真正要防的那个失败单会话
+        复现不出来：原来的写法是
+        `UPDATE ... WHERE resource_id NOT IN (存活行已有的)`，那个子查询只看
+        得见自己事务快照里的行，同时在跑的 parse 给存活行挂的新资源它排除不
+        掉，于是 UPDATE 撞 `pk_media_resource`（run 37783618690 的 repair job
+        就是这么挂的）。窗口是跨事务的，上面那些语义测试对它完全不敏感 ——
+        改回 UPDATE 写法它们照样全绿。所以这里只能直接断言语句形状。
+        """
+        survivor, loser = _media("大主宰"), _media("大主宰 S02")
+        res = _resource(1)
+        session.add_all([survivor, loser, res])
+        await session.flush()
+        await _link(session, loser, res)
+        await session.commit()
+
+        statements: list[str] = []
+        real = session.execute
+
+        async def spy(stmt, *a, **kw):
+            statements.append(str(stmt.compile(dialect=session.bind.dialect)))
+            return await real(stmt, *a, **kw)
+
+        session.execute = spy  # type: ignore[method-assign]
+        try:
+            moved, dropped = await merge_mod._move_links(session, loser.id, survivor.id)
+        finally:
+            session.execute = real  # type: ignore[method-assign]
+
+        assert (moved, dropped) == (1, 0)
+        assert any("ON CONFLICT" in s and "INSERT INTO media_resource" in s for s in statements), (
+            statements
+        )
 
     @pytest.mark.asyncio
     async def test_loser_titles_become_aliases(self, session) -> None:

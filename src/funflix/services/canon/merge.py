@@ -15,9 +15,10 @@ import uuid
 from dataclasses import dataclass
 
 from farlog import getLogger
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import Table, delete, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.dbinsert import insert_stmt
 from funflix.base.enums import MediaType
 from funflix.models import Media, media_resource, media_tag
 from funflix.models.media import UNKNOWN_YEAR
@@ -59,41 +60,62 @@ async def pick_survivor(session: AsyncSession, media_ids: list[uuid.UUID]) -> uu
     return max(media_ids, key=lambda mid: (counts.get(mid, 0), str(mid)))
 
 
+async def _move_assocs(
+    session: AsyncSession, table: Table, other: str, loser: uuid.UUID, survivor: uuid.UUID
+) -> tuple[int, int]:
+    """把一个败者在某张关联表上的行迁到存活行，返回 (迁移数, 丢弃的重复数)。
+
+    **一次只迁一个败者** —— 不能把整组 `media_id.in_(losers)` 一把迁完：两个
+    败者挂着同一条资源时，两行都会变成同一个 `(survivor, resource)`，直接撞
+    关联表主键。逐个迁的话第二个败者的那条在下一轮里会被当成重复丢掉，这才
+    是对的。
+
+    ## 为什么是「插入 + 删除」而不是 UPDATE
+
+    原来这里是 `UPDATE ... WHERE resource_id NOT IN (存活行已有的)`，看着没
+    问题：子查询把重复的排除掉了。**但那个子查询只看得见自己事务快照里的
+    行。** 同时在跑的 parse 正在给存活行挂新资源，它提交在我们的快照之后，
+    于是子查询没排除它、UPDATE 把败者那条改成同一个键 —— 撞主键。
+
+    run 37783618690 的 repair job 就是这么挂的：`duplicate key value violates
+    unique constraint "pk_media_resource"`，调用链 `repair apply` →
+    `assign_identities` → `merge_media_rows` → 这里。而 `_apply_rehomes` 的
+    退避重试没救它 —— 那层只认死锁和序列化失败（SQLSTATE 40001/40P01），
+    23505 唯一键冲突不在里面，**而且也不该加进去**：23505 不是普遍瞬时的，
+    真有重复插入的逻辑 bug 会被静默重试三次然后吞掉。
+
+    所以治根：`INSERT ... SELECT ... ON CONFLICT DO NOTHING` 把「有没有重复」
+    的判断挪进同一条语句里，窗口就不存在了；然后无条件删掉败者剩下的行。
+    语义和原来完全一样，只是不再有那个窗口。见 `base/dbinsert.py`。
+    """
+    src = select(
+        literal(survivor, type_=table.c.media_id.type).label("media_id"),
+        table.c[other],
+        table.c.created_at,
+    ).where(table.c.media_id == loser)
+    moved = await session.execute(
+        insert_stmt(session, table)
+        .from_select(["media_id", other, "created_at"], src)
+        .on_conflict_do_nothing(index_elements=["media_id", other])
+    )
+    # 插入之后败者名下**所有**行都该没了：搬过去的那些已经在存活行名下有副本，
+    # 撞上重复的那些本来就该丢。所以 `dropped` 是删除数减去迁移数。
+    deleted = await session.execute(delete(table).where(table.c.media_id == loser))
+    moved_count = moved.rowcount or 0
+    return moved_count, max((deleted.rowcount or 0) - moved_count, 0)
+
+
 async def _move_links(
     session: AsyncSession, loser: uuid.UUID, survivor: uuid.UUID
 ) -> tuple[int, int]:
-    """把一个败者的资源关联迁到存活行，返回 (迁移数, 丢弃的重复数)。
-
-    **一次只迁一个败者** —— 不能把整组 `media_id.in_(losers)` 一条 UPDATE
-    迁完：两个败者挂着同一条资源时，两行都会被改成同一个
-    `(survivor, resource)`，直接撞关联表主键。逐个迁的话第二个败者的那条
-    在下一轮里会被当成重复丢掉，这才是对的。
-    """
-    dupes = select(media_resource.c.resource_id).where(media_resource.c.media_id == survivor)
-    moved = await session.execute(
-        update(media_resource)
-        .where(media_resource.c.media_id == loser, media_resource.c.resource_id.not_in(dupes))
-        .values(media_id=survivor)
-    )
-    dropped = await session.execute(
-        delete(media_resource).where(media_resource.c.media_id == loser)
-    )
-    return moved.rowcount or 0, dropped.rowcount or 0
+    """把一个败者的资源关联迁到存活行，返回 (迁移数, 丢弃的重复数)。"""
+    return await _move_assocs(session, media_resource, "resource_id", loser, survivor)
 
 
 async def _move_tags(session: AsyncSession, loser: uuid.UUID, survivor: uuid.UUID) -> int:
-    """把一个败者的标签关联迁到存活行。重复的直接丢（标签没有计数要守）。
-
-    同 `_move_links`，逐个败者迁，理由一样。
-    """
-    dupes = select(media_tag.c.tag_id).where(media_tag.c.media_id == survivor)
-    moved = await session.execute(
-        update(media_tag)
-        .where(media_tag.c.media_id == loser, media_tag.c.tag_id.not_in(dupes))
-        .values(media_id=survivor)
-    )
-    await session.execute(delete(media_tag).where(media_tag.c.media_id == loser))
-    return moved.rowcount or 0
+    """把一个败者的标签关联迁到存活行。重复的直接丢（标签没有计数要守）。"""
+    moved, _ = await _move_assocs(session, media_tag, "tag_id", loser, survivor)
+    return moved
 
 
 def absorb_attributes(survivor: Media, loser: Media) -> None:

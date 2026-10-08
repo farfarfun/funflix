@@ -25,6 +25,7 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.dbinsert import insert_stmt
 from funflix.models import Base
 from funflix.services.sync.tables import SyncTable, sync_tables
 
@@ -72,22 +73,13 @@ class SyncReport:
         return sum(t.skipped_conflicts for t in self.tables)
 
 
-def _insert_stmt(session: AsyncSession, table: sa.Table) -> postgresql.Insert | sqlite.Insert:
-    dialect = session.bind.dialect.name
-    if dialect == "postgresql":
-        return postgresql.insert(table)
-    if dialect == "sqlite":
-        return sqlite.insert(table)
-    raise NotImplementedError(f"同步不支持方言: {dialect}")
-
-
 def _upsert_stmt(
     session: AsyncSession, spec: SyncTable, values: list[dict]
 ) -> postgresql.Insert | sqlite.Insert:
     pk_cols = [c.name for c in spec.table.primary_key.columns]
     update_cols = [c.name for c in spec.table.columns if c.name not in pk_cols]
 
-    stmt = _insert_stmt(session, spec.table).values(values)
+    stmt = insert_stmt(session, spec.table).values(values)
     if spec.mutable and update_cols:
         wm = spec.watermark_column
         stmt = stmt.on_conflict_do_update(

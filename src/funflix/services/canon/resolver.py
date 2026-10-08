@@ -613,9 +613,14 @@ async def _persist(
     - **分段把损失关小。** 不分段的话一次冲突回滚掉整轮一万条裁决，那是一小时
       的 LLM 调用。分段之后最坏也只影响 500 条，而且重试几乎总能救回来。
 
-    没用 `ON CONFLICT DO UPDATE` 一把梭：这段要同时跑在 SQLite 的测试库上，
-    两种方言的 `on_conflict_do_update` 得分别构造，为一个每轮撞一两次的竞态
-    养两条落库代码路径不值得。
+    没用 `ON CONFLICT DO UPDATE` 一把梭：这里落的是 **ORM 对象**（改字段、
+    靠 flush 生成语句），要换成 `ON CONFLICT` 得先把它拆成 Core 的
+    `insert().values(...)`，一行有十几个列要手写一遍，而且 `TitleCanon` 加
+    字段时两处得同步改。`canon/merge.py::_move_assocs` 那边能用是因为关联
+    表只有三列、本来就走 Core。
+
+    （「两种方言得分别构造」这个理由**已经不成立了** —— 方言分支抽成了
+    `base/dbinsert.py::insert_stmt`。留在这里的理由只有上面那条。）
     """
     if not decisions:
         return 0, 0
