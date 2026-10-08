@@ -948,7 +948,8 @@ class TestPersistDecisions:
         rows = list(await session.scalars(select(TitleCanon)))
         assert len(rows) == 1
         assert rows[0].work_title == "葬送的芙莉莲"
-        assert rows[0].status is CanonState.DECIDED
+        # `CanonState` 是一组字符串常量，不是枚举 —— 只能比值，不能比身份。
+        assert rows[0].status == CanonState.DECIDED
 
 
 def _canon(key: str, **kw) -> TitleCanon:

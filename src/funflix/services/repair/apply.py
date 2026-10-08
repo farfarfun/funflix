@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 
 from farlog import getLogger
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.dbconflict import (
@@ -248,36 +249,124 @@ async def _apply_retitles(
         await session.commit()
 
 
-async def _ensure_work(session: AsyncSession, task: RepairTask, report: ApplyReport) -> uuid.UUID:
-    """按 payload 的 `work_norm_key` get-or-create Work。
+@dataclass(frozen=True, slots=True)
+class _WorkSpec:
+    """从任务 payload 里抽出来的建作品所需信息。"""
+
+    title: str
+    media_type: MediaType
+    year: int
+
+
+async def _create_work(session: AsyncSession, key: str, spec: _WorkSpec) -> tuple[Work, bool]:
+    """插一行 Work，撞上并发插入就回落到对面刚提交的那行。
+
+    返回 `(work, 是不是这次新建的)`。
+
+    `add` 必须写在 savepoint **里面**。`begin_nested()` 在建 SAVEPOINT 之前会先
+    把会话里待落库的改动 flush 掉一次（`SessionTransaction._take_snapshot`），
+    写在外面的话 insert 实际是在 savepoint **之外**执行的 —— Postgres 一报错
+    整个事务就进 aborted 状态，回滚到 savepoint 救不回来，后面随便一句
+    `select` 都会接着报「current transaction is aborted」。
+    """
+    work = Work(norm_key=key, title=spec.title, media_type=spec.media_type, year=spec.year)
+    try:
+        async with session.begin_nested():
+            session.add(work)
+            await session.flush()
+    except IntegrityError:
+        # 回滚到 savepoint 时 `_restore_snapshot` 已经把这条新对象踢回
+        # transient 了，不用再 expunge 一次。
+        winner = await session.scalar(select(Work).where(Work.norm_key == key))
+        if winner is None:  # pragma: no cover - 理论上不可达
+            raise
+        logger.info(f"新建作品撞上并发插入，回落到已有行：{key}")
+        return winner, False
+    return work, True
+
+
+async def _ensure_works(
+    session: AsyncSession, tasks: list[RepairTask], report: ApplyReport
+) -> dict[str, uuid.UUID]:
+    """按整批任务的 `work_norm_key` 一次性 get-or-create Work，返回 key → work_id。
+
+    整批做掉、而不是在按 task 的循环里一条条做，图两件事：一是往返次数从
+    「每条一次 select 加一次 insert」降到两次；二是 `begin_nested()` 在建
+    SAVEPOINT 之前会把**整个会话**待落库的改动 flush 一遍
+    （`SessionTransaction._take_snapshot`），而 savepoint 回滚又会让它自己那
+    一轮里改动过的对象过期（`_restore_snapshot`）—— 放在批次最开头跑，会话
+    是干净的，这两样的作用范围就正好只有这里的几条 insert，碰不到任务行。
+
+    并发插入是真会撞的：`select` 查不到、`insert` 之前，并行的 canon job 和
+    parse 四个分片也在 get-or-create 同一批作品键 —— 实测生产 run
+    `37693106252` 的 Apply 步就是这么挂的（`uq_work_norm_key`，
+    `Key (norm_key)=(回到未来3简英双语特效) already exists`），整步退出 1，
+    一万多条 pending rehome 一条都排不掉。
 
     已存在的 Work **不覆盖属性**，只在原值为空/unknown 时补 —— 和
     `canon/apply.py::_ensure_work` 同一个契约。它可能是裁决建的、或者人工
     改过，拿一行 media 的推断去覆盖整部作品是不对的。
     """
-    work_key = str(task.payload["work_norm_key"])
-    media_type = MediaType(task.payload.get("media_type") or MediaType.UNKNOWN)
-    year = int(task.payload.get("year", UNKNOWN_YEAR))
-
-    work = await session.scalar(select(Work).where(Work.norm_key == work_key))
-    if work is None:
-        work = Work(
-            norm_key=work_key,
-            title=str(task.payload.get("work_title") or work_key)[:500],
-            media_type=media_type,
-            year=year,
+    wanted: dict[str, _WorkSpec] = {}
+    for task in tasks:
+        key = str(task.payload["work_norm_key"])
+        if key in wanted:
+            continue
+        wanted[key] = _WorkSpec(
+            title=str(task.payload.get("work_title") or key)[:500],
+            media_type=MediaType(task.payload.get("media_type") or MediaType.UNKNOWN),
+            year=int(task.payload.get("year", UNKNOWN_YEAR)),
         )
-        session.add(work)
-        await session.flush()
-        report.works_created += 1
-        return work.id
+    if not wanted:
+        return {}
 
-    report.works_existing += 1
-    if work.media_type is MediaType.UNKNOWN and media_type is not MediaType.UNKNOWN:
-        work.media_type = media_type
-    if work.year == UNKNOWN_YEAR and year != UNKNOWN_YEAR:
-        work.year = year
-    return work.id
+    found: dict[str, Work] = {
+        work.norm_key: work
+        for work in await session.scalars(select(Work).where(Work.norm_key.in_(list(wanted))))
+    }
+    report.works_existing += len(found)
+
+    missing = [key for key in wanted if key not in found]
+    if missing:
+        fresh = [
+            Work(
+                norm_key=key,
+                title=wanted[key].title,
+                media_type=wanted[key].media_type,
+                year=wanted[key].year,
+            )
+            for key in missing
+        ]
+        try:
+            # 整批一起 flush，撞车概率低；真撞上就退化到逐条，不让整批因为
+            # 一条冲突同归于尽。`add_all` 同样得写在 savepoint 里面，原因见
+            # `_create_work`。
+            async with session.begin_nested():
+                session.add_all(fresh)
+                await session.flush()
+        except IntegrityError:
+            logger.info(f"整批新建作品撞上并发插入，退化为逐条处理：{len(missing)} 个键")
+            for key in missing:
+                work, created = await _create_work(session, key, wanted[key])
+                found[key] = work
+                if created:
+                    report.works_created += 1
+                else:
+                    report.works_existing += 1
+        else:
+            report.works_created += len(fresh)
+            found.update(zip(missing, fresh, strict=True))
+
+    # 属性补齐放最后：这些写入会让 Work 变脏，而上面任何一次 savepoint 回滚
+    # 都会把脏对象的改动一起抹掉。
+    for key, spec in wanted.items():
+        work = found[key]
+        if work.media_type is MediaType.UNKNOWN and spec.media_type is not MediaType.UNKNOWN:
+            work.media_type = spec.media_type
+        if work.year == UNKNOWN_YEAR and spec.year != UNKNOWN_YEAR:
+            work.year = spec.year
+
+    return {key: work.id for key, work in found.items()}
 
 
 #: 批次重跑前要退回去的计数字段。死锁让整批回滚，计数不退回就会把失败
@@ -320,6 +409,9 @@ async def _rehome_batch(
     alive = set(
         await session.scalars(select(Media.id).where(Media.id.in_([t.media_id for t in batch])))
     )
+    # 作品行先整批 get-or-create 完，再动任务行 —— 顺序有讲究，见 `_ensure_works`。
+    work_ids = await _ensure_works(session, [t for t in batch if t.media_id in alive], report)
+
     targets: dict[uuid.UUID, tuple[uuid.UUID, int]] = {}
     titles: dict[uuid.UUID, str] = {}
     for task in batch:
@@ -328,7 +420,7 @@ async def _rehome_batch(
             task.applied_at = now
             report.skipped += 1
             continue
-        work_id = await _ensure_work(session, task, report)
+        work_id = work_ids[str(task.payload["work_norm_key"])]
         targets[task.media_id] = (work_id, int(task.payload["season"]))  # type: ignore[arg-type]
         title = task.payload.get("title")
         if title:

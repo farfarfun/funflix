@@ -133,6 +133,35 @@ async def _media_row(session, title: str, *, resources: int = 1, **kw) -> Media:
     return media
 
 
+async def _pending_rehomes(session, titles: list[str]) -> None:
+    """每个干净标题配一行顶着**旧作品键**的 media，外加一个 pending rehome。
+
+    夹具得用带噪声的 `media.title`，否则 `_stale_key` 算出来的旧键跟新键
+    一样，根本构造不出 `key_drift`（见它的断言）。
+    """
+    for title in titles:
+        dirty = f"{title} 作者:某人"
+        media = await _media_row(session, dirty, work_norm_key=_stale_key(dirty))
+        session.add(
+            RepairTask(
+                kind=RepairKind.REHOME,
+                symptom=RepairSymptom.KEY_DRIFT,
+                media_id=media.id,
+                payload={
+                    "title": title,
+                    "work_norm_key": series_norm_key(title),
+                    "work_title": title,
+                    "season": NO_SEASON,
+                    "media_type": MediaType.MOVIE.value,
+                    "year": UNKNOWN_YEAR,
+                },
+                status=RepairState.PENDING,
+                detected_at=utcnow(),
+            )
+        )
+    await session.commit()
+
+
 class TestPlanNoOp:
     """规则没变 → 一个任务都不建。这是整套机制能天天跑的前提。"""
 
@@ -685,40 +714,12 @@ class TestRehomeSurvivesDeadlocks:
         orig.sqlstate = "40P01"  # type: ignore[attr-defined]
         return DBAPIError("UPDATE media ...", {}, orig)
 
-    async def _pending_rehomes(self, session, titles: list[str]) -> None:
-        """每个干净标题配一行顶着**旧作品键**的 media，外加一个 pending rehome。
-
-        夹具得用带噪声的 `media.title`，否则 `_stale_key` 算出来的旧键跟新键
-        一样，根本构造不出 `key_drift`（见它的断言）。
-        """
-        for title in titles:
-            dirty = f"{title} 作者:某人"
-            media = await _media_row(session, dirty, work_norm_key=_stale_key(dirty))
-            session.add(
-                RepairTask(
-                    kind=RepairKind.REHOME,
-                    symptom=RepairSymptom.KEY_DRIFT,
-                    media_id=media.id,
-                    payload={
-                        "title": title,
-                        "work_norm_key": series_norm_key(title),
-                        "work_title": title,
-                        "season": NO_SEASON,
-                        "media_type": MediaType.MOVIE.value,
-                        "year": UNKNOWN_YEAR,
-                    },
-                    status=RepairState.PENDING,
-                    detected_at=utcnow(),
-                )
-            )
-        await session.commit()
-
     @pytest.mark.asyncio
     async def test_transient_deadlock_is_retried_and_the_batch_lands(
         self, session, monkeypatch
     ) -> None:
         """冲突是瞬时的（对面已经提交完了），重跑一次就该过。"""
-        await self._pending_rehomes(session, ["流浪地球"])
+        await _pending_rehomes(session, ["流浪地球"])
 
         real = apply_mod.assign_identities
         calls = {"n": 0}
@@ -751,7 +752,7 @@ class TestRehomeSurvivesDeadlocks:
         而不是每轮都在同一个地方倒下。
         """
         titles = ["流浪地球", "疯狂的外星人", "我不是药神"]
-        await self._pending_rehomes(session, titles)
+        await _pending_rehomes(session, titles)
         monkeypatch.setattr(apply_mod, "CHUNK", 1)
         monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
 
@@ -797,7 +798,7 @@ class TestRehomeSurvivesDeadlocks:
 
         报告里的数字是人判断「这一轮到底动了多少行」的唯一依据。
         """
-        await self._pending_rehomes(session, ["流浪地球", "疯狂的外星人"])
+        await _pending_rehomes(session, ["流浪地球", "疯狂的外星人"])
         monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
 
         real = apply_mod.assign_identities
@@ -816,6 +817,129 @@ class TestRehomeSurvivesDeadlocks:
         report = await apply_repairs(session, dry_run=False, force=True)
         assert report.rehomed == 2
         assert report.failed == 0
+
+
+class TestRehomeSurvivesConcurrentWorkInserts:
+    """并行节点抢着建同一个作品键时，rehome 不能整步挂掉。
+
+    `_ensure_works` 是 select-then-insert。并行的 canon job 和 parse 四个分片
+    同时也在 get-or-create 同一批作品键，中间那条缝里对面一提交，这边的 insert
+    就撞 `uq_work_norm_key` —— 实测生产 run `37693106252` 的 Apply 步就是这么
+    退出 1 的（`Key (norm_key)=(回到未来3简英双语特效) already exists`），当轮
+    一万多条 pending rehome 一条都没排掉。
+    """
+
+    def _conflict_once(self, session, monkeypatch) -> dict[str, int]:
+        """让下一次**显式** flush 抛一个唯一约束冲突，之后恢复正常。
+
+        注显式 flush 就够了：`_ensure_works` 整批插入那一次正是它，而 autoflush
+        走的是同步层、碰不到这个 patch。真撞车时报的是同一个异常类型，这里只是
+        不依赖「恰好有另一个进程插进来」这种时序。
+        """
+        state = {"n": 0}
+        real = session.flush
+
+        async def flush(*args, **kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                orig = Exception(
+                    'duplicate key value violates unique constraint "uq_work_norm_key"'
+                )
+                raise IntegrityError("INSERT INTO work ...", {}, orig)
+            return await real(*args, **kw)
+
+        monkeypatch.setattr(session, "flush", flush)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_concurrent_insert_falls_back_to_the_existing_row(self, session) -> None:
+        """撞上唯一约束时回落到对面那行：不往上抛，也不留下第二行。"""
+        session.add(
+            Work(
+                title="古墓丽影",
+                norm_key="古墓丽影",
+                aliases=[],
+                media_type=MediaType.UNKNOWN,
+                year=UNKNOWN_YEAR,
+            )
+        )
+        await session.commit()
+
+        spec = apply_mod._WorkSpec(title="古墓丽影 2018", media_type=MediaType.MOVIE, year=2018)
+        work, created = await apply_mod._create_work(session, "古墓丽影", spec)
+
+        assert created is False
+        assert work.norm_key == "古墓丽影"
+        # 回落到已有行，不覆盖它的属性
+        assert work.title == "古墓丽影"
+        assert await session.scalar(select(func.count()).select_from(Work)) == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_conflict_degrades_to_one_by_one(self, session, monkeypatch) -> None:
+        """整批 flush 撞车就退化成逐条，这一批照样搬完。"""
+        titles = ["流浪地球", "疯狂的外星人"]
+        await _pending_rehomes(session, titles)
+        self._conflict_once(session, monkeypatch)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+
+        assert (report.rehomed, report.failed) == (2, 0)
+        assert report.works_created == 2
+        landed = {
+            w.norm_key
+            for w in await session.scalars(
+                select(Work).where(Work.norm_key.in_([series_norm_key(t) for t in titles]))
+            )
+        }
+        assert landed == {series_norm_key(t) for t in titles}
+
+    @pytest.mark.asyncio
+    async def test_a_conflict_does_not_disturb_the_rest_of_the_batch(
+        self, session, monkeypatch
+    ) -> None:
+        """撞车只影响建作品那一下，同批里别的任务该怎么落还怎么落。
+
+        盯的是 savepoint 的作用范围：回滚会让它那一轮改动过的对象过期
+        （`_restore_snapshot`），范围划错就会牵连到任务行 —— 而异步会话里一个
+        过期对象再被读属性就是 `MissingGreenlet`，整步照样挂。这里混一条
+        「media 已经没了」的任务进去，它必须照常落成 SKIPPED。
+        """
+        # 先建一条「media 已经没了」的任务，它必须落成 SKIPPED；排在前面，
+        # 这样按 detected_at 领出来时标记动作发生在 get-or-create 之前。
+        gone = await _media_row(
+            session, "三体 作者:某人", work_norm_key=_stale_key("三体 作者:某人")
+        )
+        session.add(
+            RepairTask(
+                kind=RepairKind.REHOME,
+                symptom=RepairSymptom.KEY_DRIFT,
+                media_id=gone.id,
+                payload={
+                    "title": "三体",
+                    "work_norm_key": series_norm_key("三体"),
+                    "work_title": "三体",
+                    "season": NO_SEASON,
+                    "media_type": MediaType.MOVIE.value,
+                    "year": UNKNOWN_YEAR,
+                },
+                status=RepairState.PENDING,
+                detected_at=utcnow() - timedelta(hours=1),
+            )
+        )
+        await session.commit()
+        await session.delete(gone)
+        await session.commit()
+
+        await _pending_rehomes(session, ["流浪地球"])
+        self._conflict_once(session, monkeypatch)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+
+        assert (report.skipped, report.rehomed, report.failed) == (1, 1, 0)
+        states = {
+            str(t.payload["title"]): t.status for t in await session.scalars(select(RepairTask))
+        }
+        assert states == {"三体": RepairState.SKIPPED, "流浪地球": RepairState.APPLIED}
 
 
 class TestApplyKeyScope:
