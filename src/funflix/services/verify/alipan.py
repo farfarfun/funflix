@@ -34,6 +34,20 @@ from funflix.services.verify.base import AnonymousHttpProbe, CheckOutcome, LinkR
 #: 判 INVALID 不是一条单向门：`_RECHECK_TTL` 给 INVALID 排 30 天后再确认一次，
 #: 连续两次（`_INVALID_CONFIRM_TIMES`）才彻底退休。真要是被风控临时封掉、
 #: 后来又放开了，30 天后那一次复查能捞回来。
+#:
+#: 补上之后的实测（run 37817812402 对比 run 37797533687，两轮 Verify 步骤
+#: 时长几乎相同，80 分 06 秒 vs 82 分 11 秒）：
+#:
+#: | | 补之前 | 补之后 |
+#: |---|---|---|
+#: | 校验条数 | 1852 | **3607** |
+#: | error | 772（42%） | **70（1.9%）** |
+#: | valid / invalid | 578 / 494 | 2670 / 848 |
+#: | 判不出结论 | 780 | **81** |
+#:
+#: 同样的墙上时间出了近两倍的结论。省下来的不只是那 640 次调用：阿里被限流
+#: 后间隔会自适应放大（补之前实测顶在 `_MAX_INTERVAL_FACTOR` 的 16 倍上，
+#: 16 秒才探一条），少打一批注定没结论的请求，间隔自己就收回来了。
 _GONE_CODES = {
     "NotFound.ShareLink",
     "ShareLink.Cancelled",
