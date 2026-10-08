@@ -17,7 +17,8 @@ from typing import Any
 
 from farlog import getLogger
 from sqlalchemy import and_, case, or_, select, tuple_, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.backoff import backoff
@@ -134,7 +135,9 @@ def _snapshot_cache(cache: BatchCache) -> tuple:
 
     只拷贝容器本身（dict/list/set 的壳），不深拷贝里面的 ORM 对象——
     对已经在 chunk 开始前就存在的对象，SAVEPOINT 回滚会由 SQLAlchemy
-    自己把它们过期掉，下次访问自动重新 SELECT，值总是对的；这里要防的
+    自己把它们过期掉（**过期之后必须靠 `_refresh_stale` 显式读回来**，
+    异步会话里读过期对象的属性是 `MissingGreenlet` 而不是自动重查，
+    见那个函数）；这里要防的
     是"这个 chunk 里新建、又被这个 chunk 的回滚撤销"的对象继续赖在缓存里
     被后面的 chunk 复用——那种对象在库里根本没有对应行，被后面的 chunk 当成
     "已存在"拿去用，关联表 INSERT 就会撞外键；它们的属性在回滚后读出来也
@@ -162,6 +165,66 @@ def _restore_cache(cache: BatchCache, snapshot: tuple) -> None:
         cache.media_resource_pairs,
         cache.media_tag_pairs,
     ) = snapshot
+
+
+async def _refresh_stale(session: AsyncSession, cache: BatchCache) -> int:
+    """把缓存里过期的 ORM 对象重新读一遍，读不回来的摘掉。返回处理了几条。
+    **回滚之后必须调。**
+
+    `_snapshot_cache` 的文档里说「chunk 开始前就存在的对象，SAVEPOINT 回滚
+    会由 SQLAlchemy 自己把它们过期掉，下次访问自动重新 SELECT，值总是对的」
+    —— 前半句对，**后半句在异步会话里是错的**。属性访问是同步的，它没法
+    `await` 那次重新 SELECT，于是直接抛
+    `MissingGreenlet: greenlet_spawn has not been called`。
+
+    后果是「撞车重跑」这条路**必然**失败：`_persist_chunk` 回滚后调用方原样
+    重跑同一组（见 `persist_extracted`），重跑时 `_upsert_*` 在缓存里查中一个
+    已过期的对象、读它的 `id` 就炸。run 37778092602 的 parse (4) 里 39 次撞车
+    有 18 次这样炸掉，每次连带整组回滚，一个分片就白烧 360 份文档。
+
+    所以在这里**显式** `await session.refresh(...)` 把它们读回来 —— 这是整个
+    回滚路径上唯一还在协程里、能 await 的地方，错过这里就只剩同步属性访问。
+
+    **不能图省事直接从缓存里摘掉。** `_upsert_media`/`_upsert_work`/
+    `_upsert_resource`/`_upsert_tag` 传了 `cache` 时**缓存就是权威**：未命中
+    不回落 SELECT，直接按「库里没有」新建一行。摘掉一个其实存在的键，重跑时
+    就是插重复行 —— 实测报
+    `UNIQUE constraint failed: resource.provider, resource.share_id`，撞车重跑
+    照样整组回滚，只是把 `MissingGreenlet` 换成了唯一键冲突。
+
+    读不回来的（refresh 抛 `ObjectDeletedError`，或对象已经游离/被判为
+    transient）才摘掉：那种情况库里确实没有对应行，让 `_upsert_*` 重新建
+    才是对的。正常情况下这一类已经被 `_restore_cache` 撤掉了（它们是本
+    chunk 新建的，不在快照里），这里只是兜底。
+    """
+    handled = 0
+    for mapping in (
+        cache.media_by_key,
+        cache.work_by_key,
+        cache.canon_by_key,
+        cache.resource_by_key,
+        cache.tag_by_key,
+    ):
+        for key, obj in list(mapping.items()):
+            if obj is None or not _is_stale(obj):
+                continue
+            handled += 1
+            state = sa_inspect(obj)
+            if state.persistent or state.deleted:
+                try:
+                    await session.refresh(obj)
+                    continue
+                except SQLAlchemyError:
+                    # 行真的没了（别的节点删掉了），只能摘。
+                    pass
+            del mapping[key]
+    return handled
+
+
+def _is_stale(obj: Any) -> bool:
+    """这个 ORM 对象现在读属性会不会触发 IO。全是内存里的判断，自己不碰库。"""
+    state = sa_inspect(obj)
+    return bool(state.expired or state.detached or state.transient or state.deleted)
 
 
 def keyset_after(ts_col: Any, id_col: Any, last_ts: Any, last_id: uuid.UUID) -> Any:
@@ -1036,9 +1099,11 @@ async def persist_extracted(
             if not conflicted or attempt == CHUNK_CONFLICT_ATTEMPTS - 1:
                 break
             # 撞车的那一行**现在已经在库里了**（对面提交完了才轮到我们报错），
-            # 而 `_persist_chunk` 回滚时把这一组写进 `cache` 的条目也撤了，
-            # 于是重跑时 `_upsert_*` 会重新 SELECT、查中那一行、走复用分支 ——
-            # 这才是"下一轮重试"真正会发生的事，只是不用等两小时。
+            # 而 `_persist_chunk` 回滚时把这一组写进 `cache` 的条目撤了、
+            # 把回滚打过期的条目重新读了回来（`_refresh_stale`，少了这一步
+            # 重跑必然抛 `MissingGreenlet`），于是重跑时 `_upsert_*` 要么查中
+            # 刷新后的那一行、要么重新 SELECT，都走复用分支 —— 这才是"下一轮
+            # 重试"真正会发生的事，只是不用等两小时。
             for doc in chunk:
                 reports[doc.id] = copy.copy(snapshot[doc.id])
             logger.info(f"解析撞车重跑这一组 {len(chunk)} 份（第 {attempt + 1} 次）")
@@ -1157,6 +1222,9 @@ async def _persist_chunk(
         # SAVEPOINT 一起失效，留着会被下一个 chunk 当"已存在"复用到坏对象。
         if cache is not None and cache_snapshot is not None:
             _restore_cache(cache, cache_snapshot)
+            # 把回滚打过期的对象读回来，否则下面这一组原样重跑时会撞
+            # `MissingGreenlet` —— 见 `_refresh_stale`。
+            await _refresh_stale(session, cache)
         for doc in chunk:
             report = reports[doc.id]
             report.status = doc.parse_status
@@ -1174,6 +1242,8 @@ async def _persist_chunk(
         # 只有上面提交成功的那条路径才会把它们合并进调用方的字典。
         if cache is not None and cache_snapshot is not None:
             _restore_cache(cache, cache_snapshot)
+            # 同上。这条路不重跑当前组，但后面的 chunk 还要接着用这个缓存。
+            await _refresh_stale(session, cache)
         for doc in chunk:
             report = reports[doc.id]
             if doc.id == failed_doc_id:

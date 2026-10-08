@@ -826,6 +826,70 @@ class TestRunnerParseBatch:
         assert tags[0].media_count == 1
 
     @pytest.mark.asyncio
+    async def test_a_retry_after_rollback_does_not_hit_missinggreenlet(
+        self, session, monkeypatch
+    ) -> None:
+        """撞车重跑时，缓存里**回滚前就存在**的行不能还赖着不走。
+
+        SAVEPOINT 回滚会把这一组改动过的行过期掉。异步会话里读一个过期对象的
+        属性**不会**自动重查，它抛
+        `MissingGreenlet: greenlet_spawn has not been called` —— 于是"撞车就
+        在本轮重跑一次"这条路必然失败。run 37778092602 的 parse (4) 里 39 次
+        撞车有 18 次这么炸的，每次连带整组回滚，一个分片白烧 360 份文档。
+
+        所以回滚之后要显式 `await session.refresh(...)` 把过期对象读回来
+        （`_refresh_stale`）。注意**不能**改成「从缓存里摘掉」：传了 cache 时
+        缓存就是权威，未命中 `_upsert_*` 直接新建，摘掉一个其实存在的键重跑
+        时就撞唯一键 —— 只是把 `MissingGreenlet` 换成另一种冲突。
+
+        和上面那条「不污染下一个 chunk」的区别：那条防的是**这个 chunk 新建**
+        的对象，靠恢复快照就够了；这条防的是**本来就在库里**、被这个 chunk
+        改脏、又被回滚过期的对象 —— 快照恢复反而会把它原样放回缓存。
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        from funflix.services.extract import runner as runner_module
+        from funflix.services.extract.rule import RuleExtractor
+
+        # 两条文档指向同一部剧、同一个链接：第二条落库时 media/resource/tag
+        # 都是「已经在库里」的行，会被查出来放进缓存、并被这一组改脏。
+        shared = "名称：测试剧集1\n标签：#悬疑\n链接：https://pan.quark.cn/s/fake000001"
+        first, second = make_doc(1, content=shared), make_doc(2, content=shared)
+        session.add_all([first, second])
+        await session.commit()
+
+        (seed,) = await parse_batch(session, [first], RuleExtractor())
+        await session.commit()
+        assert seed.ok
+
+        real_phase2 = runner_module._persist_phase2
+        calls = 0
+
+        async def _boom_once(*a, **kw):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # 在**阶段一 flush 之后**才炸，这样回滚才真的有脏行可过期 ——
+                # 在阶段一开头就抛的话一行都没碰过，缓存里的对象不会过期，
+                # 这个 bug 根本复现不出来（上面那条撞车重跑的测试就是这样，
+                # 所以它一直是绿的）。
+                raise IntegrityError("INSERT", {}, Exception("uq_media_identity"))
+            return await real_phase2(*a, **kw)
+
+        monkeypatch.setattr(runner_module, "_persist_phase2", _boom_once)
+
+        (report,) = await parse_batch(session, [second], RuleExtractor())
+        await session.commit()
+
+        assert "MissingGreenlet" not in (report.error or ""), "回滚后缓存里还留着过期对象"
+        assert calls == 2, "撞车后要在本轮重跑这一组"
+        assert report.ok, f"重跑该成功，实际 error={report.error!r}"
+        assert second.parse_status == ParseStatus.DONE
+        # 守住「从缓存里摘掉」那个错修法：缓存未命中 `_upsert_resource` 会按
+        # "库里没有"再插一行，于是重跑撞 (provider, share_id) 唯一键。
+        assert await session.scalar(select(func.count()).select_from(Resource)) == 1
+
+    @pytest.mark.asyncio
     async def test_tag_count_is_added_to_not_overwritten(self, session) -> None:
         """标签计数走算术 UPDATE（`media_count = media_count + :d`），不是绝对值。
 
