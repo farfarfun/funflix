@@ -1674,6 +1674,10 @@ def parse(
         str | None,
         typer.Option(help="分片并行，写成 i/N（如 0/8）：只处理 id 末位落在第 i 片的文档"),
     ] = None,
+    max_seconds: Annotated[
+        float | None,
+        typer.Option(help="墙上时间预算（秒），到点就不再领新文档、收尾退出；默认不设"),
+    ] = None,
 ) -> None:
     """抽取：把原始文本解析成作品与资源。
 
@@ -1692,6 +1696,11 @@ def parse(
     `--shard i/N` 开 N 个进程并行推同一个队列，各片按 id 末位取模互斥，
     不重不漏。切漏了的后果只是那些文档留在 pending，补跑一遍不带
     `--shard` 的即可收干净。
+
+    在有时长上限的环境里（比如 CI 的 job）用 `--max-seconds` 而不是
+    `--limit`：同样的条数耗时能差 35%（文档难易不一样，实测数据在
+    `services/extract/concurrent_runner.py::_ParseProducer.produce`），
+    按条数填就只能往保守的那头填，把窗口空着。
     """
     from funflix.base.db import session_scope
     from funflix.models import RawDocument
@@ -1771,6 +1780,7 @@ def parse(
                 concurrency=concurrency,
                 force=force,
                 shard=shard_spec,
+                max_seconds=max_seconds,
                 on_progress=_on_progress,
             )
         finally:

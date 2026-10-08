@@ -121,15 +121,20 @@ jobs:
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
       # 影响范围有限，不会一次把所有待解析的都搭进去。
       #
-      # 6000 这个数是量出来的。run 37734962378 四个分片都跑满了 5000 条，
-      # 耗时 50 / 68 / 68 / 68 分钟 —— 注意分片之间差 35%（同样 5000 条，
-      # 文档的难易不一样）。按最慢的 68 分钟算，6000 条约 82 分钟，对 120
-      # 分钟的 job 预算留了 32% 余量，刚好能吸收这个波动。
+      # 闸门用**时间**而不是条数。按条数填这个格子一直填不准：run
+      # 37734962378 四个分片都跑满了 5000 条，耗时却是 50 / 68 / 68 / 68
+      # 分钟 —— 同样的条数差 35%（文档难易不一样）。于是只能往保守那头填，
+      # 6000 条按最慢的分片算约 82 分钟，剩下 38 分钟纯空转：cron 是每 2 小时
+      # 一轮、job 预算也是 120 分钟，这等于三分之一的窗口白扔，而 pending 还
+      # 有 183 万条。
       #
-      # 不敢上 8000（外推约 109 分钟，余量 8%）：撞上 timeout 是整个 job 被
-      # kill，这一轮已经解析完的也白跑，比少解析 2000 条亏得多。
+      # 6600 秒 = 110 分钟，留 10 分钟给 setup 和收尾。到点收工是安全的：
+      # 落库按 `--write-batch` 逐批提交，已经解析完的不会回滚，没排到的下一轮
+      # 接着领（见 `services/extract/concurrent_runner.py::_ParseProducer.produce`）。
       - name: Parse
-        run: uv run $UV_SYNC_EXTRAS funflix parse --shard ${{ matrix.shard }}/4 --limit 6000
+        run: >
+          uv run $UV_SYNC_EXTRAS funflix parse
+          --shard ${{ matrix.shard }}/4 --max-seconds 6600
 
   verify:
     runs-on: ubuntu-latest
@@ -231,12 +236,21 @@ jobs:
       # 调用吃 429（run 37693106252：200 次调用 10 分钟跑完 ≈ 20 次/分，失败 50
       # 次）。429 的请求网关不处理也不计费，但这一页的候选项被整页丢掉、留到
       # 下一轮重来，等于四分之一的进度白走。所以真正的闸门是
-      # `--call-interval`：把调用起跑时刻排开到实际跑得通的速率上。墙上时间
-      # 不是瓶颈（一轮 200 个块、job 给了 120 分钟）。
+      # `--call-interval`：把调用起跑时刻排开到实际跑得通的速率上。
+      #
+      # 墙上时间也不是瓶颈，而且是**可以算准**的：`_Pacer` 保证两次调用起跑至少
+      # 隔 `--call-interval`，所以 N 个块的耗时就是 `4N` 秒上下，跟并发无关。
+      # 200 块实测 18 分钟（run 37744553498），`500 × 4s ≈ 33 分钟`，加上 merge
+      # 那步实测的 17 分钟，离 120 分钟的预算还有一半。所以这一步不需要像 parse
+      # 那样换成时间预算 —— 条数本身就是时间。
+      #
+      # 从 200 提到 500 的依据：那一轮报告「够格送裁决 1556 / 本次送出 200」，
+      # 剩 1356 个块。按 200 一轮要 7 轮（cron 每 2 小时 → 14 小时），500 一轮
+      # 3 轮就清完。代价是 token：200 块烧了 32 万输入 / 3.2 万输出。
       - name: Resolve
         run: >
           uv run $UV_SYNC_EXTRAS --extra llm funflix canon resolve
-          --apply --yes --limit 200 --concurrency 4 --call-interval 4
+          --apply --yes --limit 500 --concurrency 4 --call-interval 4
 
       # 应用的是**之前每一轮**攒下来的裁决，不只是这一轮的，所以 resolve 挂了
       # （比如 LLM 网关抽风）它照样要跑完 —— job 整体仍然是红的，不会掩盖问题。
@@ -245,8 +259,12 @@ jobs:
       # commit，裁决表单调涨：run 37726067206 攒到 5417 条时整步约两小时，连着
       # resolve 一起把 120 分钟的 job 预算吃光，被 `cancelled`，resolve 刚裁出来
       # 的 492 条一条都没落库。额度只花在「真有活要干」的键上（已就位的整键跳
-      # 过，见 `services/canon/apply.py::_already_settled`），800 这个数留的是
-      # resolve 的上限涨到 800 之后的最坏情况 —— 一轮全是新裁决，约 20 分钟。
+      # 过，见 `services/canon/apply.py::_already_settled`）。
+      #
+      # 800 跑出来的实测（run 37744553498）：整步 17 分钟，报告「已裁决 5872 /
+      # 已就位跳过 3465 / **本轮没排上 0**」—— 额度没用满，两小时那个病根确实
+      # 就在那 3465 条重复重扫上。所以这个数不跟着 resolve 的 500 一起涨：
+      # 没排上还是 0 就说明有余量，等它哪轮不是 0 了再提。
       - name: Merge
         if: ${{ !cancelled() }}
         run: uv run $UV_SYNC_EXTRAS --extra llm funflix canon merge --apply --yes --limit 800
@@ -317,10 +335,15 @@ jobs:
       #
       # 放在 rehome 之后跑：上面那步刚制造出来的空壳，这步顺手就收掉了。
       #
-      # 删行不可逆，所以 `--limit` 先压到 2000 跑一轮，核对报告里的「删除空壳 /
-      # 本轮没排上」对不对得上本地量到的 36,223，确认了再往上提。查询本身不是
-      # 瓶颈（本地对生产库实测每批 500 行热后 70ms），静置窗口会拦掉刚建的行，
-      # 见 `services/maintenance.py::PRUNE_MIN_AGE`。
+      # 删行不可逆，所以先用 `--limit 2000` 跑了一轮对账：run 37744553498 报
+      # 「删除空壳 2000 / 本轮没排上 33703」，合计 35,703，对得上本地量到的
+      # 36,223（差的 520 个是这期间 parse 给它们挂上了 media，不再是空壳）。
+      # 耗时 11.3 秒，含进程启动和连库，4 个批次。
+      #
+      # 按这个速率 20000 行约 2 分钟，repair 这个 job 的其余几步实测 Scan 13
+      # 分钟 + Apply 20 分钟，离 120 分钟的预算还很远。没有一步提到 40000
+      # 一轮清完：剩下的 13,703 行留到下一轮，中间多一次「前台点点看有没有
+      # 误删」的机会 —— 删行这事只有这一次机会便宜。
       - name: Prune works
         if: ${{ !cancelled() }}
-        run: uv run $UV_SYNC_EXTRAS funflix db prune-works --yes --limit 2000
+        run: uv run $UV_SYNC_EXTRAS funflix db prune-works --yes --limit 20000

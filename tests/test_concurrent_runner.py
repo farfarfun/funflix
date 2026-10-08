@@ -252,6 +252,88 @@ class TestRunParsePipeline:
         assert total == done == 5
 
 
+class TestParseTimeBudget:
+    """`--max-seconds` 到点就收工。
+
+    时间预算比 `--limit` 更适合给 CI 的 job 兜底：同样 5000 条，四个分片实测
+    50 / 68 / 68 / 68 分钟，差 35%（文档难易不一样），所以按条数填只能往保守
+    那头填、把 job 窗口空着。理由完整写在
+    `_ParseProducer.produce` 的 docstring 里。
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_spent_budget_stops_producing(self, db_url) -> None:
+        """预算是 0 就一条都不该吐 —— 队列里明明还有活。"""
+        async with open_session(db_url) as session:
+            session.add_all([make_doc(n) for n in range(1, 6)])
+            await session.commit()
+
+        reports = run_parse_pipeline(
+            extractor_name="rule",
+            settings=Settings(database_url=db_url),
+            concurrency=2,
+            max_seconds=0,
+        )
+
+        assert reports == []
+        async with open_session(db_url) as session:
+            # 没领的都还在 pending，下一轮接着领
+            left = list(await session.scalars(select(RawDocument.parse_status)))
+            assert left == [ParseStatus.PENDING] * 5
+
+    @pytest.mark.asyncio
+    async def test_a_roomy_budget_does_not_get_in_the_way(self, db_url) -> None:
+        """预算够用时行为跟不设一样 —— 别把正常路也掐了。"""
+        async with open_session(db_url) as session:
+            session.add_all([make_doc(n) for n in range(1, 4)])
+            await session.commit()
+
+        reports = run_parse_pipeline(
+            extractor_name="rule",
+            settings=Settings(database_url=db_url),
+            concurrency=2,
+            max_seconds=600,
+        )
+
+        assert len(reports) == 3
+
+    @pytest.mark.asyncio
+    async def test_what_got_parsed_before_the_budget_ran_out_is_kept(self, db_url) -> None:
+        """到点收工不能回滚已经解析完的 —— 否则这一轮就是白跑。
+
+        这条是「用时间预算而不是条数」能成立的前提：收工是安全的，因为落库按
+        `write_batch` 逐批提交。
+        """
+        async with open_session(db_url) as session:
+            session.add_all([make_doc(n) for n in range(1, 11)])
+            await session.commit()
+
+        # 预算短到只够吐出前几条：生产者每吐一条就检查一次 deadline
+        reports = run_parse_pipeline(
+            extractor_name="rule",
+            settings=Settings(database_url=db_url),
+            concurrency=2,
+            write_batch=1,
+            max_seconds=0.25,
+        )
+
+        async with open_session(db_url) as session:
+            done = len(
+                list(
+                    await session.scalars(
+                        select(RawDocument.id).where(RawDocument.parse_status == ParseStatus.DONE)
+                    )
+                )
+            )
+        assert done == len(reports), "报告里有几条，库里就该有几条 done"
+        assert len(await _media_titles(db_url)) == done, "解析出来的作品要留在库里"
+
+
+async def _media_titles(url: str) -> list[str]:
+    async with open_session(url) as session:
+        return list(await session.scalars(select(Media.title)))
+
+
 class TestPipelinePending:
     def test_pending_sums_both_queue_backlogs(self) -> None:
         class _FakeProducer:

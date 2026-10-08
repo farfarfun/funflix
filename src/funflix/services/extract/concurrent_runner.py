@@ -186,6 +186,7 @@ class _ParseProducer(BaseProducer):
         batch_size: int,
         force: bool,
         shard: tuple[int, int] | None = None,
+        max_seconds: float | None = None,
         name: str | None = None,
     ) -> None:
         """保存构造参数；数据库引擎、事件循环等资源留到 `on_start()` 里按线程现造。
@@ -198,6 +199,8 @@ class _ParseProducer(BaseProducer):
             batch_size: 每次翻页读取的文档数上限。
             force: 为 True 时跳过缓存查询，强制让每条文档都重新抽取。
             shard: `(序号, 总片数)`，只处理 id 末位落在本片的文档；None 表示全量。
+            max_seconds: 墙上时间预算（秒），到点就不再吐新的；None 表示不设。
+                比 `limit` 更适合给 CI 的 job 兜时间 —— 见 `produce`。
             name: 线程名，透传给 `BaseProducer`。
         """
         super().__init__(output_queue, name=name)
@@ -207,6 +210,7 @@ class _ParseProducer(BaseProducer):
         self.batch_size = batch_size
         self.force = force
         self.shard = shard
+        self.max_seconds = max_seconds
 
     def on_start(self) -> None:
         """在生产者线程内创建专属 `AsyncEngine`/事件循环，并初始化翻页游标与缓冲区。"""
@@ -222,6 +226,11 @@ class _ParseProducer(BaseProducer):
         self._last_id: uuid.UUID = uuid.UUID(int=0)
         self._remaining_limit = self.limit
         self._exhausted = False
+        # 预算从生产者线程真正开跑算起，不从构造算起：建引擎、开事件循环
+        # 都在这之前，把那几秒算进预算等于白送。
+        self._deadline = (
+            None if self.max_seconds is None else time.monotonic() + max(0.0, self.max_seconds)
+        )
 
     def on_stop(self) -> None:
         """释放本线程专属的 `AsyncEngine` 并关闭事件循环。"""
@@ -236,12 +245,25 @@ class _ParseProducer(BaseProducer):
     def produce(self) -> Any:
         """吐出一条待处理条目；缓冲区空时先翻一页，翻到底则抛 `StopIteration` 结束生产。
 
+        到点（`max_seconds`）也抛 `StopIteration` 收工。**时间预算比 `limit`
+        更适合给 CI 兜底**：`limit` 要人先量出「多少条约等于多少分钟」再填，
+        而那个换算一直在飘 —— run 37734962378 四个分片都跑满 5000 条，耗时是
+        50 / 68 / 68 / 68 分钟，同样的条数差 35%（文档的难易不一样）。于是
+        `limit` 只能往保守的那头填，把 job 窗口的三分之一空着：cron 是每 2
+        小时一轮、job 预算也是 120 分钟，6000 条跑 82 分钟就退出，剩下 38
+        分钟纯空转。换成时间预算就能把窗口填满，也不用再猜数字。
+
+        收工是安全的：解析按 `write_batch` 逐批提交（见 `_ParseConsumer`），
+        已经解析完的不会因为收工而回滚，没排到的下一轮接着领。
+
         Returns:
             含 `doc_id`/`content`/`extractor_kind`/`cached_output` 的字典，供处理单元消费。
 
         Raises:
-            StopIteration: 数据库里已无更多待解析文档。
+            StopIteration: 数据库里已无更多待解析文档，或超了 `max_seconds`。
         """
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise StopIteration
         if not self._buffer and not self._exhausted:
             self._aio_loop.run_until_complete(self._fetch_page())
         if not self._buffer:
@@ -505,6 +527,7 @@ def run_parse_pipeline(
     concurrency: int = 4,
     force: bool = False,
     shard: tuple[int, int] | None = None,
+    max_seconds: float | None = None,
     settings: Settings | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[ParseReport]:
@@ -525,6 +548,11 @@ def run_parse_pipeline(
     而远程库场景下瓶颈是每条文档那两次网络往返，不是 `extract()` 的 CPU。
     要提吞吐只能多开进程，而多开进程必须分片，否则各进程的翻页游标从同一处
     起步、把同一批文档重复解析一遍。
+
+    `max_seconds` 是**墙上时间**预算：到点后生产者不再吐新的，但本函数要等
+    已经吐出去的全部解析完、全部落库才返回，所以实际耗时会略超预算。设它的
+    时候给外层超时留余量。为什么它比 `limit` 更适合 CI，见
+    `_ParseProducer.produce`。
     """
     settings = settings or get_settings()
 
@@ -544,6 +572,7 @@ def run_parse_pipeline(
             "batch_size": batch_size,
             "force": force,
             "shard": shard,
+            "max_seconds": max_seconds,
         },
         consumer_kwargs={
             "settings": settings,
