@@ -716,6 +716,13 @@ def canon_resolve(
         int | None, typer.Option("--limit", help="最多送多少个块，用于小额预算试探")
     ] = None,
     concurrency: Annotated[int, typer.Option("--concurrency", help="并发调用数")] = 8,
+    call_interval: Annotated[
+        float,
+        typer.Option(
+            "--call-interval",
+            help="两次调用起跑时刻的最小间隔（秒），0 不节流。网关限的是速率不是并发",
+        ),
+    ] = 4.0,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
 ) -> None:
     """把规则搞不定的残局送 LLM 裁决，结果写 `title_canon`。
@@ -745,6 +752,7 @@ def canon_resolve(
                 key=key,
                 limit=limit,
                 concurrency=concurrency,
+                call_interval=call_interval,
             )
 
     report = _run(_do)

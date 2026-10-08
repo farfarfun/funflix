@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import uuid
 
@@ -32,9 +33,13 @@ from funflix.services.canon import (
 from funflix.services.canon.merge import absorb_attributes, pick_survivor
 from funflix.services.canon.purge import is_junk_media_title
 from funflix.services.canon.resolver import (
+    MAX_ENTRIES_PER_CALL,
     CanonDecision,
     CanonEntry,
+    ResolveReport,
+    _Pacer,
     _persist,
+    _resolve_block,
     validate_decisions,
 )
 from funflix.services.counters import (
@@ -1434,3 +1439,70 @@ class TestSettleKnownWorks:
 
         row = await session.get(TitleCanon, "大主宰")
         assert row.work_title == "大主宰", "取出现次数最多的写法"
+
+
+class TestCallPacer:
+    """调用节流器：限的是**速率**，不是并发。
+
+    网关限流了就是白走进度 —— 429 的请求没被处理，这一页的候选项整页丢掉、
+    留到下一轮重来。实测 run 37693106252 的一轮：并发压到 4，200 次调用里
+    仍有 50 次吃到 `429 Request Rate Reaches Maximum Limit`。信号量管不了
+    这个，SDK 自带的指数退避也管不了（几个协程各自退避、退完又一起撞回来）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_callers_are_spaced_out(self) -> None:
+        """一起冲进来的调用要被排开，而不是挤在同一瞬间发出去。"""
+        pacer = _Pacer(0.05)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        stamps: list[float] = []
+
+        async def one() -> None:
+            await pacer.wait()
+            stamps.append(loop.time() - started)
+
+        await asyncio.gather(*(one() for _ in range(4)))
+
+        assert len(stamps) == 4
+        # 第一个不等，之后每个至少再隔一个间隔。留 10ms 容差给事件循环调度。
+        for i, stamp in enumerate(sorted(stamps)):
+            assert stamp >= i * 0.05 - 0.01, f"第 {i} 个调用太早了：{stamp:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_zero_interval_does_not_throttle(self) -> None:
+        """`0` 要能完全关掉节流 —— 单组演练和测试不该为此等。"""
+        pacer = _Pacer(0)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await asyncio.gather(*(pacer.wait() for _ in range(50)))
+        assert loop.time() - started < 0.05
+
+    @pytest.mark.asyncio
+    async def test_every_page_goes_through_the_pacer(self) -> None:
+        """节流要卡在**每一页**上，不是每个块一次。
+
+        一个块可能拆成好几页（`MAX_ENTRIES_PER_CALL`），页之间顺序跑 ——
+        漏掉的话大块就会连着打出好几个不节流的请求。
+        """
+        waits = {"n": 0}
+
+        class CountingPacer(_Pacer):
+            async def wait(self) -> None:
+                waits["n"] += 1
+
+        class StubClient:
+            model = "stub"
+
+            async def extract(self, system: str, user: str):
+                from funflix.services.extract.llm.client import LLMResult
+
+                return LLMResult(payload={"decisions": []}, model="stub")
+
+        entries = [CanonEntry(key=f"k{i}") for i in range(MAX_ENTRIES_PER_CALL * 2 + 1)]
+        report = ResolveReport(dry_run=False)
+
+        await _resolve_block(StubClient(), entries, report, CountingPacer(0))
+
+        assert report.calls == 3
+        assert waits["n"] == 3

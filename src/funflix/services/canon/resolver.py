@@ -74,6 +74,17 @@ MAX_ENTRIES_PER_CALL = 50
 #: 并发调用数。受网关限流约束，不是 CPU 约束。
 DEFAULT_CONCURRENCY = 8
 
+#: 两次调用的**起跑时刻**至少隔这么多秒。
+#:
+#: 网关限的是速率，不是并发数 —— 并发压到 4 仍然有四分之一的调用吃到
+#: `429 Request Rate Reaches Maximum Limit`（实测 run 37693106252：200 次调用
+#: 10 分钟跑完 ≈ 20 次/分，其中 50 次失败）。SDK 自带的 5 次指数退避管不了
+#: 这个：几个协程各自退避、退完又一起撞回来，把速率重新顶上去。
+#:
+#: 429 是白走的进度：请求没被处理，这一页的候选项整页丢掉、留到下一轮重来。
+#: 4 秒 ≈ 15 次/分，正好是那一轮**实际跑通**的速率。
+MIN_CALL_INTERVAL = 4.0
+
 #: 年份的合理区间，超出即视为模型瞎填。与 `llm/extractor` 同一个口径。
 _YEAR_MIN, _YEAR_MAX = 1900, 2100
 
@@ -272,10 +283,39 @@ def _decided_context(decided: dict[str, CanonDecision]) -> str:
     )
 
 
+class _Pacer:
+    """把所有模型调用的起跑时刻排开，两次之间至少隔 `interval` 秒。
+
+    限的是**速率**，跟 `asyncio.Semaphore` 限并发是两件事，两样都要：并发
+    决定同时有几个请求在飞（用来盖住单次调用十几秒的延迟），速率决定每分钟
+    往网关推几个。只限并发的后果见 `MIN_CALL_INTERVAL`。
+
+    `interval <= 0` 时完全不节流，测试和单组演练用。
+    """
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._lock = asyncio.Lock()
+        self._next_at: float | None = None
+
+    async def wait(self) -> None:
+        if self._interval <= 0:
+            return
+        # 整段都握着锁：后一个等待者要等前一个睡完才开始算自己的时刻，
+        # 这样 N 个并发调用的起跑时刻就是严格等间隔的。
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            if self._next_at is not None and self._next_at > now:
+                await asyncio.sleep(self._next_at - now)
+                now = self._next_at
+            self._next_at = now + self._interval
+
+
 async def _resolve_block(
     client: LLMClient,
     entries: list[CanonEntry],
     report: ResolveReport,
+    pacer: _Pacer,
 ) -> dict[str, CanonDecision]:
     """裁决一个候选块，按需拆页。页之间顺序跑，后面的页能看到前面的结论。"""
     decided: dict[str, CanonDecision] = {}
@@ -284,6 +324,7 @@ async def _resolve_block(
         lines = [prompts.format_entry(e.key, e.rows, e.resources, e.sample) for e in page]
         user = prompts.build_user_message(lines) + _decided_context(decided)
 
+        await pacer.wait()
         report.calls += 1
         try:
             result = await client.extract(prompts.SYSTEM_PROMPT, user)
@@ -368,6 +409,7 @@ async def resolve_canon(
     key: str | None = None,
     limit: int | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
+    call_interval: float = MIN_CALL_INTERVAL,
     client: LLMClient | None = None,
     on_progress: Callable[[int], None] | None = None,
 ) -> ResolveReport:
@@ -378,6 +420,7 @@ async def resolve_canon(
         key: 只处理 `block_key` 等于它的那一块。单组演练用。
         limit: 最多送多少个块。配合小额预算试探。
         concurrency: 并发块数。
+        call_interval: 两次调用起跑时刻的最小间隔（秒），0 表示不节流。
         client: 注入用，测试传桩。默认按 funsecret 的配置构造。
         on_progress: 每做完一个块调一次，入参是累计已裁决的 key 数。
 
@@ -429,10 +472,11 @@ async def resolve_canon(
         client = OpenAICompatClient(tool_schema=prompts.TOOL_SCHEMA, tool_name=prompts.TOOL_NAME)
 
     gate = asyncio.Semaphore(concurrency)
+    pacer = _Pacer(call_interval)
 
     async def run(entries: list[CanonEntry]) -> dict[str, CanonDecision]:
         async with gate:
-            return await _resolve_block(client, entries, report)
+            return await _resolve_block(client, entries, report, pacer)
 
     results = await asyncio.gather(*(run(entries) for _, entries in pending))
 
