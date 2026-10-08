@@ -309,3 +309,18 @@ jobs:
       - name: Requeue
         if: ${{ !cancelled() }}
         run: uv run $UV_SYNC_EXTRAS funflix repair requeue --apply --yes --limit 50000
+
+      # 收 rehome / merge 的残留：media 搬走或被合并掉之后，原作品就空了，
+      # 在这之前没人负责删它。搜索默认**不**过滤空壳（只有 `--valid-only`
+      # 那条路才过滤），所以它们会直接出现在列表页里、点进去什么都没有 ——
+      # 首次统计 36,223 行、占作品总数 17.9%。
+      #
+      # 放在 rehome 之后跑：上面那步刚制造出来的空壳，这步顺手就收掉了。
+      #
+      # 删行不可逆，所以 `--limit` 先压到 2000 跑一轮，核对报告里的「删除空壳 /
+      # 本轮没排上」对不对得上本地量到的 36,223，确认了再往上提。查询本身不是
+      # 瓶颈（本地对生产库实测每批 500 行热后 70ms），静置窗口会拦掉刚建的行，
+      # 见 `services/maintenance.py::PRUNE_MIN_AGE`。
+      - name: Prune works
+        if: ${{ !cancelled() }}
+        run: uv run $UV_SYNC_EXTRAS funflix db prune-works --yes --limit 2000

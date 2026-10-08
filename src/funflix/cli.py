@@ -560,6 +560,41 @@ def db_cleanup_resources(
     _ok("资源清理完成")
 
 
+@db_app.command("prune-works")
+def db_prune_works(
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="这一轮最多删多少行，用于分轮磨完积压；默认删到没有为止"),
+    ] = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
+) -> None:
+    """删掉没有任何 media 指向的空壳作品。
+
+    这些行是 rehome / merge 的残留：media 搬走或被合并掉之后原作品就空了。
+    搜索默认不过滤它们（只有 `--valid-only` 那条路才过滤），所以空壳会直接
+    出现在列表页和关键词搜索里，点进去什么都没有。
+
+    判定只认「真的没有 media 指向」，不信 `season_count` 这类冗余计数 ——
+    理由见 `services/maintenance.py::_empty_work_ids`。
+    """
+    from funflix.base.db import session_scope
+    from funflix.services.maintenance import prune_empty_works
+
+    if not yes and not typer.confirm("将删除没有任何季的空壳作品，继续？"):
+        raise typer.Abort()
+
+    async def _do():
+        async with session_scope() as session:
+            return await prune_empty_works(session, limit=limit)
+
+    report = _run(_do)
+    _table(
+        [["删除空壳", report.deleted], ["本轮没排上", report.remaining]],
+        ["项", "数量"],
+    )
+    _ok("空壳作品清理完成")
+
+
 @db_app.command("relink-checks")
 def db_relink_checks(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,

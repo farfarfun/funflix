@@ -11,7 +11,7 @@ import itertools
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError
 
 from funflix.base import dbconflict
@@ -31,8 +31,10 @@ from funflix.models import (
 )
 from funflix.services import maintenance
 from funflix.services.maintenance import (
+    PRUNE_MIN_AGE,
     cleanup_resources,
     data_tables,
+    prune_empty_works,
     recount_tags,
     relink_checks,
     reset_pipeline_data,
@@ -659,3 +661,103 @@ class TestRelinkChecks:
             select(Resource.share_id).where(Resource.check_status == CheckStatus.UNCHECKED)
         )
         assert len(list(remaining)) == 2, "放弃的行留在 UNCHECKED，交给 verify 正常探测"
+
+
+class TestPruneEmptyWorks:
+    """空壳作品（没有任何 media 指向）要删掉。
+
+    这些行是 rehome / merge 的残留。搜索默认不过滤它们（见
+    `services/search.py::_apply_filters`：只有 `valid_only` 那条路才要求有
+    校验通过的资源），所以空壳会直接出现在列表页里、点进去什么都没有 ——
+    生产库实测 36,223 行、占作品总数 17.9%。
+    """
+
+    def _work(self, title: str, *, age=PRUNE_MIN_AGE * 2) -> Work:
+        """一个光秃秃的作品，没有任何 media。
+
+        `created_at` 要显式写老：`prune_empty_works` 只删静置够久的行。
+        """
+        return Work(
+            title=title,
+            norm_key=title,
+            aliases=[],
+            media_type=MediaType.MOVIE,
+            year=2024,
+            created_at=utcnow() - age,
+        )
+
+    @pytest.mark.asyncio
+    async def test_deletes_a_work_with_no_media(self, session) -> None:
+        session.add(self._work("空壳"))
+        await session.commit()
+
+        report = await prune_empty_works(session)
+        assert report.deleted == 1
+        assert await session.scalar(select(func.count()).select_from(Work)) == 0
+
+    @pytest.mark.asyncio
+    async def test_keeps_a_work_that_still_has_a_season(self, session) -> None:
+        """有 media 指向就不能删 —— `work_id` 是 CASCADE，删了会连带删掉季。"""
+        media = _media("流浪地球")
+        session.add_all([media, self._work("空壳")])
+        await session.commit()
+
+        report = await prune_empty_works(session)
+        assert report.deleted == 1
+        survivors = set(await session.scalars(select(Work.title)))
+        assert survivors == {"流浪地球"}
+
+    @pytest.mark.asyncio
+    async def test_does_not_trust_a_stale_season_count(self, session) -> None:
+        """判定只看有没有 media 指向，不看冗余计数。
+
+        `season_count` 由 `services/counters.py` 事后重算，本身会过期：生产库
+        里 `season_count == 0` 是 33,633 行，真的没有 media 指向的是 36,223
+        行 —— 两边都会错，而删行是不可逆的。
+        """
+        # 有季、但计数还没刷到（看起来像空壳）
+        live = _media("计数没刷到")
+        live.work.season_count = 0
+        live.work.resource_count = 0
+        # 真空壳、但计数停留在旧值（看起来像有内容）
+        shell = self._work("计数是旧的")
+        shell.season_count = 3
+        shell.resource_count = 7
+        session.add_all([live, shell])
+        await session.commit()
+
+        report = await prune_empty_works(session)
+        assert report.deleted == 1
+        survivors = set(await session.scalars(select(Work.title)))
+        assert survivors == {"计数没刷到"}, "该按关联判，不该按计数判"
+
+    @pytest.mark.asyncio
+    async def test_a_freshly_created_work_is_left_alone(self, session) -> None:
+        """刚建出来的不碰。
+
+        建作品和挂 media 目前在同一个事务里，所以理论上不存在「已提交的空
+        作品」这种中间态。但删行不可逆，万一将来有哪条路径把两件事拆开提交，
+        这个静置窗口就是唯一的兜底。
+        """
+        session.add(self._work("刚建的", age=timedelta(0)))
+        await session.commit()
+
+        report = await prune_empty_works(session)
+        assert report.deleted == 0
+        assert await session.scalar(select(func.count()).select_from(Work)) == 1
+
+    @pytest.mark.asyncio
+    async def test_limit_caps_the_round_and_reports_the_rest(self, session, monkeypatch) -> None:
+        """分轮删：首轮三万多行，一次删完的大事务会把 CI 的 job 预算占满。"""
+        monkeypatch.setattr(maintenance, "PRUNE_CHUNK", 2)
+        session.add_all([self._work(f"空壳{i}") for i in range(5)])
+        await session.commit()
+
+        report = await prune_empty_works(session, limit=3)
+        assert (report.deleted, report.remaining) == (3, 2)
+        assert await session.scalar(select(func.count()).select_from(Work)) == 2
+
+        # 下一轮把剩下的收干净
+        again = await prune_empty_works(session, limit=3)
+        assert (again.deleted, again.remaining) == (2, 0)
+        assert await session.scalar(select(func.count()).select_from(Work)) == 0

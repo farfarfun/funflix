@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import cast
 
 from farlog import getLogger
@@ -20,11 +21,13 @@ from funflix.base.enums import CHECKABLE_PROVIDERS, CheckStatus, ParseStatus, Pr
 from funflix.models import (
     Base,
     LinkCheck,
+    Media,
     RawDocument,
     Resource,
     Source,
     Tag,
     TagKind,
+    Work,
     media_resource,
     media_tag,
     utcnow,
@@ -558,6 +561,92 @@ async def cleanup_resources(session: AsyncSession) -> CleanupResourcesReport:
     for chunk in _chunks(list(affected_media_ids)):
         report.media_recounted += await refresh_counters_for_media(session, chunk)
     await session.commit()
+    return report
+
+
+#: 空壳作品至少要「静置」这么久才删。纯粹是给跨进程的中间态留余量：建作品和
+#: 挂 media 虽然在同一个事务里（见 `canon/apply.py::_ensure_work`），但一旦将来
+#: 有哪条路径把两件事拆开提交，没有这个窗口就会在那个缝里把活作品删掉。
+PRUNE_MIN_AGE = timedelta(hours=1)
+
+#: 每批删多少行。跟 `_chunks` 的默认值一致，没有特别的道理 —— 够小不至于把
+#: 一个大事务拖太久，够大不至于让往返次数变成瓶颈。
+PRUNE_CHUNK = 500
+
+
+@dataclass(slots=True)
+class PruneWorksReport:
+    """`prune_empty_works` 的执行结果。
+
+    Attributes:
+        deleted: 删掉的空壳作品数。
+        remaining: 这一轮 `limit` 没排上的空壳数，下一轮接着删。
+    """
+
+    deleted: int = 0
+    remaining: int = 0
+
+
+def _empty_work_ids(cutoff: datetime):
+    """选出「没有任何 media 指向」且已经静置够久的作品 id。
+
+    判定走 `NOT EXISTS` 而不是 `work.season_count == 0`：那两个计数是冗余列，
+    由 `services/counters.py` 事后重算，本身就可能过期（生产库实测
+    `season_count == 0` 有 33,633 行，而真的没有 media 指向的是 36,223 行 ——
+    差的 2,590 行正是计数还没刷到的）。删行这种不可逆操作不能建立在可能过期的
+    冗余列上。
+    """
+    return select(Work.id).where(
+        ~select(Media.id).where(Media.work_id == Work.id).exists(),
+        Work.created_at < cutoff,
+    )
+
+
+async def prune_empty_works(session: AsyncSession, *, limit: int | None = None) -> PruneWorksReport:
+    """删掉没有任何 media 指向的空壳作品。
+
+    这些行是 rehome / merge 的残留：media 被搬到别的作品下或被合并掉之后，原
+    作品就空了，但没人负责删它。`canon/rebuild.py` 里那句「那是 maintenance
+    的活」说的就是这件事。
+
+    为什么必须删：搜索默认**不**过滤空壳 —— `services/search.py::_apply_filters`
+    只在 `valid_only` 时才要求「至少有一条校验通过的资源」，不带这个参数的列表页
+    和关键词搜索会把空壳一起吐出去，用户点进去是空的。生产库实测 36,223 行、
+    占作品总数 17.9%。
+
+    删 work 是不可逆的，所以两道保险：一是只认 `NOT EXISTS`（见
+    `_empty_work_ids`），二是只删静置超过 `PRUNE_MIN_AGE` 的行。`media.work_id`
+    是 `ondelete="CASCADE"`，但这里删的恰恰是没有 media 的行，级联不会触发。
+
+    Args:
+        session: 数据库会话。
+        limit: 这一轮最多删多少行；None 表示删到没有为止。分轮是为了让它能
+            挂在有时间预算的 CI job 里 —— 首轮三万多行，一次删完的大事务
+            会把 job 占满。
+
+    Returns:
+        删掉的行数，以及这一轮没排上、留给下一轮的行数。
+    """
+    report = PruneWorksReport()
+    cutoff = utcnow() - PRUNE_MIN_AGE
+    budget = limit
+
+    while budget is None or budget > 0:
+        size = PRUNE_CHUNK if budget is None else min(PRUNE_CHUNK, budget)
+        victims = list(await session.scalars(_empty_work_ids(cutoff).limit(size)))
+        if not victims:
+            return report
+        await session.execute(delete(Work).where(Work.id.in_(victims)))
+        # 按批提交：中断时已经删掉的那些不会回滚，下一轮从剩下的接着来。
+        await session.commit()
+        report.deleted += len(victims)
+        if budget is not None:
+            budget -= len(victims)
+
+    report.remaining = (
+        await session.scalar(select(func.count()).select_from(_empty_work_ids(cutoff).subquery()))
+        or 0
+    )
     return report
 
 
