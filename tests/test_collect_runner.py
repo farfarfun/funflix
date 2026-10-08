@@ -5,9 +5,14 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import func, select
 
+from funflix.base.backoff import MAX_SOURCE_FAILURES
 from funflix.base.enums import SourceType
-from funflix.models import RawDocument, Source
-from funflix.services.collect.base import CollectedMessage, FetchResult
+from funflix.models import RawDocument, Source, utcnow
+from funflix.services.collect.base import CollectedMessage, FetchResult, record_fetch_failure
+from funflix.services.collect.concurrent_runner import (
+    _OPAQUE_FAILURE_COPY_FIELDS,
+    _detached_copy,
+)
 from funflix.services.collect.runner import collect_source
 
 
@@ -181,6 +186,48 @@ class TestCollectFailure:
 
         assert source.consecutive_failures == 0
         assert source.last_error is None
+
+    async def test_a_hopeless_source_gets_disabled(self, session) -> None:
+        """连续失败攒到上限就停掉，别再每 6 小时白打一次死掉的接口。"""
+        source = await _make_source(session)
+        source.consecutive_failures = MAX_SOURCE_FAILURES - 1
+
+        await collect_source(session, source, StubCollector(error=RuntimeError("NXDOMAIN")))
+        await session.commit()
+
+        assert source.consecutive_failures == MAX_SOURCE_FAILURES
+        assert source.enabled is False
+        # 停用原因要原样留着，不然人工复查时无从下手。
+        assert "NXDOMAIN" in source.last_error
+
+    async def test_a_failing_source_stays_enabled_below_the_threshold(self, session) -> None:
+        source = await _make_source(session)
+        source.consecutive_failures = MAX_SOURCE_FAILURES - 2
+
+        await collect_source(session, source, StubCollector(error=RuntimeError("超时")))
+        await session.commit()
+
+        assert source.enabled is True
+
+    async def test_disabling_survives_the_concurrent_write_back(self, session) -> None:
+        """并发那条路在**快照**上记失败，停用得能搬回真正挂在 session 上的那一行。
+
+        两个地方都可能把它丢掉：快照字段表漏了 `enabled`（那它恒为 `None`，
+        `record_fetch_failure` 里的 `and source.enabled` 直接短路，自动停用在这
+        条路上根本不触发），或者失败回写只搬那三个计数字段。
+        """
+        source = await _make_source(session)
+        source.consecutive_failures = MAX_SOURCE_FAILURES - 1
+        snapshot = _detached_copy(source)
+
+        record_fetch_failure(snapshot, RuntimeError("NXDOMAIN"), now=utcnow())
+        assert snapshot.enabled is False, "快照不带 enabled，自动停用在并发这条路上不触发"
+
+        for name in _OPAQUE_FAILURE_COPY_FIELDS:
+            setattr(source, name, getattr(snapshot, name))
+        await session.commit()
+
+        assert source.enabled is False
 
     async def test_missing_collector_is_reported_not_raised(self, session) -> None:
         source = Source(

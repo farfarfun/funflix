@@ -70,11 +70,16 @@ from funworker import BaseBatchConsumer, BaseProcessor, BaseProducer, Pipeline
 from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from funflix.base.backoff import MAX_BACKOFF, backoff
+from funflix.base.backoff import MAX_BACKOFF
 from funflix.base.config import Settings, get_settings
 from funflix.base.db import create_engine
 from funflix.models import Source, utcnow
-from funflix.services.collect.base import CollectedMessage, Collector, FetchResult
+from funflix.services.collect.base import (
+    CollectedMessage,
+    Collector,
+    FetchResult,
+    record_fetch_failure,
+)
 from funflix.services.collect.priority import loss_sensitive_source_clause
 from funflix.services.collect.registry import get_collector_class
 from funflix.services.collect.runner import (
@@ -103,6 +108,8 @@ _TELEGRAM_PAGES_PER_VISIT = _MAX_BACKFILL_PAGES_PER_RUN
 #: `consecutive_failures` 必须在列——`_run_opaque_source` 失败分支会在快照上
 #: 做 `+= 1`，漏了它默认是 `None`（模型的 `default=0` 只在真正 flush 时才生效，
 #: 一个从没挂过 session 的裸 `Source()` 拿不到），失败一次就直接 TypeError 崩掉。
+#: `enabled` 同理：`record_fetch_failure` 要读它来判断「这个源是不是刚被停用」
+#: （避免每轮重复打日志），漏了就恒为 `None`，自动停用在并发这条路上根本不触发。
 _SOURCE_SNAPSHOT_FIELDS = (
     "id",
     "source_type",
@@ -117,6 +124,7 @@ _SOURCE_SNAPSHOT_FIELDS = (
     "max_pages_per_fetch",
     "fetch_interval_seconds",
     "consecutive_failures",
+    "enabled",
 )
 
 #: 整源任务成功时，处理单元在快照上推进的字段要原样搬回真正挂在 session
@@ -133,6 +141,16 @@ _OPAQUE_COPY_FIELDS = (
     "last_error",
     "last_success_at",
     "next_fetch_at",
+)
+
+#: 整源任务失败时要搬回来的字段——`record_fetch_failure` 在快照上写的就这几个。
+#: `enabled` 必须在列：攒够 `MAX_SOURCE_FAILURES` 时它会被置 `False`，漏了这一个
+#: 停用就被静默丢掉，自动停用在并发这条路上等于没做。
+_OPAQUE_FAILURE_COPY_FIELDS = (
+    "consecutive_failures",
+    "last_error",
+    "next_fetch_at",
+    "enabled",
 )
 
 
@@ -277,10 +295,7 @@ async def _run_opaque_source(
     try:
         result = await collector.fetch(source)
     except Exception as exc:
-        source.consecutive_failures += 1
-        source.last_error = f"{type(exc).__name__}: {exc}"
-        source.next_fetch_at = now + backoff(source.consecutive_failures)
-        report.error = source.last_error
+        report.error = record_fetch_failure(source, exc, now=now)
         logger.warning(f"采集失败 source={source.identifier}: {source.last_error}")
         return fetch_messages, backfill_messages, report
 
@@ -666,9 +681,8 @@ class _CollectConsumer(BaseBatchConsumer):
             source.total_collected += report.created
             source.total_backfilled += report.backfill_created
         else:
-            source.consecutive_failures = item.source.consecutive_failures
-            source.last_error = item.source.last_error
-            source.next_fetch_at = item.source.next_fetch_at
+            for name in _OPAQUE_FAILURE_COPY_FIELDS:
+                setattr(source, name, getattr(item.source, name))
 
         self.reports.append((source.identifier, report))
 

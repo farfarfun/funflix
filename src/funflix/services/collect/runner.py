@@ -13,7 +13,7 @@ from datetime import timedelta
 from farlog import getLogger
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from funflix.base.backoff import MAX_BACKOFF, backoff
+from funflix.base.backoff import MAX_BACKOFF
 from funflix.base.commit_batcher import CommitBatcher
 from funflix.models import Source, utcnow
 from funflix.schemas.raw import RawDocumentCreate
@@ -23,6 +23,7 @@ from funflix.services.collect.base import (
     FetchResult,
     ProgressHook,
     SupportsProgress,
+    record_fetch_failure,
 )
 from funflix.services.collect.registry import get_collector
 from funflix.services.ingest import ingest_many
@@ -125,10 +126,7 @@ async def collect_source(
         try:
             result = await collector.fetch(source)
         except Exception as exc:  # 网络抖动、页面改版、被限流都收敛到这里
-            source.consecutive_failures += 1
-            source.last_error = f"{type(exc).__name__}: {exc}"
-            source.next_fetch_at = now + backoff(source.consecutive_failures)
-            report.error = source.last_error
+            report.error = record_fetch_failure(source, exc, now=now)
             logger.warning(f"采集失败 source={source.identifier}: {source.last_error}")
             return report
 

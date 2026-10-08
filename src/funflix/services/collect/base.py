@@ -7,7 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
+from farlog import getLogger
+
+from funflix.base.backoff import MAX_SOURCE_FAILURES, backoff
 from funflix.models import Source
+
+logger = getLogger("funflix")
 
 
 @dataclass(slots=True, frozen=True)
@@ -147,3 +152,26 @@ class Collector(Protocol):
         不支持回溯的采集器返回空结果并置 `backfill_done=True` 即可。
         """
         ...
+
+
+def record_fetch_failure(source: Source, exc: BaseException, *, now: datetime) -> str:
+    """把一次采集失败记到源上：累计失败数、错误信息、下次重试时间。返回错误信息。
+
+    连续失败攒到 `MAX_SOURCE_FAILURES` 就顺手把源停掉 —— 退避封顶在 6 小时，
+    一个永久死掉的源每天还要白打 4 次接口、永远打下去，而且它一直占着
+    `funflix status` 里「连续失败 N」那个数字，把真正该看的新故障淹掉。
+
+    两条采集路径（`runner.py` 的顺序版和 `concurrent_runner.py` 的并发版）
+    共用这一个函数，而不是各记一遍 —— 这套健康度策略之前就是各复制一份的，
+    `base/backoff.py` 开头那段注释讲的就是分叉之后的后果。
+    """
+    source.consecutive_failures += 1
+    source.last_error = f"{type(exc).__name__}: {exc}"
+    source.next_fetch_at = now + backoff(source.consecutive_failures)
+    if source.consecutive_failures >= MAX_SOURCE_FAILURES and source.enabled:
+        source.enabled = False
+        logger.warning(
+            f"采集源停用 source={source.identifier}："
+            f"连续失败 {source.consecutive_failures} 次，最后一条错误 {source.last_error}"
+        )
+    return source.last_error
