@@ -81,6 +81,29 @@ def _path(href: str) -> str:
         return ""
 
 
+def _fetchable(url: str) -> bool:
+    """这个地址能不能真的拿去发一次 HTTP 请求。
+
+    光看锚文本和后缀不够。附件那条筛选里的 `label.endswith(".torrent")` 看的是
+    **锚文本**，而锚文本像个种子文件名完全不代表 href 是个能下载的地址 ——
+    `meijumi.net` 的列表页就是把 magnet 链接的锚文本写成
+    `The.Circle.US.S05.WEBRip.x264-ION10.torrent`。
+
+    而 `client.get("magnet:?xt=...")` **不**抛 `httpx.UnsupportedProtocol`：
+    客户端一旦持有 cookie（访问过一次列表页基本就有了），httpx 会先过一遍
+    cookie 兼容层，那里把地址塞进 `urllib.request.Request`，于是抛
+    `ValueError: unknown url type: '/?xt=urn:btih:...'` —— scheme 被 httpx 的
+    URL 规范化吃掉了，所以报错里压根看不出这原本是个 magnet。`fetch` 的逐页
+    兜底只认 `httpx.HTTPError`，这个 `ValueError` 一路冒到外面，整轮采集作废，
+    连这一轮已经处理好的别的详情页一起丢。生产库里 `https://www.meijumi.net/`
+    就长期卡在这一条上。
+    """
+    try:
+        return urlsplit(url).scheme.lower() in {"http", "https"}
+    except ValueError:
+        return False
+
+
 def _decode(payload: bytes) -> str:
     match = _CHARSET_RE.search(payload[:5000])
     encoding = match.group(1).decode("ascii", errors="ignore") if match else "utf-8"
@@ -296,11 +319,19 @@ class WebCollector(SupportsProgress):
             # 两处都要兜 ValueError：`urlsplit(href)` 自己就会在电驴链接上炸，
             # 见 `_resolve` 的 docstring。
             if (resolved := _resolve(url, href)) is not None
+            and _fetchable(resolved)
             and (label.lower().endswith(".torrent") or _ATTACHMENT_RE.search(_path(href)))
         ]
         for attachment_url, label in attachments[:5]:
-            torrent = await client.get(attachment_url, headers={"User-Agent": DEFAULT_UA})
-            torrent.raise_for_status()
+            try:
+                torrent = await client.get(attachment_url, headers={"User-Agent": DEFAULT_UA})
+                torrent.raise_for_status()
+            except httpx.HTTPError:
+                # 附件是锦上添花：详情页正文里的链接上面已经抓到了。一个附件
+                # 404/超时就把整页丢掉不值当，更不该让它冒到 `fetch` 外面去 ——
+                # 那会连这一轮已经处理好的别的详情页一起丢。
+                requests += 1
+                continue
             requests += 1
             if magnet := _torrent_magnet(torrent.content, label or page.title):
                 attachment_links.append(magnet)

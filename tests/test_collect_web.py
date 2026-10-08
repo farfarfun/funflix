@@ -366,3 +366,89 @@ def test_normalize_identifier_rejects_unparsable_url_without_raising() -> None:
     """
     assert WebCollector.normalize_identifier("http://[不是IPv6/x") is None
     assert WebCollector.normalize_identifier(_ED2K_HREFS[0]) is None
+
+
+@pytest.mark.asyncio
+async def test_a_magnet_labelled_as_a_torrent_does_not_kill_the_round() -> None:
+    """锚文本写成 `xxx.torrent`、href 其实是 magnet —— 不能拿去发 HTTP 请求。
+
+    附件那条筛选里有 `label.endswith(".torrent")`，看的是**锚文本**；
+    `meijumi.net` 就把 magnet 链接的锚文本写成种子文件名。而 httpx 客户端一旦
+    持有 cookie（列表页 `Set-Cookie` 一下就有了），`client.get("magnet:?xt=...")`
+    抛的是 `ValueError: unknown url type: '/?xt=urn:btih:...'` 而**不是**
+    `httpx.UnsupportedProtocol` —— `fetch` 的逐详情页兜底只认
+    `httpx.HTTPError`，于是这一个 href 把整轮采集掀翻，连已经处理好的别的详情页
+    一起丢。生产库里 `https://www.meijumi.net/` 就长期卡在这一条上。详见
+    `_fetchable`。
+    """
+    magnet = "magnet:?xt=urn:btih:" + "ab" * 20
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(
+                200,
+                # cookie 是关键：没有它 httpx 不走 urllib 那层 cookie 兼容代码，
+                # 抛的就是正常的 `UnsupportedProtocol`，这个 bug 复现不出来。
+                headers={"set-cookie": "sid=1; Path=/"},
+                text='<a href="/movie/1.html">电影甲</a>',
+            )
+        return httpx.Response(
+            200,
+            text=(
+                f'<title>【电影甲】下载-影视站</title><a href="{magnet}">Movie.Name.S01.torrent</a>'
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = Source(
+        id=1,
+        source_type=SourceType.WEB,
+        url="https://media.example/",
+        identifier="https://media.example/",
+        max_pages_per_fetch=5,
+        extra={},
+    )
+    result = await WebCollector(client).fetch(source)
+    await client.aclose()
+
+    found = [link for message in result.messages for link in scan_known_links(message.text)]
+    assert [link.provider for link in found] == [Provider.MAGNET]
+
+
+@pytest.mark.asyncio
+async def test_a_broken_attachment_does_not_lose_the_detail_page() -> None:
+    """附件取不到就跳过它，正文里已经抓到的链接要留下。
+
+    附件是锦上添花。原来这里一个 404 就让 `_detail_message` 抛出去，整页丢掉；
+    真正的损失不是这一页，是 `fetch` 里 `errors and not detail_attempted`
+    那个判断之外的东西 —— 同一轮里别的详情页白跑。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(200, text='<a href="/movie/1.html">电影甲</a>')
+        if request.url.path == "/movie/1.html":
+            return httpx.Response(
+                200,
+                text=(
+                    "<title>【电影甲】下载-影视站</title>"
+                    '<a href="https://pan.quark.cn/s/share1">夸克</a>'
+                    '<a href="/attach-download-2.htm">Movie.torrent</a>'
+                ),
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = Source(
+        id=1,
+        source_type=SourceType.WEB,
+        url="https://media.example/",
+        identifier="https://media.example/",
+        max_pages_per_fetch=5,
+        extra={},
+    )
+    result = await WebCollector(client).fetch(source)
+    await client.aclose()
+
+    found = [link for message in result.messages for link in scan_known_links(message.text)]
+    assert [link.share_id for link in found] == ["share1"]
