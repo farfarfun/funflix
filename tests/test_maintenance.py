@@ -662,6 +662,59 @@ class TestRelinkChecks:
         )
         assert len(list(remaining)) == 2, "放弃的行留在 UNCHECKED，交给 verify 正常探测"
 
+    async def test_a_finished_batch_is_committed_before_the_next_one_runs(
+        self, session, monkeypatch
+    ) -> None:
+        """每批落完就提交 —— 提交点在哪决定了行锁要持有多久。
+
+        原先 424 个批次全挤在同一个外层事务里、只用 SAVEPOINT 分隔，`commit`
+        等到整个函数末尾才发：第一批拿到的 2000 把行锁一路持到二十分钟后，
+        锁越攒越多，而 CI 里四个 parse 分片正在写同一批 `resource`。
+        run 37744553498 的 Relink 实测 30 个批次撞车重试耗尽 —— 重试次数和
+        退避时长都治不了，锁窗口才是主因。
+
+        提交点的位置不好直接断言，这里用「第二批抛个非冲突异常」把它照出来：
+        没有按批提交的话，第一批会跟着第二批的异常一起回滚。
+        """
+        monkeypatch.setattr(maintenance, "_RELINK_BATCH", 2)
+        for n in range(30, 34):  # 两个满批
+            session.add(
+                LinkCheck(
+                    provider=Provider.QUARK,
+                    share_id=f"s{n:06d}",
+                    url=f"https://pan.quark.cn/s/s{n:06d}",
+                    checked_at=utcnow(),
+                    status=CheckStatus.VALID,
+                )
+            )
+            session.add(_resource(n))
+        await session.commit()
+
+        real_execute = session.execute
+        seen = 0
+
+        async def boom(stmt, params=None, *args, **kwargs):
+            """第一批正常落，第二批抛个**不是**并发冲突的异常。"""
+            nonlocal seen
+            if isinstance(params, list):
+                seen += 1
+                if seen == 2:
+                    raise RuntimeError("第二批炸了")
+            return await real_execute(stmt, params, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", boom)
+        with pytest.raises(RuntimeError):
+            await relink_checks(session)
+        monkeypatch.undo()
+        await session.rollback()
+
+        remaining = list(
+            await session.scalars(
+                select(Resource.share_id).where(Resource.check_status == CheckStatus.UNCHECKED)
+            )
+        )
+        assert len(remaining) == 2, "第一批已经提交，不该被第二批的异常带走"
+
 
 class TestPruneEmptyWorks:
     """空壳作品（没有任何 media 指向）要删掉。

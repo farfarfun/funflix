@@ -53,6 +53,9 @@ PRESERVED_TABLES = frozenset({"source", "user", "alembic_version"})
 #: 从 5000 降到 2000 是为了缩小跟并行节点撞死锁的窗口：一条 UPDATE 带多少行就
 #: 同时持有多少把行锁，而 CI 里 parse 正在写同一批 `resource`。往返次数从
 #: 170 次涨到 425 次，在这个量级上无所谓；真撞上了，一批的重试代价也小一半多。
+#:
+#: 这个数只决定「一条 UPDATE 带多少行」，不再决定锁要持有多久 —— 后者由
+#: 按批提交管（见 `_flush_relink_batch`），那才是撞车的主因。
 _RELINK_BATCH = 2_000
 
 
@@ -278,11 +281,15 @@ async def relink_checks(session: AsyncSession) -> RelinkReport:
     latest = select(
         ranked.c.provider, ranked.c.share_id, ranked.c.status, ranked.c.checked_at
     ).where(ranked.c.rn == 1)
-    rows = await session.stream(latest)
+    # **一次读完，不用 `session.stream`。** 按批提交会把流式游标连根拔掉（同
+    # `canon/resolver.py::resolve_canon` 里记的那条），而按批提交是这里的重点。
+    # 代价是 848k 行四列一次进内存，约 130MB —— 跟「锁持有 20 分钟」比，这个
+    # 换得值。
+    rows = (await session.execute(latest)).all()
 
     conflicted = 0
     batch: list[dict[str, object]] = []
-    async for provider, share_id, status, checked_at in rows:
+    for provider, share_id, status, checked_at in rows:
         batch.append(
             {
                 "p": provider,
@@ -298,9 +305,13 @@ async def relink_checks(session: AsyncSession) -> RelinkReport:
     if batch:
         conflicted += await _flush_relink_batch(session, stmt, batch)
 
+    # 每批自己提交完了，这里只是收尾（没有未提交的改动时是空操作）。
     await session.commit()
-    # 逐行数不出来（executemany 的 rowcount 不可靠），用前后差值 —— 这是精确的，
-    # 因为本函数是把 resource 从 `UNCHECKED` 改走的唯一来源。
+    # 逐行数不出来（executemany 的 rowcount 不可靠），用前后差值。**这个差值
+    # 是个参考值，不是精确值**：本函数是唯一把 resource 从 `UNCHECKED` 改走的
+    # 地方，但 CI 里并行的 parse 分片在不停**新建** `UNCHECKED` 行，于是后面
+    # 那次计数里混进了这期间新来的，差值被低估。单独跑（`db relink-checks`，
+    # 或刚 `db reset` 完的库）时它是准的。
     return RelinkReport(
         hydrated=unchecked_before - await _unchecked_count(session), conflicted=conflicted
     )
@@ -309,7 +320,7 @@ async def relink_checks(session: AsyncSession) -> RelinkReport:
 async def _flush_relink_batch(
     session: AsyncSession, stmt: Update, batch: list[dict[str, object]]
 ) -> int:
-    """落一批回填，撞车就重试；重试耗尽则放弃这批，返回放弃的行数。
+    """落一批回填并提交，撞车就重试；重试耗尽则放弃这批，返回放弃的行数。
 
     **一批失败不能把整个函数带走。** 这个函数做的是「省一遍重探」的优化：
     放弃的那些行留在 `UNCHECKED`，verify 会照常去探，结论一样，只是多花
@@ -319,12 +330,24 @@ async def _flush_relink_batch(
     开 SAVEPOINT 而不是直接 `execute`：死锁会把当前事务打进 aborted 状态，
     不回滚的话后面每一批都会报「current transaction is aborted」，等于一次
     撞车废掉整轮。回滚到 SAVEPOINT 就能把事务救回来，前面已经落好的批次
-    也不受影响（它们在更外层的事务里，commit 在函数末尾）。
+    也不受影响。
+
+    **每批提交完就放锁。** 原先 424 个批次全挤在同一个外层事务里、只用
+    SAVEPOINT 分隔，`commit` 等到整个函数末尾才发 —— 于是第一批拿到的
+    2000 把行锁要一路持到二十分钟后，锁越攒越多，而 CI 里四个 parse 分片
+    正在写同一批 `resource`。run 37744553498 的 Relink 实测 30 个批次撞车
+    重试耗尽（0.5s / 1.0s 两次退避全撞光），而重试次数和退避时长都治不了
+    这个 —— 对面不是「提交完就走」的瞬时冲突，是持续几十分钟的写流，
+    模块文档里「重试一次基本就过」那个假设在这一步不成立。锁窗口从二十
+    分钟缩到一条 executemany 的几十毫秒，才是对症的。
+
+    顺带一个好处：中断时已经回填好的批次不回滚，下一轮只打残局。
     """
 
     async def _once() -> None:
         async with session.begin_nested():
             await session.execute(stmt, batch)
+        await session.commit()
 
     try:
         await retry_on_write_conflict(_once, what=f"relink 这批 {len(batch)} 行")
