@@ -137,6 +137,16 @@ TOOL_SCHEMA: dict[str, Any] = {
                                 "maximum": 99,
                             },
                             "media_type": {"type": "string", "enum": _MEDIA_TYPES},
+                            #: `year` **故意**既不在 `required` 里、也不在
+                            #: SYSTEM_PROMPT 正文里提 —— 生产库 5889 条裁决里只有
+                            #: 16 条带年份，这是设计的结果，不是漏了。
+                            #:
+                            #: 年份参与 Work 的唯一约束 `(norm_key, media_type,
+                            #: year)`，猜错一年就把同一部作品劈成两个 Work，和误并
+                            #: 一样难修；而上映年份正是模型最容易记错的字段。规则从
+                            #: 标题原文抽的年份（`流浪地球 (2019)`）来源可信，
+                            #: `lookup.py` 也是「裁决里是 0 就用规则抽的」这个顺序。
+                            #: 所以这一列由规则主导，模型只在确信时顺手补一个。
                             "year": {
                                 "type": ["integer", "null"],
                                 "description": "首播/上映年份，1900-2100，不确定填 null",
