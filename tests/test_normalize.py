@@ -436,6 +436,88 @@ class TestCleanTitleIdempotent:
         assert looks_like_junk_title(clean_title(once))
 
 
+class TestTagLineTitles:
+    """Telegram 频道的「🏷 标签：」行被当成了作品。
+
+    生产库里这一类 20 行 media 挂了 18863 条资源，其中 `#短剧` 一行就 12207 条
+    —— 不是因为它出现了一万次，而是 `extract/rule.py` 的 `shared_links` 让
+    每个段落都拿到全文档的链接，几千条消息累积到了同一个"作品"底下。
+    """
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "#短剧",
+            "#电影",
+            "#动漫",
+            "#剧集",
+            "#综艺",
+            "#纪录片",
+            # 裸的类目词（没有 `#`）同样不是作品名
+            "短剧",
+            "电影",
+            "真人秀",
+            "影视",
+        ],
+    )
+    def test_a_lone_category_word_is_not_a_work(self, title: str) -> None:
+        assert looks_like_junk_title(clean_title(title))
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "#动漫 #短剧",
+            "#电影 #动漫",
+            "#动漫 #短剧 #综艺",
+            "#电影 #纪录片",
+            "#剧集 #短剧",
+            # 模板原文整行，`clean_title` 会把 `🏷 标签：` 剥掉
+            "🏷 标签：#短剧 #最新短剧 #热播短剧",
+        ],
+    )
+    def test_a_string_of_category_tags_is_not_a_work(self, title: str) -> None:
+        assert looks_like_junk_title(clean_title(title))
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "#紧急呼救",
+            "#训练日",
+            "#Luimelia",
+            "#零之使魔",
+            "#21克",
+            "#家人募集中",
+            "#亲爱的小美人鱼",
+            "#凡人修仙传 #年番4 #幕兰之战 #4K 11点以后",
+            "#七王国的骑士# HBO #A Knight of the Seven Kingdoms#",
+            "#怪奇物语# flix #Stranger Things#",
+            "#斩神之凡尘神域 第二季 本季完",
+        ],
+    )
+    def test_a_hashtag_prefixed_real_work_survives(self, title: str) -> None:
+        """**这条是上面两条的约束条件，不是补充。**
+
+        这些频道的片名本身就带 `#`，上面那些标题在库里都是真作品（`#紧急呼救`
+        117 条资源、`#训练日` 95 条）。所以判据只能是「逐词都是类目词」，
+        不能是「全是 hashtag」那个形态 —— 后者写起来短得多，也能把标签行全
+        拦下，代价是连这十一行一起删掉，而删除不可逆。
+        """
+        assert not looks_like_junk_title(clean_title(title))
+
+    def test_a_non_category_tag_string_is_deliberately_let_through(self) -> None:
+        """`#VPN #SednaVPN` 是频道广告，但它漏过去 —— 这是有意的。
+
+        想拦住它就得放弃「逐词都是类目词」这个判据，而那会连带误杀上面那批
+        真作品。它在生产库里只有 4 条资源。
+        """
+        assert not looks_like_junk_title(clean_title("#VPN #SednaVPN"))
+
+    @pytest.mark.parametrize("title", ["◎年 代", "感谢"])
+    def test_site_template_leftovers(self, title: str) -> None:
+        """影视站模板的字段名和频道的客套话，各挂着 964 / 683 条资源。"""
+        assert looks_like_junk_title(clean_title(title))
+
+
 class TestNormKey:
     def test_collapses_spacing_and_case(self) -> None:
         assert norm_key("Some Title") == norm_key("some.title") == "sometitle"

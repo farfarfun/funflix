@@ -1307,6 +1307,7 @@ _JUNK_TITLE_KEYS = frozenset(
         "补档",
         "求片",
         "投稿",
+        "感谢",
         # 字段名
         "资源",
         "资源名",
@@ -1330,12 +1331,76 @@ _JUNK_TITLE_KEYS = frozenset(
         "时长",
         "地区",
         "年份",
+        # `◎年 代` —— 影视站模板的字段名，库里 964 条资源挂在它底下。
+        "年代",
         "类型",
         "画质",
         "集数",
         "更新",
     }
 )
+
+#: 影视类目词。整条标题就是其中之一时它是频道的分类标签，不是作品名。
+#:
+#: 没有并进 `_JUNK_TITLE_KEYS` 是因为它还要参与 `_is_tag_line` 的**逐词**
+#: 判定 —— Telegram 的标签行是 `#动漫 #短剧` 这种多词拼接，光有整条命中拦不住。
+_CATEGORY_KEYS = frozenset(
+    {
+        "短剧",
+        "最新短剧",
+        "热播短剧",
+        "电影",
+        "剧集",
+        "电视剧",
+        "连续剧",
+        "新剧",
+        "动漫",
+        "动画",
+        "动画片",
+        "番剧",
+        "国漫",
+        "日漫",
+        "美剧",
+        "韩剧",
+        "日剧",
+        "泰剧",
+        "港剧",
+        "台剧",
+        "英剧",
+        "综艺",
+        "真人秀",
+        "纪录片",
+        "少儿",
+        "儿童",
+        "影视",
+        "热播",
+        "完结",
+        "追更",
+    }
+)
+
+
+def _is_tag_line(title: str) -> bool:
+    """整条标题是一串类目标签。
+
+    Telegram 频道 `夸克云盘影视资源频道` 的消息是固定模板，最后一行
+    `🏷 标签：#短剧 #最新短剧 …` 被规则抽取器当成了一个独立作品段落。单看
+    这一段只是多出一条垃圾 media，坏在 `extract/rule.py` 的 `shared_links`：
+    文档里出现网盘前缀时**每个**段落都拿到**全文档**的链接，于是同一条链接
+    既挂到真作品、又挂到标签段上。几千条消息累积下来，库里 `#短剧` 这一"部
+    作品"底下挂了 11916 条资源 —— 前台最脏的一行就是它。
+
+    **只认"逐词都是类目词"，不认"全是 hashtag"这个形态。** 这些频道的片名
+    本身就带 `#`：库里 `#紧急呼救` 117 条、`#训练日` 95 条、`#Luimelia`
+    13 条、`#零之使魔` 4 条都是真作品，按形态判会连它们一起删掉，而删除不
+    可逆。代价是 `#VPN #SednaVPN` 这类非类目的标签串漏过去 —— 它只有 4 条
+    资源，和误杀一批真剧不是一个量级。
+    """
+    tokens = title.split()
+    if not tokens:
+        return False
+    return all(tok.startswith("#") and norm_key(tok) in _CATEGORY_KEYS for tok in tokens)
+
 
 #: 网盘分享 ID 的形态：纯小写字母数字、够长、且**字母数字混有**。
 #: `adg4qmqWc8j` 这种会漏进标题（见 `_URL_FRAGMENT_RE` 的说明）。
@@ -1400,7 +1465,12 @@ def looks_like_junk_title(title: str) -> bool:
     if key.isdigit():
         # `84` `85` `007803` —— 表格行号 / 集数被当成了剧名
         return True
-    if key in _JUNK_TITLE_KEYS:
+    if key in _JUNK_TITLE_KEYS or key in _CATEGORY_KEYS:
+        # 整条就是一个类目词：`短剧`、`#电影`（`#` 在 norm_key 里被抹掉）。
+        return True
+    if _is_tag_line(title):
+        # 多词标签串 `#动漫 #短剧`。判在**原标题**上，不是 key —— 词的边界
+        # 和 `#` 前缀都是判据，而 key 把两者都抹平了。
         return True
     if _PROVIDER_SHARE_ID_RE.match(key):
         return True
