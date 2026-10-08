@@ -18,6 +18,7 @@ import uuid
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from funflix.base.enums import MediaType, Provider, Quality
 from funflix.models import Media, Resource, Tag, TagKind, Work, media_resource, media_tag, utcnow
@@ -30,6 +31,7 @@ from funflix.services.canon import (
     purge_junk_media,
     rebuild_works,
 )
+from funflix.services.canon import resolver as resolver_mod
 from funflix.services.canon.merge import absorb_attributes, pick_survivor
 from funflix.services.canon.purge import is_junk_media_title
 from funflix.services.canon.resolver import (
@@ -1157,6 +1159,96 @@ class TestPersistDecisions:
         assert rows[0].work_title == "葬送的芙莉莲"
         # `CanonState` 是一组字符串常量，不是枚举 —— 只能比值，不能比身份。
         assert rows[0].status == CanonState.DECIDED
+
+
+class TestPersistUnderConcurrentInserts:
+    """落库要扛住「同时在跑的 parse 往 `title_canon` 插行」。
+
+    `canon/lookup.py::pending_row` 给没见过的键造 `pending` 行，8 个 parse 分片
+    都在干这事；而落库是先查 `existing` 再 `add`，窗口里被插进来的键查不到、
+    于是走 `add`，flush 时撞主键。阶段 1 一轮才几十个键，撞上可以忽略；阶段 2
+    一轮一万个键，于是必然撞 —— run 37769919480 就是这么挂的（`Key
+    (norm_key)=(佳偶天成王鹤润) already exists`），一次冲突把整轮一小时的 LLM
+    调用全回滚了。
+    """
+
+    def _decisions(self, *keys: str) -> list[CanonDecision]:
+        return [
+            CanonDecision(
+                key=k,
+                work_norm_key=series_norm_key(k),
+                work_title=k,
+                season=None,
+                media_type=MediaType.MOVIE,
+                year=UNKNOWN_YEAR,
+                is_junk=False,
+                confidence=0.9,
+            )
+            for k in keys
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_conflicting_chunk_is_retried_and_lands(self, session, monkeypatch) -> None:
+        """撞一次就重查重跑 —— 第二遍那行已经在库里，走更新分支。"""
+        real = resolver_mod._persist_chunk
+        calls = {"n": 0}
+
+        async def racy(sess, chunk, model, prompt_version):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise IntegrityError("insert", {}, Exception("duplicate key"))
+            return await real(sess, chunk, model, prompt_version)
+
+        monkeypatch.setattr(resolver_mod, "_persist_chunk", racy)
+
+        decided, _ = await resolver_mod._persist(session, self._decisions("佳偶天成"), "test-model")
+
+        assert calls["n"] == 2, "撞了要重试，不能直接放弃"
+        assert decided == 1
+        assert len(list(await session.scalars(select(TitleCanon)))) == 1
+
+    @pytest.mark.asyncio
+    async def test_one_hopeless_chunk_does_not_take_the_others_down(
+        self, session, monkeypatch
+    ) -> None:
+        """这条是分段的全部意义：一个键撞到底，也只能毁掉它自己那一段。
+
+        不分段的话整轮一万条裁决一起回滚，那是一小时的调用白烧。
+        """
+        monkeypatch.setattr(resolver_mod, "PERSIST_CHUNK_SIZE", 1)
+        real = resolver_mod._persist_chunk
+
+        async def racy(sess, chunk, model, prompt_version):
+            if chunk[0].key == "撞到底的键":
+                raise IntegrityError("insert", {}, Exception("duplicate key"))
+            return await real(sess, chunk, model, prompt_version)
+
+        monkeypatch.setattr(resolver_mod, "_persist_chunk", racy)
+
+        decided, _ = await resolver_mod._persist(
+            session, self._decisions("前一个键", "撞到底的键", "后一个键"), "test-model"
+        )
+
+        assert decided == 2, "撞死的那一段跳过，另外两段要照样落进去"
+        keys = set(await session.scalars(select(TitleCanon.norm_key)))
+        assert keys == {"前一个键", "后一个键"}
+
+    @pytest.mark.asyncio
+    async def test_decisions_are_split_into_chunks(self, session, monkeypatch) -> None:
+        """分段是真的分了 —— 不然上一条的隔离性无从谈起。"""
+        monkeypatch.setattr(resolver_mod, "PERSIST_CHUNK_SIZE", 2)
+        sizes: list[int] = []
+        real = resolver_mod._persist_chunk
+
+        async def spy(sess, chunk, model, prompt_version):
+            sizes.append(len(chunk))
+            return await real(sess, chunk, model, prompt_version)
+
+        monkeypatch.setattr(resolver_mod, "_persist_chunk", spy)
+
+        await resolver_mod._persist(session, self._decisions("甲", "乙", "丙", "丁", "戊"), "m")
+
+        assert sizes == [2, 2, 1]
 
 
 def _canon(key: str, **kw) -> TitleCanon:

@@ -63,6 +63,7 @@ from typing import Any
 
 from farlog import getLogger
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import MediaType
@@ -115,6 +116,13 @@ MIN_CALL_INTERVAL = 4.0
 #: 不可逆。归一那一路不设这个门槛，因为它一次只送一个块、几十个键，量级差三个
 #: 数量级。不够格的 junk 就当这条没信息，留在 `pending` 下轮再问。
 CLASSIFY_JUNK_MIN_CONFIDENCE = 0.9
+
+#: 落库的分段大小，一段一个事务。见 `_persist` 为什么必须分段。
+PERSIST_CHUNK_SIZE = 500
+
+#: 一段撞上并发插入后最多重试几次。重试几乎总是一次就过（重查就看见那行了），
+#: 给 3 次是为了容下"连着被插了两个不同的键"这种小概率叠加。
+PERSIST_CONFLICT_ATTEMPTS = 3
 
 #: 年份的合理区间，超出即视为模型瞎填。与 `llm/extractor` 同一个口径。
 _YEAR_MIN, _YEAR_MAX = 1900, 2100
@@ -587,6 +595,27 @@ async def _persist(
     `title_canon` 里还没有行（新采进来的作品就是这样，`canon rebuild` 不在
     定时流水线里），`existing` 查不到，就会 `add` 两行同主键，commit 时炸
     `UniqueViolationError: pk_title_canon`。
+
+    ## 为什么要分段 + 重试
+
+    「先查 `existing` 再 `add`」之间有个窗口，而**同时在跑的 parse 会往
+    `title_canon` 插行** —— `canon/lookup.py::pending_row` 给没见过的键造
+    `pending` 行，8 个分片进程都在干这事。窗口里被插进来的那个键，这里查不到
+    于是走 `add`，flush 时撞主键。
+
+    这个竞态一直存在，只是阶段 1（归一）一轮才碰几十个键，撞上的概率可以忽略；
+    阶段 2（分类）一轮送一万个键，于是必然撞 —— run 37769919480 就是这么挂的，
+    报的是 `Key (norm_key)=(佳偶天成王鹤润) already exists`。
+
+    修法是分段落库 + 撞了就重查重试，有两个独立的理由：
+
+    - **重试才治得了竞态。** 重查时那行已经在库里了，第二遍走的是更新分支。
+    - **分段把损失关小。** 不分段的话一次冲突回滚掉整轮一万条裁决，那是一小时
+      的 LLM 调用。分段之后最坏也只影响 500 条，而且重试几乎总能救回来。
+
+    没用 `ON CONFLICT DO UPDATE` 一把梭：这段要同时跑在 SQLite 的测试库上，
+    两种方言的 `on_conflict_do_update` 得分别构造，为一个每轮撞一两次的竞态
+    养两条落库代码路径不值得。
     """
     if not decisions:
         return 0, 0
@@ -600,14 +629,47 @@ async def _persist(
             best[decision.key] = decision
     decisions = list(best.values())
 
-    keys = [d.key for d in decisions]
+    decided = junk = 0
+    for start in range(0, len(decisions), PERSIST_CHUNK_SIZE):
+        chunk = decisions[start : start + PERSIST_CHUNK_SIZE]
+        for attempt in range(PERSIST_CONFLICT_ATTEMPTS):
+            try:
+                chunk_junk = await _persist_chunk(session, chunk, model, prompt_version)
+            except IntegrityError:
+                # 回滚才能让 session 重新可用；下一遍的 `existing` 会看见
+                # 那行，走更新分支。
+                await session.rollback()
+                if attempt == PERSIST_CONFLICT_ATTEMPTS - 1:
+                    # 不往上抛：抛了就把这一轮**已经提交**的段之外的全部
+                    # 白烧掉。这一段的键留在原状（没有行、或还是 pending），
+                    # 下一轮 `resolve` 会重新捞到它们。
+                    logger.warning(f"落库撞车 {len(chunk)} 条，重试 {attempt + 1} 次仍冲突，跳过")
+                    break
+                logger.info(f"落库撞车，重查重跑这一段 {len(chunk)} 条（第 {attempt + 1} 次）")
+                continue
+            decided += len(chunk)
+            junk += chunk_junk
+            break
+
+    return decided, junk
+
+
+async def _persist_chunk(
+    session: AsyncSession,
+    chunk: list[CanonDecision],
+    model: str,
+    prompt_version: str,
+) -> int:
+    """落一段裁决并提交，返回这一段里 junk 的条数。调用方负责重试，见 `_persist`。"""
     existing = {
         row.norm_key: row
-        for row in await session.scalars(select(TitleCanon).where(TitleCanon.norm_key.in_(keys)))
+        for row in await session.scalars(
+            select(TitleCanon).where(TitleCanon.norm_key.in_([d.key for d in chunk]))
+        )
     }
     now = dt.datetime.now(dt.UTC)
     junk = 0
-    for decision in decisions:
+    for decision in chunk:
         row = existing.get(decision.key)
         if row is None:
             row = TitleCanon(norm_key=decision.key)
@@ -626,7 +688,7 @@ async def _persist(
         junk += int(decision.is_junk)
 
     await session.commit()
-    return len(decisions), junk
+    return junk
 
 
 async def resolve_canon(
