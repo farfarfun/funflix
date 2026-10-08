@@ -750,6 +750,13 @@ def canon_resolve(
     limit: Annotated[
         int | None, typer.Option("--limit", help="最多送多少个块，用于小额预算试探")
     ] = None,
+    classify_limit: Annotated[
+        int,
+        typer.Option(
+            "--classify-limit",
+            help="再给单候选项块标多少包类型（一包 50 个键 = 一次调用），0 不跑",
+        ),
+    ] = 0,
     concurrency: Annotated[int, typer.Option("--concurrency", help="并发调用数")] = 8,
     call_interval: Annotated[
         float,
@@ -766,9 +773,20 @@ def canon_resolve(
     再跑 `canon merge`。分两步是故意的：裁决是花钱买来的，先落盘、再人工抽查，
     确认没有误并才应用。
 
-    只送候选项 ≥2 的候选块（实测约 4,900 个）。单候选项的块没有可并的对象，
-    送过去纯烧钱。已经是 `decided` 的键会被跳过，所以中断后重跑只打残局，
-    不重复付费。
+    ## 两个阶段
+
+    `--limit` 管**归一**：只送候选项 ≥2 的块，判"这些键里哪些是同一部作品"。
+
+    `--classify-limit` 管**分类**：送单候选项的块，判孤立键的类型。它默认 0
+    即不跑，因为规模完全不同 —— 生产库 18.5 万个块里 99.2% 只有一个候选项，
+    其中 6.4 万个键的 `media_type` 还是 unknown，而规则那边已经到顶
+    （`guess_media_type` 对抽样 100% 返回 unknown，短剧标题不带类型信号）。
+    这一路**不问作品名**，所以结构性地不可能误并。
+
+    额度按"包"而不是按"键"给：一包 50 个键 = 一次调用，乘以 `--call-interval`
+    就是耗时下限。每轮能给多少取决于 job 还剩多少时间，不取决于还有多少键。
+
+    已经是 `decided` 的键两个阶段都会跳过，所以中断后重跑只打残局，不重复付费。
 
     每轮开头还会先免费沉淀一批：字面恰好等于某个**已知作品键**的未裁决键，
     答案已经在库里了，不必再问模型（见 `services/canon/sediment.py`）。
@@ -786,6 +804,7 @@ def canon_resolve(
                 dry_run=not apply,
                 key=key,
                 limit=limit,
+                classify_limit=classify_limit,
                 concurrency=concurrency,
                 call_interval=call_interval,
             )
@@ -796,20 +815,31 @@ def canon_resolve(
             ["沉淀免费判掉", report.settled],
             ["扫描 media", report.scanned],
             ["候选块总数", report.blocks],
-            ["够格送裁决", report.blocks_eligible],
-            ["本次送出", report.blocks_sent],
-            ["调用次数", report.calls],
-            ["调用失败", report.calls_failed],
-            ["写入裁决", report.decided],
-            ["其中判为垃圾", report.junk],
-            ["校验不通过", report.rejected],
-            ["模型漏答", report.missing],
+            ["① 归一｜够格送裁决", report.blocks_eligible],
+            ["① 归一｜本次送出", report.blocks_sent],
+            ["① 归一｜调用次数", report.calls],
+            ["① 归一｜调用失败", report.calls_failed],
+            ["① 归一｜写入裁决", report.decided],
+            ["① 归一｜其中判为垃圾", report.junk],
+            ["① 归一｜校验不通过", report.rejected],
+            ["① 归一｜模型漏答", report.missing],
+            ["② 分类｜单候选项块", report.singles],
+            ["② 分类｜够格标类型", report.singles_eligible],
+            ["② 分类｜本次送出", report.singles_sent],
+            ["② 分类｜调用次数", report.classify_calls],
+            ["② 分类｜调用失败", report.classify_calls_failed],
+            ["② 分类｜写入类型", report.classified],
+            ["② 分类｜其中判为垃圾", report.classify_junk],
+            ["② 分类｜模型判不出", report.classify_unknown],
+            ["② 分类｜校验不通过", report.classify_rejected],
+            ["② 分类｜模型漏答", report.classify_missing],
             ["输入 token", report.input_tokens],
             ["输出 token", report.output_tokens],
         ],
         ["项", "数量"],
     )
-    _samples_block(report.samples, "待裁决的候选块（同块内的候选项）")
+    _samples_block(report.samples, "① 待裁决的候选块（同块内的候选项）")
+    _samples_block(report.classify_samples, "② 待标类型的孤立键")
     if report.dry_run:
         _warn("dry-run：一次调用都没发。确认要送的块无误后加 --apply 执行")
     else:
@@ -855,6 +885,7 @@ def canon_merge(
         [
             ["已裁决条数", report.decisions],
             ["已就位跳过", report.settled],
+            ["只有类型无需归并", report.typed_only],
             ["本轮没排上", report.deferred],
             ["判为垃圾的键", report.junk_keys],
             ["删除 media", report.junk_media_deleted],

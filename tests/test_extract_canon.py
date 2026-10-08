@@ -120,6 +120,34 @@ class TestResolveTarget:
         )
         assert target.is_junk is True
 
+    def test_a_type_only_decision_takes_the_type_and_leaves_identity_to_the_rules(self) -> None:
+        """分类裁决（`resolver.py` 阶段 2）落下来的行走的就是这条路。
+
+        它只有 `media_type`，`work_title` / `work_norm_key` 都是 NULL —— 这是
+        刻意的，孤立的键没有可并的对象，给模型一个写标题的字段只会凭空制造
+        误并的机会。所以身份必须从这一条分享自己的标题来，类型从裁决来。
+
+        而且**不能**回落到 `_fallback`：那会把 `needs_pending_row` 置真，可这
+        个键在库里已经有行了，`runner.py` 再插一行就撞主键、把整个 SAVEPOINT
+        带崩（见那边的注释）。
+        """
+        target = resolve_target(
+            title="沉默不语的顾小姐 更新至30集",
+            media_type=MediaType.UNKNOWN,
+            year=None,
+            canon=_canon(
+                "沉默不语的顾小姐",
+                work_norm_key=None,
+                work_title=None,
+                season=None,
+                media_type=MediaType.TV,
+            ),
+        )
+        assert target.media_type is MediaType.TV
+        assert target.work_norm_key == "沉默不语的顾小姐"
+        assert target.work_title == "沉默不语的顾小姐 更新至30集"
+        assert target.needs_pending_row is False
+
     def test_broken_decision_falls_back_instead_of_making_an_empty_key_work(self) -> None:
         """裁决的作品名洗完是空的 —— 别建一个空键 Work，那是吸收脏数据的黑洞。"""
         target = resolve_target(

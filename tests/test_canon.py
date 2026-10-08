@@ -33,6 +33,7 @@ from funflix.services.canon import (
 from funflix.services.canon.merge import absorb_attributes, pick_survivor
 from funflix.services.canon.purge import is_junk_media_title
 from funflix.services.canon.resolver import (
+    CLASSIFY_JUNK_MIN_CONFIDENCE,
     MAX_ENTRIES_PER_CALL,
     CanonDecision,
     CanonEntry,
@@ -40,6 +41,8 @@ from funflix.services.canon.resolver import (
     _Pacer,
     _persist,
     _resolve_block,
+    _singles_pending,
+    validate_classifications,
     validate_decisions,
 )
 from funflix.services.counters import (
@@ -889,6 +892,205 @@ class TestResolveValidation:
         assert stats["missing"] == 3
 
 
+class TestClassifyValidation:
+    """`validate_classifications` —— 单候选项块那一路的闸门。
+
+    这一路的输入是**几万个孤立的键**，量级比归一那一路大三个数量级，所以它的
+    失误模式也不同：归一怕的是误并一组，这里怕的是一个系统性偏差被乘上上万条。
+    每条断言对应一个这样的放大器。
+    """
+
+    ENTRIES = [
+        CanonEntry(key="沉默不语的顾小姐", rows=3, resources=7, sample="沉默不语的顾小姐"),
+        CanonEntry(key="化龙记", rows=1, resources=2, sample="化龙记"),
+        CanonEntry(key="夸克", rows=9, resources=0, sample="夸克"),
+    ]
+
+    def _payload(self, *decisions) -> dict:
+        return {"decisions": list(decisions)}
+
+    def _ok(self, key: str, **kw) -> dict:
+        return {
+            "key": key,
+            "media_type": kw.get("media_type", "tv"),
+            "year": kw.get("year"),
+            "is_junk": kw.get("is_junk", False),
+            "confidence": kw.get("confidence", 0.9),
+        }
+
+    def test_identity_fields_are_never_set(self) -> None:
+        """这一路**永远不表达作品身份** —— 整个设计的安全性就在这一条上。
+
+        schema 里没有 `work_title`，所以模型没有任何渠道说"这两个键是同一部"。
+        落库后 `work_norm_key` 是 NULL，身份由 `lookup.py` 的
+        `canon.work_title or title` 从规则那边拿。改坏这条断言就等于给上万个
+        孤立键开了一扇误并的门，而误并不可逆。
+        """
+        decisions, _ = validate_classifications(
+            self._payload(self._ok("沉默不语的顾小姐"), self._ok("化龙记")), self.ENTRIES
+        )
+        assert len(decisions) == 2
+        assert all(d.work_title is None for d in decisions)
+        assert all(d.work_norm_key is None for d in decisions)
+        assert all(d.season is None for d in decisions)
+
+    def test_a_work_title_in_the_payload_is_ignored(self) -> None:
+        """模型自己加了 `work_title` 字段也不采纳 —— 不靠 schema 自觉。"""
+        item = self._ok("化龙记")
+        item["work_title"] = "大主宰"
+        decisions, _ = validate_classifications(self._payload(item), self.ENTRIES)
+        assert decisions[0].work_title is None
+
+    def test_unknown_type_is_dropped_not_persisted(self) -> None:
+        """判不出的不落库。
+
+        落了才是真的坏：`_persist` 会把这行从 `pending` 翻成 `decided`，而
+        `resolve_canon` / `sediment` 都按 `status` 判断还要不要处理这个键 ——
+        一行 unknown 的 `decided` 等于把这个键永久钉死在没有类型的状态上，
+        以后换更强的模型也捞不回来。丢掉它还是 `pending`，下轮能再问。
+        """
+        decisions, stats = validate_classifications(
+            self._payload(self._ok("化龙记", media_type="unknown")), self.ENTRIES
+        )
+        assert decisions == []
+        assert stats["no_signal"] == 1
+
+    def test_unparseable_type_is_dropped_too(self) -> None:
+        """模型用中文答了类型 —— 折成 unknown 之后同样不落库。"""
+        decisions, stats = validate_classifications(
+            self._payload(self._ok("化龙记", media_type="短剧")), self.ENTRIES
+        )
+        assert decisions == []
+        assert stats["no_signal"] == 1
+
+    @pytest.mark.parametrize("confidence", [0.0, 0.5, 0.89, None])
+    def test_low_confidence_junk_is_not_accepted(self, confidence) -> None:
+        """`is_junk` 到了 `canon/apply.py` 是**真删 media 行**。
+
+        归一那一路一次送几十个键，这一路一轮送上万个 —— 模型偏激进一点，
+        删除量就是四位数且不可逆。所以这里要的不是"模型说是垃圾"，而是
+        "模型很确定是垃圾"。不够格的就当这条没信息。
+        """
+        decisions, stats = validate_classifications(
+            self._payload(self._ok("夸克", is_junk=True, confidence=confidence)), self.ENTRIES
+        )
+        assert decisions == []
+        assert stats["junk_low_confidence"] == 1
+
+    def test_confident_junk_is_accepted(self) -> None:
+        decisions, _ = validate_classifications(
+            self._payload(self._ok("夸克", is_junk=True, confidence=CLASSIFY_JUNK_MIN_CONFIDENCE)),
+            self.ENTRIES,
+        )
+        assert decisions[0].is_junk is True
+        assert decisions[0].work_norm_key is None
+
+    def test_junk_needs_no_type(self) -> None:
+        """junk 不受 unknown 那条筛子约束 —— 它的信息在 `is_junk` 上。"""
+        decisions, _ = validate_classifications(
+            self._payload(self._ok("夸克", media_type="unknown", is_junk=True, confidence=0.98)),
+            self.ENTRIES,
+        )
+        assert len(decisions) == 1
+        assert decisions[0].is_junk is True
+
+    def test_unknown_key_is_rejected(self) -> None:
+        decisions, stats = validate_classifications(
+            self._payload(self._ok("斗破苍穹")), self.ENTRIES
+        )
+        assert decisions == []
+        assert stats["unknown_key"] == 1
+
+    def test_duplicate_key_keeps_only_the_first(self) -> None:
+        decisions, stats = validate_classifications(
+            self._payload(
+                self._ok("化龙记", media_type="tv"),
+                self._ok("化龙记", media_type="movie"),
+            ),
+            self.ENTRIES,
+        )
+        assert [d.media_type for d in decisions] == [MediaType.TV]
+        assert stats["duplicate_key"] == 1
+
+    def test_missing_keys_are_counted_not_invented(self) -> None:
+        decisions, stats = validate_classifications(self._payload(self._ok("化龙记")), self.ENTRIES)
+        assert len(decisions) == 1
+        assert stats["missing"] == 2
+
+    @pytest.mark.parametrize("bad", [1899, 2101, "2024", True, None, 3.5])
+    def test_out_of_range_year_becomes_unknown(self, bad) -> None:
+        decisions, _ = validate_classifications(
+            self._payload(self._ok("化龙记", year=bad)), self.ENTRIES
+        )
+        assert decisions[0].year == UNKNOWN_YEAR
+
+    def test_garbage_payload_yields_nothing(self) -> None:
+        decisions, stats = validate_classifications({"decisions": "nope"}, self.ENTRIES)
+        assert decisions == []
+        assert stats["missing"] == 3
+
+
+class TestSinglesPending:
+    """挑谁去标类型。每一道筛子都是在省钱，错了就是白花。"""
+
+    def _blocks(self, *groups: list[CanonEntry]) -> dict[str, list[CanonEntry]]:
+        return {f"b{i}": list(g) for i, g in enumerate(groups)}
+
+    def test_multi_entry_blocks_are_left_to_the_merge_path(self) -> None:
+        """多候选项的块归一那一路管，这里不碰。
+
+        不是分工洁癖：归一给的裁决带身份 + 季 + 类型，信息更全。先用一条只有
+        类型的裁决把这个键标成 `decided`，归一那边 `all(e.key in done)` 就会
+        整块跳过，这组键就永远并不起来了。
+        """
+        multi = [CanonEntry(key="大主宰", resources=9), CanonEntry(key="大主宰2", resources=1)]
+        report = ResolveReport()
+        assert _singles_pending(self._blocks(multi), set(), report) == []
+        assert report.singles == 0
+
+    def test_already_decided_keys_are_skipped(self) -> None:
+        """一个键可能同时落在单候选项块和多候选项块里（生产库 621 个这样），
+        所以必须真查 `done`，不能假定两路的键不相交。"""
+        entry = CanonEntry(key="化龙记", resources=2)
+        report = ResolveReport()
+        out = _singles_pending(self._blocks([entry]), {"化龙记"}, report)
+        assert out == []
+        assert report.singles == 1
+        assert report.singles_eligible == 0
+
+    def test_keys_that_already_have_a_type_are_not_paid_for(self) -> None:
+        """抽取那一步已经判出类型的键不再花钱。
+
+        它拿的是**整篇文案**（`extract/rule.py` 给 `guess_media_type` 的是
+        `segment.text`），比这里只有一个标题强得多，判出来的就是答案。这一道
+        筛掉的量最大 —— 生产库上够格数从 164,431 降到约 6.4 万，六成的调用
+        本来是白花的。
+        """
+        report = ResolveReport()
+        out = _singles_pending(
+            self._blocks([CanonEntry(key="化龙记", resources=2, typed=True)]), set(), report
+        )
+        assert out == []
+        assert report.singles == 1
+        assert report.singles_eligible == 0
+
+    def test_keys_the_rules_can_type_are_not_paid_for(self) -> None:
+        """标题本身就带类型信号的也不花钱。"""
+        report = ResolveReport()
+        out = _singles_pending(
+            self._blocks([CanonEntry(key="某纪录片", sample="蓝色星球 纪录片")]), set(), report
+        )
+        assert out == []
+
+    def test_biggest_first(self) -> None:
+        """额度小的时候先修前台最显眼的行。"""
+        small = CanonEntry(key="冷门剧", rows=1, resources=1)
+        big = CanonEntry(key="热门剧", rows=20, resources=300)
+        report = ResolveReport()
+        out = _singles_pending(self._blocks([small], [big]), set(), report)
+        assert [e.key for e in out] == ["热门剧", "冷门剧"]
+
+
 class TestPersistDecisions:
     """落库那一步。`validate_decisions` 只保证**块内**的 key 不重复。"""
 
@@ -973,6 +1175,50 @@ def _canon(key: str, **kw) -> TitleCanon:
 
 class TestApplyCanonDecisions:
     """阶段 4：把裁决落到库上。误应用和误并一样不可逆。"""
+
+    @pytest.mark.asyncio
+    async def test_a_type_only_decision_never_creates_an_empty_key_work(self, session) -> None:
+        """只有类型、不说作品是谁的裁决，merge 必须整条跳过。
+
+        这是分类那一路（`resolver.py` 阶段 2）落下来的行：`work_norm_key` 和
+        `work_title` 都是 NULL，结论经 `lookup.py` 走 parse / repair 落到
+        media 上，不经过 merge。
+
+        不跳过的后果是灾难性的：`_work_key_of` 对这种行算出空串，
+        `_ensure_work` 就会 get-or-create 一个 `norm_key=''` 的 Work，而**所有**
+        这样的裁决都落到同一个它身上 —— 一个把几万行 media 吸进去的黑洞，
+        且 `media.work_id` 一旦改掉就再也分不开了。6.4 万个待标类型的键，
+        漏掉这道判断就是 6.4 万行。
+        """
+        media = _media("沉默不语的顾小姐")
+        session.add(media)
+        await session.commit()
+        home = media.work_id
+
+        session.add(
+            TitleCanon(
+                norm_key=series_norm_key("沉默不语的顾小姐"),
+                work_norm_key=None,
+                work_title=None,
+                season=None,
+                media_type=MediaType.TV,
+                year=UNKNOWN_YEAR,
+                is_junk=False,
+                status=CanonState.DECIDED,
+            )
+        )
+        await session.commit()
+
+        report = await apply_canon_decisions(session, dry_run=False)
+
+        assert report.typed_only == 1
+        assert report.works_created == 0
+        empty = await session.scalar(
+            select(func.count()).select_from(Work).where(Work.norm_key == "")
+        )
+        assert empty == 0
+        await session.refresh(media)
+        assert media.work_id == home
 
     @pytest.mark.asyncio
     async def test_sequel_key_merges_into_the_work_as_its_own_season(self, session) -> None:

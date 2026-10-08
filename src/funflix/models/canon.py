@@ -29,6 +29,14 @@ from funflix.models.media import UNKNOWN_YEAR
 #: prompt_version)` 上，动它会让两百万条已缓存的抽取结果全部失效重跑。
 CANON_PROMPT_VERSION = "canon-v1"
 
+#: 分类 prompt 的版本号。和上面那个分开记，理由见 `canon/prompts.py` 的模块说明。
+#:
+#: 带这个版本号的行只补了 `media_type` / `year` / `is_junk`，**`work_title` 和
+#: `work_norm_key` 是 NULL** —— 它们不表达作品身份，身份仍由规则层给
+#: （`lookup.py` 的 `canon.work_title or title`）。想把这一路的结论全部作废时，
+#: 按 `prompt_version = 'canon-cls-v1'` 就能精确捞出来，不会误伤归一裁决。
+CANON_CLASSIFY_PROMPT_VERSION = "canon-cls-v1"
+
 
 class CanonState:
     """`TitleCanon.status` 的取值。

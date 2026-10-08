@@ -259,12 +259,33 @@ jobs:
       # 归一裁决对它无意义。真正的待办量看「够格送裁决」。
       #
       # 代价是这 18 万单 key 块的 `media_type` 永远得不到 LLM 补全：全库
-      # `unknown` 的 64668 个键里 64519 个（99.8%）落在单 key 块里。那是另一条
-      # 路要解决的事，不是把这里的 limit 提上去能解决的。
+      # `unknown` 的 64668 个键里 64519 个（99.8%）落在单 key 块里。**这正是
+      # `--classify-limit` 存在的理由** —— 不是把上面那个 limit 提上去能解决的。
+      #
+      # ## --classify-limit：单 key 块只标类型
+      #
+      # 额度单位是**包**，一包 50 个键 = 一次调用。和 `--limit` 共用一个
+      # `_Pacer`，所以这一步的总耗时是 `(归一块数 + 包数) × 4s` 加上约 6 分钟
+      # 的全表扫描 —— 两个额度都在花同一份时间预算。
+      #
+      # 本地实跑 2 包（100 个键）的实测，是定下面这个数字的依据：
+      # 写入类型 62 / 判为垃圾 5 / 模型判不出 38 / 校验不通过 0 / 漏答 0。
+      # 人眼过了那 62 条：`兄台请留步`、`三嫁惹君心` 判 tv，`尚硅谷大数据大神班`
+      # 判 other，`意林pdf` 判 book，都对；5 条 junk 全是 confidence 1.0 的抓取
+      # 残渣（`post via api service`、`asmr description`），只牵连 5 行 media。
+      # movie/tv/anime 之间混了约 5-9%（`攻壳机动队` 判成 movie），但类型判错
+      # 可以重判，和误并那种不可逆的损坏不是一回事 —— 而这条路**结构性地**
+      # 不可能误并，它的 schema 里没有 `work_title`。
+      #
+      # 待办量 64582 个键 = 1292 包。先给 200 包（1 万个键，约 14 分钟）跑一轮
+      # 看 Action 里的实测，确认绿了再往上提 —— 时间预算这边宽得很：归一那条线
+      # 已经见底（上一轮 409 个块，这一轮只剩 72），Resolve 这步会从 33 分钟掉
+      # 到 25 分钟上下。提到 800 包（4 万键）两轮就能清完 6.4 万。
       - name: Resolve
         run: >
           uv run $UV_SYNC_EXTRAS --extra llm funflix canon resolve
-          --apply --yes --limit 500 --concurrency 4 --call-interval 4
+          --apply --yes --limit 500 --classify-limit 200
+          --concurrency 4 --call-interval 4
 
       # 应用的是**之前每一轮**攒下来的裁决，不只是这一轮的，所以 resolve 挂了
       # （比如 LLM 网关抽风）它照样要跑完 —— job 整体仍然是红的，不会掩盖问题。

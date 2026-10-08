@@ -76,6 +76,8 @@ class ApplyReport:
     settled: int = 0
     #: 真有活要干、但被这一轮的 `limit` 挡在外面的键数，下一轮接着做。
     deferred: int = 0
+    #: 不表达作品身份、因此 merge 无活可干的裁决数。见循环里的说明。
+    typed_only: int = 0
     dry_run: bool = True
     samples: list[str] = field(default_factory=list)
 
@@ -303,7 +305,7 @@ async def apply_canon_decisions(
 
     by_key = {d.norm_key: d for d in decisions}
     members = await _media_rows_for_keys(session, set(by_key))
-    works = await _existing_works(session, {_work_key_of(d) for d in decisions})
+    works = await _existing_works(session, {k for d in decisions if (k := _work_key_of(d))})
 
     junk_victims: list[uuid.UUID] = []
     live: list[tuple[TitleCanon, list[uuid.UUID]]] = []
@@ -312,6 +314,20 @@ async def apply_canon_decisions(
         if decision.is_junk:
             report.junk_keys += 1
             junk_victims.extend(row.media_id for row in rows)
+        elif not _work_key_of(decision):
+            # 这条裁决没说作品是谁，merge 就没有归并可做。两种来源：
+            #
+            # - 分类裁决（`resolver.py` 的阶段 2）：按设计只补 `media_type`，
+            #   `work_title` / `work_norm_key` 都是 NULL。它的结论经
+            #   `lookup.py` 的 `canon.work_title or title` 走 parse / repair
+            #   那条路落到 media 上，不经过这里。
+            # - 坏数据：人工改库改出来的空标题行。
+            #
+            # **必须显式跳过**，不能让它往下走：`_ensure_work` 对空键会
+            # get-or-create 一个 `norm_key=''` 的 Work，而所有这样的裁决都会
+            # 落到同一个它身上 —— 一个把几万行 media 吸进去的黑洞，且
+            # `media.work_id` 改完就再也分不开了。
+            report.typed_only += 1
         elif rows:
             if _already_settled(decision, rows, works.get(_work_key_of(decision))):
                 report.settled += 1

@@ -15,8 +15,25 @@
 这正是想要的：**分块宁宽不紧**。该在一块的没在一块，模型根本没机会纠正；
 分宽了只是多给几个候选，代价仅仅是 token。
 
-**只送 ≥2 个候选项的块**（实测 4,899 个）。单候选项的块没有可并的对象，
-送过去纯烧钱；它们的季号/类型/年份由规则兜着，等真有需要再单独扫一遍。
+**归一只送 ≥2 个候选项的块**（实测 1,471 个）。单候选项的块没有可并的对象，
+拿去问"哪些是同一部"纯烧钱。
+
+## 阶段 2：单候选项块只标类型
+
+上面那句话有个代价，拖到现在才付：生产库 185,285 个块里 **183,814 个
+（99.2%）只有一个候选项**，归一那一路一个都不碰，于是 64,668 个
+`media_type` 还是 unknown 的键里，**64,519 个（99.8%）永远等不到裁决**。
+规则那边也到顶了 —— `guess_media_type` 对 4,000 行抽样 100% 返回 unknown，
+因为短剧标题（`沉默不语的顾小姐`、`飞鸥不下`）压根不带类型信号。
+
+所以加了第二个阶段，**只问类型、不问作品名**：孤立的键本来就没有可并的对象，
+给模型一个写标题的字段只会凭空制造误并的机会。它在 `CLASSIFY_TOOL_SCHEMA`
+里没有表达归并的字段，所以这条路**结构性地**不可能误并 —— 比在 prompt 里
+叮嘱"不要并"可靠。身份仍由规则给（`lookup.py` 的
+`canon.work_title or title`），落下来的行 `work_norm_key` 是 NULL。
+
+两个阶段串行、共用一趟全表扫描和一个限速器，额度各自独立
+（`limit` / `classify_limit`）。串行是必须的，理由见 `_singles_pending`。
 
 ## 一次调用一个块
 
@@ -50,7 +67,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from funflix.base.enums import MediaType
 from funflix.models import Media
-from funflix.models.canon import CANON_PROMPT_VERSION, CanonState, TitleCanon
+from funflix.models.canon import (
+    CANON_CLASSIFY_PROMPT_VERSION,
+    CANON_PROMPT_VERSION,
+    CanonState,
+    TitleCanon,
+)
 from funflix.models.media import UNKNOWN_YEAR
 from funflix.services.canon import prompts
 from funflix.services.canon import sediment as sediment_mod
@@ -62,6 +84,7 @@ from funflix.services.extract.llm.client import (
 from funflix.services.text.normalize import (
     block_key,
     clean_title,
+    guess_media_type,
     looks_like_junk_title,
     series_norm_key,
 )
@@ -85,6 +108,14 @@ DEFAULT_CONCURRENCY = 8
 #: 4 秒 ≈ 15 次/分，正好是那一轮**实际跑通**的速率。
 MIN_CALL_INTERVAL = 4.0
 
+#: 分类标注里 `is_junk=true` 的采纳门槛。
+#:
+#: 高得不像个阈值是故意的：`is_junk` 到了 `canon/apply.py` 是**真删 media 行**，
+#: 而分类这一路一轮要送上万个孤立键 —— 模型偏激进一点，删除量就是四位数且
+#: 不可逆。归一那一路不设这个门槛，因为它一次只送一个块、几十个键，量级差三个
+#: 数量级。不够格的 junk 就当这条没信息，留在 `pending` 下轮再问。
+CLASSIFY_JUNK_MIN_CONFIDENCE = 0.9
+
 #: 年份的合理区间，超出即视为模型瞎填。与 `llm/extractor` 同一个口径。
 _YEAR_MIN, _YEAR_MAX = 1900, 2100
 
@@ -104,6 +135,10 @@ class CanonEntry:
     rows: int = 0
     resources: int = 0
     sample: str = ""
+    #: 这个键底下**已经有行带着类型**了 —— 抽取那一步从整篇文案判出来的
+    #: （`extract/rule.py` 给 `guess_media_type` 的是 `segment.text`，比标题
+    #: 信息多得多）。分类阶段靠它避开已有答案的键，见 `_singles_pending`。
+    typed: bool = False
 
 
 @dataclass(slots=True)
@@ -141,6 +176,26 @@ class ResolveReport:
     dry_run: bool = True
     samples: list[str] = field(default_factory=list)
 
+    # --- 阶段 2：单候选项块的类型标注（见 `_singles_pending`）-----------------
+    #: 只有一个候选项、因此归一那一路按设计不碰的块数
+    singles: int = 0
+    #: 其中还缺类型、够格送标注的 key 数（规则判得出类型的不送）
+    singles_eligible: int = 0
+    #: 本轮实际送出的 key 数
+    singles_sent: int = 0
+    classify_calls: int = 0
+    classify_calls_failed: int = 0
+    #: 标注出类型、已落库的条数
+    classified: int = 0
+    #: 标注成 junk 的条数
+    classify_junk: int = 0
+    #: 模型自己也判不出（返回 unknown）因此**故意不落库**的条数，见
+    #: `validate_classifications`
+    classify_unknown: int = 0
+    classify_rejected: int = 0
+    classify_missing: int = 0
+    classify_samples: list[str] = field(default_factory=list)
+
 
 async def _scan_blocks(session: AsyncSession, report: ResolveReport) -> dict[str, list[CanonEntry]]:
     """扫全表，按 `block_key` → `series_norm_key` 聚合。
@@ -149,8 +204,8 @@ async def _scan_blocks(session: AsyncSession, report: ResolveReport) -> dict[str
     这里再拦一道是为了让 resolve 在没跑过 purge 的库上也不会把垃圾送去烧钱。
     """
     blocks: dict[str, dict[str, CanonEntry]] = {}
-    rows = await session.stream(select(Media.title, Media.resource_count))
-    async for title, resource_count in rows:
+    rows = await session.stream(select(Media.title, Media.resource_count, Media.media_type))
+    async for title, resource_count, media_type in rows:
         report.scanned += 1
         cleaned = clean_title(title or "")
         if looks_like_junk_title(cleaned):
@@ -167,6 +222,8 @@ async def _scan_blocks(session: AsyncSession, report: ResolveReport) -> dict[str
             entries[key] = entry
         entry.rows += 1
         entry.resources += resource_count or 0
+        if media_type is not MediaType.UNKNOWN:
+            entry.typed = True
 
     report.blocks = len(blocks)
     # 候选项按规模倒序：拆页时主干必须落在第 1 页，后面的页才有锚可以对。
@@ -270,6 +327,95 @@ def validate_decisions(
     return decisions, stats
 
 
+def validate_classifications(
+    payload: dict[str, Any], entries: list[CanonEntry]
+) -> tuple[list[CanonDecision], dict[str, int]]:
+    """把分类标注校验成裁决列表。
+
+    和 `validate_decisions` 的三个关键差别：
+
+    1. **`work_title` / `work_norm_key` 一律留 `None`**，`season` 也是。schema
+       里根本没有这些字段（见 `prompts.CLASSIFY_TOOL_SCHEMA`），这一路不表达
+       作品身份，只补类型。身份由 `lookup.py` 的
+       `work_title = canon.work_title or title` 从规则那边拿。
+    2. **模型返回 unknown 的直接丢掉，不落库。** 落了反而有害：`_persist` 会把
+       这一行从 `pending` 翻成 `decided`，而 `resolve_canon` 和 `sediment` 都按
+       `status` 判断"还要不要处理这个键" —— 一个 unknown 的 decided 行等于把
+       这个键永久钉死在没有类型的状态上，以后换了更强的模型也捞不回来。
+       丢掉的话它还是 `pending`，下一轮还能再问。
+    3. **junk 要 `confidence >= CLASSIFY_JUNK_MIN_CONFIDENCE` 才采纳。** 归一
+       那一路一次只送一个块、几十个键，这一路一轮要送上万个孤立键，而
+       `is_junk` 在 `canon/apply.py` 那边是**真删 media 行**。模型稍微偏激进，
+       删除量就是四位数且不可逆。不够格的 junk 退化成"这条没信息"，跟 unknown
+       一样丢掉。
+    """
+    expected = {e.key for e in entries}
+    stats = {
+        "unknown_key": 0,
+        "duplicate_key": 0,
+        "no_signal": 0,
+        "junk_low_confidence": 0,
+        "missing": 0,
+    }
+
+    raw = payload.get("decisions")
+    if not isinstance(raw, list):
+        raw = []
+
+    decisions: list[CanonDecision] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            stats["unknown_key"] += 1
+            continue
+
+        key = str(item.get("key") or "").strip()
+        if key not in expected:
+            stats["unknown_key"] += 1
+            continue
+        if key in seen:
+            stats["duplicate_key"] += 1
+            continue
+        seen.add(key)
+
+        raw_confidence = item.get("confidence")
+        confidence = float(raw_confidence) if isinstance(raw_confidence, (int, float)) else None
+
+        is_junk = bool(item.get("is_junk"))
+        if is_junk and (confidence is None or confidence < CLASSIFY_JUNK_MIN_CONFIDENCE):
+            stats["junk_low_confidence"] += 1
+            continue
+
+        media_type = MediaType.UNKNOWN
+        raw_type = item.get("media_type")
+        if isinstance(raw_type, str):
+            try:
+                media_type = MediaType(raw_type.strip().lower())
+            except ValueError:
+                media_type = MediaType.UNKNOWN
+
+        if not is_junk and media_type is MediaType.UNKNOWN:
+            # 模型也判不出来 —— 留在 pending，见 docstring 第 2 条。
+            stats["no_signal"] += 1
+            continue
+
+        decisions.append(
+            CanonDecision(
+                key=key,
+                work_title=None,
+                work_norm_key=None,
+                season=None,
+                media_type=media_type,
+                year=_coerce_year(item.get("year")),
+                is_junk=is_junk,
+                confidence=confidence,
+            )
+        )
+
+    stats["missing"] = len(expected - seen)
+    return decisions, stats
+
+
 def _decided_context(decided: dict[str, CanonDecision]) -> str:
     """把前几页定下来的作品名回传给模型，让它照抄而不是另起一个写法。"""
     titles = sorted({d.work_title for d in decided.values() if d.work_title})
@@ -346,8 +492,87 @@ async def _resolve_block(
     return decided
 
 
+def _singles_pending(
+    blocks: dict[str, list[CanonEntry]], done: set[str], report: ResolveReport
+) -> list[CanonEntry]:
+    """挑出够格送类型标注的孤立键。
+
+    三道筛子，每一道都是在省钱：
+
+    - **只要单候选项的块**。多候选项的块归一那一路会处理，而它给的裁决信息更全
+      （身份 + 季 + 类型），不该在这里先用一个只有类型的裁决把它占掉。
+    - **跳过已裁决的键**。一个 `series_norm_key` 可能同时落在一个多候选项块和
+      一个单候选项块里（它丢掉尾部的拉丁别名、`block_key` 留着，生产库
+      104,527 个键里有 621 个这样），所以这里必须查 `done`，不能假定两路的键
+      不相交。
+    - **跳过已经有类型的键**（`entry.typed`）。抽取那一步是拿**整篇文案**喂
+      `guess_media_type` 的，比这里只有一个标题强得多，它判出来的类型就是答案
+      了。这一道筛掉的量最大：不看它的话够格数是 164,431，看了之后
+      约 6.4 万 —— 六成的调用本来是白花的。
+    - **跳过标题本身就能判出类型的键**。`guess_media_type` 对**标题**也能判出
+      来的同样不花钱。实测它对生产库抽样 100% 返回 unknown（短剧标题不带类型
+      信号），所以这一道几乎筛不掉东西 —— 留着是为了"规则能干的不交给模型"
+      这个顺序不会因为以后规则变强而失效。
+
+    按资源数倒序：额度小的时候先修前台最显眼的那些行。
+    """
+    out: list[CanonEntry] = []
+    for entries in blocks.values():
+        if len(entries) != 1:
+            continue
+        report.singles += 1
+        entry = entries[0]
+        if entry.key in done or entry.typed:
+            continue
+        if guess_media_type(entry.sample, entry.sample) is not MediaType.UNKNOWN:
+            continue
+        out.append(entry)
+
+    out.sort(key=lambda e: (-e.resources, -e.rows, e.key))
+    report.singles_eligible = len(out)
+    return out
+
+
+async def _classify_pack(
+    client: LLMClient,
+    entries: list[CanonEntry],
+    report: ResolveReport,
+    pacer: _Pacer,
+) -> list[CanonDecision]:
+    """标注一包孤立的键。一包一次调用，没有拆页也没有跨页上下文。
+
+    `_resolve_block` 那边要拆页、要把前几页定下来的作品名回传，是因为同一个块
+    拆开之后两页必须给出**字面相同**的 `work_title` 才能并到一起。这里每个键
+    各自独立、又不产出标题，页与页之间没有任何需要对齐的东西 —— 所以包怎么切
+    都不影响结果，一包就是一次调用。
+    """
+    lines = [prompts.format_entry(e.key, e.rows, e.resources, e.sample) for e in entries]
+    user = prompts.build_classify_message(lines)
+
+    await pacer.wait()
+    report.classify_calls += 1
+    try:
+        result = await client.extract(prompts.CLASSIFY_SYSTEM_PROMPT, user)
+    except LLMCallError as exc:
+        report.classify_calls_failed += 1
+        logger.warning(f"类型标注调用失败，该包留待重跑：{exc}")
+        return []
+
+    report.input_tokens += result.input_tokens or 0
+    report.output_tokens += result.output_tokens or 0
+
+    decisions, stats = validate_classifications(result.payload, entries)
+    report.classify_rejected += stats["unknown_key"] + stats["duplicate_key"]
+    report.classify_unknown += stats["no_signal"] + stats["junk_low_confidence"]
+    report.classify_missing += stats["missing"]
+    return decisions
+
+
 async def _persist(
-    session: AsyncSession, decisions: list[CanonDecision], model: str
+    session: AsyncSession,
+    decisions: list[CanonDecision],
+    model: str,
+    prompt_version: str = CANON_PROMPT_VERSION,
 ) -> tuple[int, int]:
     """把裁决写进 `title_canon`，返回 (decided 条数, junk 条数)。
 
@@ -369,7 +594,9 @@ async def _persist(
     best: dict[str, CanonDecision] = {}
     for decision in decisions:
         incumbent = best.get(decision.key)
-        if incumbent is None or decision.confidence > incumbent.confidence:
+        # `confidence` 是 `float | None`（模型没给、或给了个非数字时就是 None），
+        # 直接比会 `TypeError: '>' not supported between ... NoneType`。
+        if incumbent is None or (decision.confidence or 0.0) > (incumbent.confidence or 0.0):
             best[decision.key] = decision
     decisions = list(best.values())
 
@@ -394,7 +621,7 @@ async def _persist(
         row.status = CanonState.DECIDED
         row.confidence = decision.confidence
         row.model = model
-        row.prompt_version = CANON_PROMPT_VERSION
+        row.prompt_version = prompt_version
         row.decided_at = now
         junk += int(decision.is_junk)
 
@@ -408,6 +635,7 @@ async def resolve_canon(
     dry_run: bool = True,
     key: str | None = None,
     limit: int | None = None,
+    classify_limit: int = 0,
     concurrency: int = DEFAULT_CONCURRENCY,
     call_interval: float = MIN_CALL_INTERVAL,
     client: LLMClient | None = None,
@@ -415,14 +643,30 @@ async def resolve_canon(
 ) -> ResolveReport:
     """给候选块跑 LLM 裁决，结果落 `title_canon`。
 
+    两个阶段，各打一种残局，共用同一趟全表扫描和同一个限速器：
+
+    1. **归一**（多候选项块）：判"这些键里哪些是同一部作品"。额度 `limit`。
+    2. **分类**（单候选项块）：判孤立键的类型。额度 `classify_limit`，默认
+       **0 即不跑**。它不表达作品身份，所以不可能误并，见
+       `validate_classifications`。
+
+    两阶段串行，不是为了省并发 —— 是因为一个键可能同时出现在两种块里（见
+    `_singles_pending`），阶段 1 先落库，阶段 2 的 `done` 才拦得住重复付费，
+    也才不会让一条只有类型的裁决盖掉一条信息更全的归一裁决。
+
     Args:
         dry_run: 只统计块数和抽样要送的内容，**一次调用都不发**。默认开。
         key: 只处理 `block_key` 等于它的那一块。单组演练用。
-        limit: 最多送多少个块。配合小额预算试探。
-        concurrency: 并发块数。
+        limit: 阶段 1 最多送多少个块。配合小额预算试探。
+        classify_limit: 阶段 2 最多送多少**包**（一包 ≤ `MAX_ENTRIES_PER_CALL`
+            个键，也就是一次调用）。0 = 不跑这个阶段。按包而不是按键算，是为
+            了让它和 `MIN_CALL_INTERVAL` 直接相乘就能估出耗时 —— 每轮的预算
+            本质上是时间，不是键数。
+        concurrency: 并发块数（两阶段各自内部的并发）。
         call_interval: 两次调用起跑时刻的最小间隔（秒），0 表示不节流。
-        client: 注入用，测试传桩。默认按 funsecret 的配置构造。
-        on_progress: 每做完一个块调一次，入参是累计已裁决的 key 数。
+        client: 注入用，测试传桩，**两个阶段共用它**。默认按 funsecret 的配置
+            各构造一个 —— 两阶段的 `tool_schema` 不同，而它是构造时绑定的。
+        on_progress: 每个阶段落库后调一次，入参是累计已裁决的 key 数。
 
     可中断续跑：已经是 `decided` 的 key 会被跳过，块里全部 key 都裁决过的块
     整块跳过。所以中断后重跑只打残局，不重复付费。
@@ -465,28 +709,68 @@ async def resolve_canon(
     for _, entries in pending[:SAMPLE_LIMIT]:
         report.samples.append(" | ".join(e.key for e in entries[:6]))
 
+    # 阶段 2 的候选集。放在 dry-run 的 return 之前算，这样 dry-run 能同时报出
+    # 两个阶段各有多少活 —— 定额度之前要先看得见规模。
+    singles = _singles_pending(blocks, done, report)
+    packs = [
+        singles[start : start + MAX_ENTRIES_PER_CALL]
+        for start in range(0, len(singles), MAX_ENTRIES_PER_CALL)
+    ]
+    packs = packs[:classify_limit]
+    report.singles_sent = sum(len(pack) for pack in packs)
+    for pack in packs[:SAMPLE_LIMIT]:
+        report.classify_samples.append(" | ".join(e.key for e in pack[:6]))
+
     if dry_run:
         return report
-
-    if client is None:
-        client = OpenAICompatClient(tool_schema=prompts.TOOL_SCHEMA, tool_name=prompts.TOOL_NAME)
 
     gate = asyncio.Semaphore(concurrency)
     pacer = _Pacer(call_interval)
 
-    async def run(entries: list[CanonEntry]) -> dict[str, CanonDecision]:
-        async with gate:
-            return await _resolve_block(client, entries, report, pacer)
+    if pending:
+        resolve_client = client or OpenAICompatClient(
+            tool_schema=prompts.TOOL_SCHEMA, tool_name=prompts.TOOL_NAME
+        )
 
-    results = await asyncio.gather(*(run(entries) for _, entries in pending))
+        async def run(entries: list[CanonEntry]) -> dict[str, CanonDecision]:
+            async with gate:
+                return await _resolve_block(resolve_client, entries, report, pacer)
 
-    # 落库在**所有**调用做完之后一次性做：`_persist` 要 commit，而 commit 会
-    # 把 `_scan_blocks` 那个流式游标连根拔掉 —— 那个游标此刻已经消费完了，
-    # 但一边并发调用一边 commit 还会让会话被多个任务同时碰，异步会话不是线程安全的。
-    flat = [d for result in results for d in result.values()]
-    decided, junk = await _persist(session, flat, client.model)
-    report.decided = decided
-    report.junk = junk
-    if on_progress is not None:
-        on_progress(decided)
+        results = await asyncio.gather(*(run(entries) for _, entries in pending))
+
+        # 落库在**所有**调用做完之后一次性做：`_persist` 要 commit，而 commit 会
+        # 把 `_scan_blocks` 那个流式游标连根拔掉 —— 那个游标此刻已经消费完了，
+        # 但一边并发调用一边 commit 还会让会话被多个任务同时碰，异步会话不是线程安全的。
+        flat = [d for result in results for d in result.values()]
+        decided, junk = await _persist(session, flat, resolve_client.model)
+        report.decided = decided
+        report.junk = junk
+        if on_progress is not None:
+            on_progress(decided)
+        # 阶段 1 刚裁决的键不能再送进阶段 2 ——「已就位」的判断只看 `done`。
+        done |= {d.key for d in flat}
+        packs = [[e for e in pack if e.key not in done] for pack in packs]
+        packs = [pack for pack in packs if pack]
+        report.singles_sent = sum(len(pack) for pack in packs)
+
+    if packs:
+        classify_client = client or OpenAICompatClient(
+            tool_schema=prompts.CLASSIFY_TOOL_SCHEMA, tool_name=prompts.CLASSIFY_TOOL_NAME
+        )
+
+        async def classify(pack: list[CanonEntry]) -> list[CanonDecision]:
+            async with gate:
+                return await _classify_pack(classify_client, pack, report, pacer)
+
+        packed = await asyncio.gather(*(classify(pack) for pack in packs))
+
+        typed = [d for result in packed for d in result]
+        classified, junk = await _persist(
+            session, typed, classify_client.model, CANON_CLASSIFY_PROMPT_VERSION
+        )
+        report.classified = classified
+        report.classify_junk = junk
+        if on_progress is not None:
+            on_progress(report.decided + classified)
+
     return report

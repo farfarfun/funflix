@@ -1,10 +1,19 @@
 """归一裁决的 prompt 与工具 schema。
 
-**改这里的任何内容都要升 `CANON_PROMPT_VERSION`**（在 `models/canon.py`）——
-`title_canon` 按 `norm_key` 缓存裁决，不升版本就没法区分"这条是旧 prompt 判的"。
+这里有**两套**，各管一种残局，共用 `title_canon` 这张表：
 
-和 `extract/llm/prompts.py` 是两套独立的东西，不要混：那一套回答"这段文案里
-有哪些作品和链接"，这一套回答"这一堆已经入库的脏标题里，哪些是同一部作品"。
+- 归一（`SYSTEM_PROMPT` / `TOOL_SCHEMA`）：回答"这一堆字面相似的脏标题里，
+  哪些是同一部作品"。只对 ≥2 个候选项的块有意义。改它要升
+  `CANON_PROMPT_VERSION`。
+- 分类（`CLASSIFY_SYSTEM_PROMPT` / `CLASSIFY_TOOL_SCHEMA`）：回答"这个孤立的
+  键是什么类型"。补的是单候选项块 —— 占全部块的 99.2%，归一那一套按设计
+  不碰它们。改它要升 `CANON_CLASSIFY_PROMPT_VERSION`。
+
+两个版本号分开是因为落库的行按 `prompt_version` 留痕：改了分类 prompt 不该
+让几千条归一裁决看起来像是旧版本判的，反之亦然。
+
+和 `extract/llm/prompts.py` 是另一回事，不要混：那一套回答"这段文案里有哪些
+作品和链接"，跑在数据入库之前；这里两套都跑在入库之后。
 """
 
 from __future__ import annotations
@@ -179,3 +188,135 @@ def format_entry(key: str, rows: int, resources: int, sample: str) -> str:
 
 def build_user_message(entries: list[str]) -> str:
     return USER_TEMPLATE.format(entries="\n".join(entries), tool=TOOL_NAME, count=len(entries))
+
+
+# ---------------------------------------------------------------------------
+# 分类裁决（单候选项块）
+# ---------------------------------------------------------------------------
+#
+# 上面那套回答"这一堆键里哪些是同一部作品"，需要块内有候选可比。可生产库
+# 185,285 个候选块里 183,814 个（99.2%）只有**一个**候选项 —— `resolver.py`
+# 的 `len(entries) < 2: continue` 把它们全跳过了，于是 64,668 个 `media_type`
+# 还是 unknown 的键里，64,519 个（99.8%）永远等不到裁决。规则那边也到顶了：
+# `guess_media_type` 对 4,000 行抽样 100% 返回 unknown，因为短剧标题
+# （`沉默不语的顾小姐`、`飞鸥不下`）压根不带类型信号。
+#
+# 这一套就是去补那 6.4 万行的，**但刻意不问 `work_title`**：孤立的键本来就
+# 没有可并的对象，给模型一个写标题的字段只会凭空制造误并的机会（它可能把
+# `大主宰` 和同一批里碰巧出现的 `天命大主宰` 写成同一个名字）。模型在这里
+# 没有表达归并的渠道，所以这条路**结构性地**不可能误并 —— 这比在 prompt 里
+# 叮嘱"不要并"可靠得多。身份仍由规则定，见 `lookup.py` 的
+# `work_title = canon.work_title or title`。
+
+CLASSIFY_TOOL_NAME = "submit_canon_types"
+
+CLASSIFY_SYSTEM_PROMPT = """\
+你是影视资源库的作品类型标注器。输入是一批**彼此无关**的标题键，\
+每一个都是库里一部独立的作品。你只做一件事：给每一个键标出它的类型。
+
+## 不要做的事
+
+- **不要归并**。这批键之间没有任何关系，字面相似也只是巧合 ——\
+`大主宰` 和 `天命大主宰` 是两部不同的作品。你也没有任何字段可以表达归并。
+- **不要改写标题**。作品名由规则层决定，不是这一步的职责。
+- `key` 必须**原样照抄**，不要清洗、不要补全。
+
+## 类型
+
+`media_type`：movie（电影）、tv（电视剧/短剧/网剧）、anime（动漫/国漫）、\
+variety（综艺）、documentary（纪录片）、book（小说/电子书）、comic（漫画）、\
+other（课程/软件/其它非影视）、unknown（判断不了）。
+
+**判断不了就填 unknown，不要猜。** 填 unknown 的键会留在原处等以后再判，\
+代价只是晚一点；猜错会把一部剧永久标成电影，而那要靠人工才能发现。
+
+这批键大量来自网盘分享频道，其中**中文竖屏短剧占很大比例** ——\
+`闪婚后发现老公是首富`、`沉默不语的顾小姐` 这类几十到上百集、每集几分钟的\
+作品，类型是 **tv**，不是 movie。片名像一句话、带强情绪钩子的，基本都是短剧。
+
+## 不是作品
+
+`is_junk` 为 true 的情况：网盘按钮文案（`夸克`、`查看资源`）、表格列名、\
+纯数字、提取码、分享 ID、整页抓取残渣（`描述大主宰导演马建平编剧…`、\
+`post via api service`）、网盘客户端安装包、频道公告与广告、\
+**频道的类目或合集标题**（`07月新番`、`最新电影合集`、`电子书打包` ——\
+它们不是某一部作品，而是一批作品的入口）。规则层已经拦掉了明显的，\
+留给你的是需要读懂语义才看得出来的。`is_junk=true` 时 `media_type` 填 unknown。
+
+## 输出要求
+
+1. **输入的每一个 key 都必须出现在输出里**，一个不能少，一个不能多。
+2. `key` 字段原样照抄输入里的 key。
+3. `confidence` 填 0-1，表示你对这条标注的确信程度。
+"""
+
+CLASSIFY_USER_TEMPLATE = """\
+## 待标注的标题键
+
+下面每一行是一个**独立作品**，彼此无关。格式：
+
+    <key>  （出现 N 行 / M 条资源）  示例原始标题：…
+
+{entries}
+
+请调用 {tool} 提交标注，输入的 {count} 个 key 每一个都要有一条对应的结果。\
+"""
+
+#: 和 `TOOL_SCHEMA` 的差别就是这一步的全部安全性所在：**没有 `work_title`、
+#: 没有 `season`**。
+#:
+#: 少 `work_title` 是为了堵死误并（见上面的说明）。少 `season` 是因为孤立的键
+#: 没有"整部作品的通名覆盖了好几季"这个判断依据 —— 季号由 `lookup.py` 的
+#: `extract_season(title)` 逐条判定更准，模型在这里填任何数字都是把一条分享的
+#: 季号钉到整个键上。
+CLASSIFY_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": CLASSIFY_TOOL_NAME,
+        "description": "提交每个标题键的作品类型标注",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "description": "每个输入 key 一条，不能少也不能多",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key": {
+                                "type": "string",
+                                "description": "原样照抄的输入 key",
+                            },
+                            "media_type": {"type": "string", "enum": _MEDIA_TYPES},
+                            #: 和 `TOOL_SCHEMA` 里的 `year` 同一个取舍：不进
+                            #: `required`、正文也不提，模型确信时顺手补一个。
+                            "year": {
+                                "type": ["integer", "null"],
+                                "description": "首播/上映年份，1900-2100，不确定填 null",
+                            },
+                            "is_junk": {
+                                "type": "boolean",
+                                "description": "这个键根本不是一部作品",
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                        },
+                        "required": ["key", "media_type", "is_junk", "confidence"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["decisions"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def build_classify_message(entries: list[str]) -> str:
+    return CLASSIFY_USER_TEMPLATE.format(
+        entries="\n".join(entries), tool=CLASSIFY_TOOL_NAME, count=len(entries)
+    )
