@@ -20,17 +20,28 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from farlog import getLogger
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from funflix.base.dbconflict import is_write_conflict, retry_on_write_conflict
 from funflix.models import Media, Tag, media_resource, media_tag
-from funflix.services.counters import refresh_work_counters
+from funflix.services.counters import lock_tags_in_order, refresh_work_counters
 from funflix.services.text.normalize import clean_title, looks_like_junk_title, series_norm_key
+
+logger = getLogger("funflix")
 
 #: 每批删多少行 media。远端 PG 一次往返 ~100ms，批太小会被往返吃掉；
 #: 批太大则单个事务持锁过久，中断时白做的工作也多。
 #: 500 是 `maintenance._chunks` 的默认值，沿用。
 CHUNK = 500
+
+#: 每批重算多少个标签的 `media_count`。比 `CHUNK` 小得多，因为这里每行的
+#: 代价极不均匀：相关子查询要给「夸克」数 45,888 行、给冷门标签数 3 行，
+#: 而全库总共才一千多个标签 —— 200 已经能分成好几批，把最热那几把行锁的
+#: 持有窗口压到一条语句之内。见 `_recount_tags`。
+TAG_RECOUNT_CHUNK = 200
 
 #: 留几条样例给人核对。只是展示用，不影响统计。
 SAMPLE_LIMIT = 40
@@ -47,6 +58,8 @@ class PurgeReport:
     links_detached: int = 0
     tags_detached: int = 0
     tags_recounted: int = 0
+    #: 撞车重试耗尽、`media_count` 暂时停在旧值的标签数。见 `_recount_tags`。
+    tags_recount_abandoned: int = 0
     #: 因为丢了季而被重算的 Work 数。`canon purge` 在 rebuild 之前跑时恒为 0
     #: （那时还没有 Work），重跑在 rebuild 之后才有值。
     works_recounted: int = 0
@@ -70,25 +83,59 @@ def is_junk_media_title(title: str | None) -> bool:
     return looks_like_junk_title(clean_title(title or ""))
 
 
-async def _recount_tags(session: AsyncSession, tag_ids: set[uuid.UUID]) -> int:
-    """按关联表重算指定标签的 `media_count`。
+async def _recount_tags(session: AsyncSession, tag_ids: set[uuid.UUID]) -> tuple[int, int]:
+    """按关联表重算指定标签的 `media_count`。返回 `(重算行数, 放弃行数)`。
 
     与 `services.counters` 同一个取舍：重算而非增减。这里只重算**受影响**的
     标签，不是全表 —— 垃圾行上的标签大多是 `夸克` 这类网盘名，集中在少数
     几个标签上，全表重算（`maintenance.recount_tags`）要把整个 media_tag 扫一遍。
+
+    **分批、按批提交、每批自己扛死锁**，三件事缺一不可，教训同
+    `maintenance._flush_relink_batch`：
+
+    原先是一条 UPDATE 把全部受影响标签一次写完。那条语句给每个标签跑一次
+    `count(*)` 相关子查询（光「夸克」就要数 45,888 行 media_tag），于是它
+    一路持着全库最热那几把行锁跑好几秒，而 CI 里 parse 八个分片正在同一批
+    行上写增量。实测结果是 run 37841925687 的 Merge 步撞上三方死锁、整个
+    canon job 退出 1 —— 连它后面那段 Work 计数重算（`delete_media_rows`
+    末尾的循环）都没跑到，库里留下一批计数失真的 Work。
+
+    放弃一批只是让这些标签的 `media_count` 暂时停在旧值（排序用的冗余列，
+    `maintenance.recount_tags` 能全表补回来），比让异常冒到命令层划算得多。
     """
     if not tag_ids:
-        return 0
+        return 0, 0
     actual = (
         select(func.count())
         .select_from(media_tag)
         .where(media_tag.c.tag_id == Tag.id)
         .scalar_subquery()
     )
-    result = await session.execute(
-        update(Tag).where(Tag.id.in_(tag_ids)).values(media_count=actual)
-    )
-    return result.rowcount or 0
+    recounted = 0
+    abandoned = 0
+    ordered = sorted(tag_ids)
+    for start in range(0, len(ordered), TAG_RECOUNT_CHUNK):
+        batch = ordered[start : start + TAG_RECOUNT_CHUNK]
+
+        async def _once(batch: list[uuid.UUID] = batch) -> int:
+            # SAVEPOINT 里做：死锁会把事务打进 aborted，不回滚的话后面每一批
+            # 都报「current transaction is aborted」，一次撞车废掉整轮。
+            async with session.begin_nested():
+                await lock_tags_in_order(session, batch)
+                result = await session.execute(
+                    update(Tag).where(Tag.id.in_(batch)).values(media_count=actual)
+                )
+            await session.commit()
+            return result.rowcount or 0
+
+        try:
+            recounted += await retry_on_write_conflict(_once, what=f"标签计数这批 {len(batch)} 行")
+        except DBAPIError as err:
+            if not is_write_conflict(err):
+                raise
+            logger.warning(f"标签计数这批 {len(batch)} 行撞车重试耗尽，放弃（留给全表重算）")
+            abandoned += len(batch)
+    return recounted, abandoned
 
 
 @dataclass(slots=True)
@@ -135,6 +182,8 @@ class DeleteStats:
     links_detached: int = 0
     tags_detached: int = 0
     tags_recounted: int = 0
+    #: 撞车重试耗尽、`media_count` 暂时停在旧值的标签数。见 `_recount_tags`。
+    tags_recount_abandoned: int = 0
     #: 因为丢了季而被重算的 Work 数。
     works_recounted: int = 0
 
@@ -174,8 +223,7 @@ async def delete_media_rows(
         if on_progress is not None:
             on_progress(stats.deleted)
 
-    stats.tags_recounted = await _recount_tags(session, affected_tags)
-    await session.commit()
+    stats.tags_recounted, stats.tags_recount_abandoned = await _recount_tags(session, affected_tags)
 
     works = sorted(affected_works)
     for start in range(0, len(works), CHUNK):
@@ -243,5 +291,6 @@ async def purge_junk_media(
     report.links_detached = stats.links_detached
     report.tags_detached = stats.tags_detached
     report.tags_recounted = stats.tags_recounted
+    report.tags_recount_abandoned = stats.tags_recount_abandoned
     report.works_recounted = stats.works_recounted
     return report

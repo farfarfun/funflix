@@ -21,6 +21,42 @@ from funflix.base.enums import CheckStatus
 from funflix.models import Media, Resource, Tag, Work, media_resource, media_tag
 
 
+async def lock_tags_in_order(
+    session: AsyncSession, tag_ids: Iterable[uuid.UUID]
+) -> list[uuid.UUID]:
+    """按 id 升序把这批 `tag` 行先锁上，返回排好序的 id。
+
+    `tag` 是全库最热的几张行：只有一千多个标签，而几乎每条文档都挂着
+    「夸克」「电视剧」。CI 里同时有三路在写它们的 `media_count` ——
+    parse 八个分片的增量 UPDATE（`extract/runner._apply_tag_count_deltas`）、
+    canon 删垃圾行后的重算（`canon/purge._recount_tags`）、以及这里的
+    孤儿清理。加锁顺序对不上就是死锁，实测过一次三方环：
+
+        Process 3551 waits for ShareLock on transaction 5162233; blocked by 3574.
+        Process 3574 ... blocked by 3608.
+        Process 3608 ... blocked by 3551.
+
+    那次牺牲的是 canon 的 Merge 步，整个 job 退出 1（run 37841925687）。
+
+    **光把 `IN` 列表排序是不够的** —— 那只是个集合字面量，Postgres 按执行
+    计划的扫描顺序访问行、不按列表顺序，于是一边走索引扫（id 序）、另一边
+    走位图堆扫（物理序）时顺序照样对不上。`ORDER BY id ... FOR UPDATE` 才
+    有保证：`LockRows` 节点挂在 `Sort` 之上，锁是按排序后的输出顺序取的。
+
+    代价是每批多一条走主键索引的语句，几毫秒。SQLite 的方言会把
+    `FOR UPDATE` 渲染成空串，本地测试走到这里相当于只做了排序。
+
+    Returns:
+        去掉 `None`、去重并升序排好的 tag id；空集合返回空列表（不发语句）。
+    """
+    ids = sorted({i for i in tag_ids if i is not None})
+    if ids:
+        await session.execute(
+            select(Tag.id).where(Tag.id.in_(ids)).order_by(Tag.id).with_for_update()
+        )
+    return ids
+
+
 async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[uuid.UUID]) -> int:
     """按关联表重算资源计数，并物理删除没有资源的作品。"""
     ids = {i for i in media_ids if i is not None}
@@ -59,8 +95,10 @@ async def refresh_media_counters(session: AsyncSession, media_ids: Iterable[uuid
                 .where(media_tag.c.tag_id == Tag.id)
                 .scalar_subquery()
             )
+            # 先按 id 升序锁上再改，理由见 `lock_tags_in_order`。
+            ordered = await lock_tags_in_order(session, affected_tag_ids)
             await session.execute(
-                update(Tag).where(Tag.id.in_(affected_tag_ids)).values(media_count=actual_count)
+                update(Tag).where(Tag.id.in_(ordered)).values(media_count=actual_count)
             )
 
     # 单条 CASE 表达式一次性把整批更新写完，而不是每个作品各发一次 UPDATE——

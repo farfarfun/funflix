@@ -18,6 +18,7 @@ import uuid
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 
 from funflix.base.enums import MediaType, Provider, Quality
@@ -32,6 +33,7 @@ from funflix.services.canon import (
     rebuild_works,
 )
 from funflix.services.canon import merge as merge_mod
+from funflix.services.canon import purge as purge_mod
 from funflix.services.canon import resolver as resolver_mod
 from funflix.services.canon.merge import absorb_attributes, pick_survivor
 from funflix.services.canon.purge import is_junk_media_title
@@ -49,6 +51,7 @@ from funflix.services.canon.resolver import (
     validate_decisions,
 )
 from funflix.services.counters import (
+    lock_tags_in_order,
     refresh_counters_for_media,
     refresh_media_counters,
     refresh_work_counters,
@@ -252,6 +255,55 @@ class TestPurgeKeepsResources:
         await session.refresh(work)
         assert (work.season_count, work.resource_count) == (0, 0)
         assert await session.get(Work, work_id) is not None, "空 Work 不删，只把计数刷成 0"
+
+    @pytest.mark.asyncio
+    async def test_tag_locking_is_ordered_and_locking(self) -> None:
+        """预加锁语句必须同时带 `ORDER BY id` 和 `FOR UPDATE`，少一半都挡不住死锁。
+
+        回归 run 37841925687：三路并发写 `tag.media_count` 撞出三方死锁，canon
+        的 Merge 步退出 1。原先 parse 那条路只把 `IN` 列表排了序 —— 不够，
+        列表顺序不决定 Postgres 的行访问顺序，顺序保证只能来自
+        `ORDER BY ... FOR UPDATE`（`LockRows` 挂在 `Sort` 之上）。
+        """
+        captured = []
+
+        class _Spy:
+            async def execute(self, stmt):
+                captured.append(stmt)
+
+        ids = [uuid.UUID(int=3), uuid.UUID(int=1), uuid.UUID(int=2)]
+        ordered = await lock_tags_in_order(_Spy(), [*ids, None, ids[0]])
+        assert ordered == sorted(ids), "要去掉 None、去重并升序"
+
+        sql = str(captured[0].compile(dialect=postgresql.dialect()))
+        assert "ORDER BY tag.id" in sql
+        assert "FOR UPDATE" in sql
+
+    @pytest.mark.asyncio
+    async def test_tag_recount_spans_chunks(self, session) -> None:
+        """受影响标签多于一批时每一批都要重算，别只算第一批。
+
+        分批本身是为了压住行锁窗口（见 `_recount_tags`），但分批写错的典型
+        后果是「只有前 200 个标签的计数是对的」，而这不会报任何错。
+        """
+        count = purge_mod.TAG_RECOUNT_CHUNK + 3
+        junk = _media("磁力下载")
+        tags = [
+            Tag(name=f"t{i}", norm_key=f"t{i}", kind=TagKind.OTHER, media_count=1)
+            for i in range(count)
+        ]
+        session.add_all([junk, *tags])
+        await session.flush()
+        await session.execute(
+            media_tag.insert(),
+            [{"media_id": junk.id, "tag_id": t.id, "created_at": utcnow()} for t in tags],
+        )
+        await session.commit()
+
+        report = await purge_junk_media(session, dry_run=False)
+        assert report.tags_recounted == count
+        assert report.tags_recount_abandoned == 0
+        assert await session.scalar(select(func.sum(Tag.media_count))) == 0
 
     @pytest.mark.asyncio
     async def test_limit_caps_deletions_but_not_the_count(self, session) -> None:

@@ -679,6 +679,7 @@ def canon_purge(
             ["断开资源关联", report.links_detached],
             ["断开标签关联", report.tags_detached],
             ["修正标签计数", report.tags_recounted],
+            ["标签计数撞车放弃", report.tags_recount_abandoned],
             ["重算 Work 计数", report.works_recounted],
         ],
         ["项", "数量"],

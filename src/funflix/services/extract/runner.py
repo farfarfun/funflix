@@ -40,7 +40,7 @@ from funflix.models.canon import TitleCanon
 from funflix.models.media import NO_SEASON, UNKNOWN_YEAR
 from funflix.models.raw import PARSE_RULES_VERSION
 from funflix.services.canon.lookup import CanonTarget, pending_row, resolve_target
-from funflix.services.counters import refresh_counters_for_media
+from funflix.services.counters import lock_tags_in_order, refresh_counters_for_media
 from funflix.services.extract.base import ExtractedItem, ExtractionOutcome, Extractor
 from funflix.services.text.linkscan import ScannedLink
 from funflix.services.text.normalize import series_norm_key, tag_norm_key
@@ -775,8 +775,13 @@ async def _apply_tag_count_deltas(session: AsyncSession, deltas: dict[uuid.UUID,
     if not deltas:
         return
     # 一条 CASE 把整批写完，理由同 `services/counters.py`：远端库往返很贵。
-    # id 排序是为了让并发进程取行锁的顺序尽量一致，少踩死锁。
+    #
+    # 先 `lock_tags_in_order` 按 id 升序把这批行锁上。原先这里只把 `IN` 列表
+    # 排了序、注释写的是「让顺序尽量一致」—— 那个「尽量」不成立：列表顺序
+    # 不决定 Postgres 的访问顺序，真正的保证要靠 `ORDER BY id FOR UPDATE`。
+    # 全库三路写 `tag.media_count` 的死锁实测见 `lock_tags_in_order`。
     ordered = sorted(deltas.items())
+    await lock_tags_in_order(session, [tag_id for tag_id, _ in ordered])
     await session.execute(
         update(Tag)
         .where(Tag.id.in_([tag_id for tag_id, _ in ordered]))
