@@ -120,8 +120,13 @@ jobs:
 
       # 单次运行处理量封顶，出问题（比如踩到某种脏数据死循环重试）
       # 影响范围有限，不会一次把所有待解析的都搭进去。
+      #
+      # 8000 这个数是量出来的：4 个分片各 5000 条实测约 52 分钟，照这个速率
+      # 8000 条约 83 分钟，离 120 分钟的 job 预算还剩一截余量。再往上（10000
+      # 条约 104 分钟）就太贴边了 —— 撞上 timeout 是整个 job 被 kill，这一轮
+      # 已经解析完的也白跑。
       - name: Parse
-        run: uv run $UV_SYNC_EXTRAS funflix parse --shard ${{ matrix.shard }}/4 --limit 5000
+        run: uv run $UV_SYNC_EXTRAS funflix parse --shard ${{ matrix.shard }}/4 --limit 8000
 
   verify:
     runs-on: ubuntu-latest
@@ -232,9 +237,16 @@ jobs:
 
       # 应用的是**之前每一轮**攒下来的裁决，不只是这一轮的，所以 resolve 挂了
       # （比如 LLM 网关抽风）它照样要跑完 —— job 整体仍然是红的，不会掩盖问题。
+      #
+      # `--limit` 是时间的闸门。这一步每个键一次 `assign_identities` + 一次
+      # commit，裁决表单调涨：run 37726067206 攒到 5417 条时整步约两小时，连着
+      # resolve 一起把 120 分钟的 job 预算吃光，被 `cancelled`，resolve 刚裁出来
+      # 的 492 条一条都没落库。额度只花在「真有活要干」的键上（已就位的整键跳
+      # 过，见 `services/canon/apply.py::_already_settled`），800 这个数留的是
+      # resolve 的上限涨到 800 之后的最坏情况 —— 一轮全是新裁决，约 20 分钟。
       - name: Merge
         if: ${{ !cancelled() }}
-        run: uv run $UV_SYNC_EXTRAS --extra llm funflix canon merge --apply --yes
+        run: uv run $UV_SYNC_EXTRAS --extra llm funflix canon merge --apply --yes --limit 800
 
   # 解析规则永远加不完，每加一条就留下一批「按旧规则算出来、现在看是错的」
   # media。这个 job 就是把那批数据慢慢刷对，所以它和上面几个完全并列、

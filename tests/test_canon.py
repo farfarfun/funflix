@@ -1506,3 +1506,184 @@ class TestCallPacer:
 
         assert report.calls == 3
         assert waits["n"] == 3
+
+
+class TestApplyIsIncremental:
+    """每轮重过全部裁决、但只干真有活的那些键。
+
+    `canon merge` 一直是全量的：`_load_decisions` 每轮把所有 `decided` 捞出来，
+    每个键一次 `assign_identities` 加一次 commit。`decided` 单调涨（resolve 每轮
+    再加几百条），5,417 条就要两个小时，正好吃光 Action 的 job 预算 ——
+    run 37726067206 的 canon 就是这么 `cancelled` 的，resolve 刚裁出来的 492 条
+    一条都没落库。
+
+    不能靠"应用完就标记成已应用"来省：parse 还在产新 media，新行的标题算出来的
+    键可能早就裁过了，标记掉就等于让它永远归不了位（`test_a_new_media_still_
+    follows_an_old_decision` 把这条锁住）。所以改成按**当下的归属**判断有没有
+    活干，见 `apply._already_settled`。
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_pass_skips_what_it_already_settled(self, session) -> None:
+        """同样的裁决跑第二遍：该一件事都不干，并且如实报成"已就位跳过"。"""
+        base, sequel = _media("大主宰"), _media("大主宰2")
+        resources = [_resource(i) for i in range(2)]
+        session.add_all([base, sequel, *resources])
+        await session.commit()
+        await _attach(session, [(base, [resources[0]]), (sequel, [resources[1]])])
+        await rebuild_works(session, dry_run=False)
+
+        session.add(_canon("大主宰2", work_title="大主宰", season=2))
+        await session.commit()
+
+        first = await apply_canon_decisions(session, dry_run=False)
+        assert first.media_rehomed == 1
+        assert first.settled == 0
+
+        second = await apply_canon_decisions(session, dry_run=False)
+        assert second.settled == 1, "第二遍没认出这个键已经落完了"
+        assert second.media_rehomed == 0
+        assert second.works_existing == 0, "跳过的键不该再去碰 Work"
+
+    @pytest.mark.asyncio
+    async def test_a_new_media_still_follows_an_old_decision(self, session) -> None:
+        """裁决应用过之后新进来的 media，还得按那条老裁决归位。
+
+        这是"应用完就标记成已应用"那条捷径会踩坏的东西，也是 `_already_settled`
+        必须看当下归属、不能看状态位的原因。
+        """
+        base, sequel = _media("大主宰"), _media("大主宰2")
+        resources = [_resource(i) for i in range(3)]
+        session.add_all([base, sequel, *resources])
+        await session.commit()
+        # 每行都得挂着资源 —— 收尾的 `refresh_media_counters` 会把零资源的行
+        # 物理删掉（那是它的契约），空壳行测不出"并到了第 2 季"
+        await _attach(session, [(base, [resources[0]]), (sequel, [resources[1]])])
+        await rebuild_works(session, dry_run=False)
+
+        session.add(_canon("大主宰2", work_title="大主宰", season=2))
+        await session.commit()
+        await apply_canon_decisions(session, dry_run=False)
+
+        work = await session.scalar(select(Work).where(Work.norm_key == "大主宰"))
+        # 这一轮之后又抽出来一行同键的 media（parse 还在往前跑）
+        fresh = _media("大主宰2", season=5)
+        session.add(fresh)
+        await session.commit()
+        await _attach(session, [(fresh, [resources[2]])])
+
+        report = await apply_canon_decisions(session, dry_run=False)
+        assert report.settled == 0, "新进的 media 把这个键重新变成有活干的了"
+        # 新行要落到的 `(work_id, 2)` 已经被上一轮那行占着，所以是并掉、不是搬走
+        assert report.media_merged == 1
+        rows = sorted(await session.scalars(select(Media.season).where(Media.work_id == work.id)))
+        assert rows == [NO_SEASON, 2], "新来的那行没被并到第 2 季"
+        await session.refresh(work)
+        assert work.resource_count == 3, "新来那条资源在合并里丢了"
+
+    @pytest.mark.asyncio
+    async def test_limit_caps_the_keys_that_have_work(self, session) -> None:
+        """`--limit` 切的是真有活的键，剩下的如实报成"本轮没排上"。"""
+        session.add_all(
+            [_media("大主宰"), _media("大主宰2"), _media("完美世界"), _media("完美世界2")]
+        )
+        await session.commit()
+        await rebuild_works(session, dry_run=False)
+
+        session.add_all(
+            [
+                _canon("大主宰2", work_title="大主宰", season=2),
+                _canon("完美世界2", work_title="完美世界", season=2),
+            ]
+        )
+        await session.commit()
+
+        report = await apply_canon_decisions(session, dry_run=False, limit=1)
+        assert report.media_rehomed == 1
+        assert report.deferred == 1, "被挡下的那个键没报出来，下一轮会不知道还有活"
+
+        rest = await apply_canon_decisions(session, dry_run=False, limit=1)
+        assert rest.media_rehomed == 1
+        assert rest.settled == 1, "上一轮做完的那个键这一轮该跳过"
+        assert rest.deferred == 0
+
+    @pytest.mark.asyncio
+    async def test_settled_keys_do_not_eat_the_limit(self, session) -> None:
+        """额度只花在有活的键上 —— 不然几千个已就位的键会把额度吃光，一轮白跑。"""
+        session.add_all(
+            [_media("大主宰"), _media("大主宰2"), _media("完美世界"), _media("完美世界2")]
+        )
+        await session.commit()
+        await rebuild_works(session, dry_run=False)
+
+        session.add(_canon("大主宰2", work_title="大主宰", season=2))
+        await session.commit()
+        await apply_canon_decisions(session, dry_run=False)
+
+        # 再加一条新裁决。额度是 1，而库里已经有一个落完的键了
+        session.add(_canon("完美世界2", work_title="完美世界", season=2))
+        await session.commit()
+
+        report = await apply_canon_decisions(session, dry_run=False, limit=1)
+        assert report.settled == 1
+        assert report.media_rehomed == 1, "额度被已就位的键吃掉了，新裁决一轮都没落上"
+        assert report.deferred == 0
+
+    @pytest.mark.asyncio
+    async def test_a_work_still_missing_info_is_not_skipped(self, session) -> None:
+        """归属对上了、但 Work 身上该补的信息还没补 —— 不能跳过。
+
+        `_ensure_work` 会在 Work 的 `media_type` / `year` 还是未知时拿裁决去补。
+        光看归属就跳过的话，这个补齐永远不会发生。
+        """
+        row = _media("大主宰2")
+        session.add(row)
+        await session.commit()
+        await rebuild_works(session, dry_run=False)
+
+        # 第一条裁决不带类型/年份，于是 Work 建出来是 unknown/0
+        session.add(_canon("大主宰2", work_title="大主宰2", media_type=MediaType.UNKNOWN))
+        await session.commit()
+        await apply_canon_decisions(session, dry_run=False)
+        work = await session.scalar(select(Work).where(Work.norm_key == "大主宰2"))
+        assert work.media_type is MediaType.UNKNOWN
+
+        # 补一条带类型和年份的裁决，归属没变但 Work 还缺信息
+        canon = await session.get(TitleCanon, "大主宰2")
+        canon.media_type = MediaType.ANIME
+        canon.year = 2023
+        await session.commit()
+
+        report = await apply_canon_decisions(session, dry_run=False)
+        assert report.settled == 0, "Work 还缺信息，不该被当成已就位"
+        await session.refresh(work)
+        assert work.media_type is MediaType.ANIME
+        assert work.year == 2023
+
+    @pytest.mark.asyncio
+    async def test_a_row_sitting_in_the_wrong_season_is_not_skipped(self, session) -> None:
+        """归属已经对了、但季号还没覆盖 —— 不能跳过。
+
+        裁决锁定季号时，它一半的工作就是覆盖季号（报告里的 `seasons_overridden`）。
+        只看 `work_id` 的话，一行早就挂在目标作品下、季号却还是规则判出来的旧值，
+        会被当成已就位，那条裁决就永远落不下去了。
+        """
+        # Work 的类型和年份都齐了，把 `_already_settled` 的其余几个条件排除掉，
+        # 单独隔出"季号对不对"这一条
+        work = Work(title="大主宰", norm_key="大主宰", media_type=MediaType.ANIME, year=2023)
+        session.add(work)
+        await session.commit()
+
+        row, resource = _media("大主宰2", work=work, season=NO_SEASON), _resource(0)
+        session.add_all([row, resource])
+        await session.commit()
+        await _attach(session, [(row, [resource])])
+
+        session.add(_canon("大主宰2", work_title="大主宰", season=2, year=2023))
+        await session.commit()
+
+        report = await apply_canon_decisions(session, dry_run=False)
+        assert report.settled == 0, "季号还没覆盖，不该被当成已就位"
+        assert report.seasons_overridden == 1
+        await session.refresh(row)
+        assert row.season == 2

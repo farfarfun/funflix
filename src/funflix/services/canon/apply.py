@@ -72,12 +72,23 @@ class ApplyReport:
     #: 为了解开换位冲突而临时挪动的次数，见 `canon/assign.py`。
     parked: int = 0
     works_recounted: int = 0
+    #: 上一轮已经落完、这一轮没新活，整键跳过的数量。见 `_already_settled`。
+    settled: int = 0
+    #: 真有活要干、但被这一轮的 `limit` 挡在外面的键数，下一轮接着做。
+    deferred: int = 0
     dry_run: bool = True
     samples: list[str] = field(default_factory=list)
 
 
 async def _load_decisions(session: AsyncSession, key: str | None) -> list[TitleCanon]:
-    """捞出已裁决、未应用的行。
+    """捞出全部已裁决的行。
+
+    **每一轮都得重新捞全部** —— 裁决不能在应用后标记成"已应用"。parse 还在
+    源源不断产出新 media，新行的标题算出来的键可能早就裁过了，那它得按那条老
+    裁决归位。标记掉就等于让后来的 media 永远归不了位。
+
+    代价是这张表单调增长、每轮的候选集越来越大，由 `_already_settled` 把"上一
+    轮已经落完、这一轮没新活"的键筛掉来兜，见那个函数的说明。
 
     `key` 按 `title_canon.norm_key` 过滤 —— 这一列**在库里**（不像
     `series_norm_key` 是纯函数），所以能下推到 SQL。
@@ -85,31 +96,99 @@ async def _load_decisions(session: AsyncSession, key: str | None) -> list[TitleC
     query = select(TitleCanon).where(TitleCanon.status == CanonState.DECIDED)
     if key is not None:
         query = query.where(TitleCanon.norm_key == key)
+    # 定序是为了 `limit` 能切得稳：先裁的先应用，一轮没排上的下一轮还排在前面，
+    # 不会出现某些键永远轮不到。`decided_at` 老数据可能是 NULL，排在最前面。
+    query = query.order_by(TitleCanon.decided_at.nulls_first(), TitleCanon.norm_key)
     return list(await session.scalars(query))
 
 
-async def _media_ids_for_keys(session: AsyncSession, keys: set[str]) -> dict[str, list[uuid.UUID]]:
-    """按 `series_norm_key` 找出对应的 media 行。
+@dataclass(slots=True)
+class _MediaRow:
+    """一行 media 的身份快照，`_already_settled` 靠它判断这一轮有没有活要干。"""
+
+    media_id: uuid.UUID
+    work_id: uuid.UUID | None
+    season: int
+
+
+async def _media_rows_for_keys(session: AsyncSession, keys: set[str]) -> dict[str, list[_MediaRow]]:
+    """按 `series_norm_key` 找出对应的 media 行，连当下的归属一起带出来。
 
     **只能在 Python 侧匹配** —— `series_norm_key` 是纯函数，库里没有这一列。
-    所以这里扫一遍 media 的 (id, title)，算键再归组。按主键翻页，不走
-    `stream()`：调用方后面要边并边提交，游标会被 commit 掉。
+    所以这里扫一遍 media，算键再归组。按主键翻页，不走 `stream()`：调用方后面
+    要边并边提交，游标会被 commit 掉。
+
+    顺手多取 `work_id` / `season` 是为了 `_already_settled` —— 这一趟全表扫反正
+    躲不掉（生产库 170 万行，实测约 1 分钟），把判断"要不要动"所需的列一起捞
+    回来，就省掉了后面每个键各自一次查询。
     """
-    found: dict[str, list[uuid.UUID]] = {k: [] for k in keys}
+    found: dict[str, list[_MediaRow]] = {k: [] for k in keys}
     cursor: uuid.UUID | None = None
     while True:
-        query = select(Media.id, Media.title).order_by(Media.id).limit(CHUNK)
+        query = (
+            select(Media.id, Media.title, Media.work_id, Media.season)
+            .order_by(Media.id)
+            .limit(CHUNK)
+        )
         if cursor is not None:
             query = query.where(Media.id > cursor)
         page = (await session.execute(query)).all()
         if not page:
             break
         cursor = page[-1][0]
-        for media_id, title in page:
+        for media_id, title, work_id, season in page:
             bucket = found.get(series_norm_key(title or ""))
             if bucket is not None:
-                bucket.append(media_id)
+                bucket.append(_MediaRow(media_id=media_id, work_id=work_id, season=season))
     return found
+
+
+def _work_key_of(decision: TitleCanon) -> str:
+    """裁决指向的作品归一键。跟 `_ensure_work` 用的是同一个算法，别让它们分叉。"""
+    return decision.work_norm_key or series_norm_key(decision.work_title or "")
+
+
+async def _existing_works(session: AsyncSession, work_keys: set[str]) -> dict[str, Work]:
+    """批量捞出这些归一键已经存在的 Work。分片查，不堆一个几千项的 IN。"""
+    keys = sorted(work_keys)
+    found: dict[str, Work] = {}
+    for start in range(0, len(keys), CHUNK):
+        rows = await session.scalars(
+            select(Work).where(Work.norm_key.in_(keys[start : start + CHUNK]))
+        )
+        found.update({w.norm_key: w for w in rows})
+    return found
+
+
+def _already_settled(decision: TitleCanon, rows: list[_MediaRow], work: Work | None) -> bool:
+    """这个键上一轮已经落完了、这一轮没有新活 —— 可以整键跳过。
+
+    为什么非要这个判断：`_load_decisions` 每轮都得把全部 `decided` 重新过一遍
+    （理由见那边），可那张表是单调涨的 —— resolve 每轮再加几百条。每个键一次
+    `assign_identities` 加一次 commit，5,417 条就要两个小时，正好把 Action 的
+    job 预算吃光：run 37726067206 的 canon 就是这么 `cancelled` 的，resolve 裁
+    出来的 492 条裁决一条都没落库。
+
+    筛掉之后成本从"裁决条数"变成"真有活要干的键数"，而后者只随新进的 media 走。
+
+    判定靠 `uq_media_season (work_id, season)`：已经挂在目标作品下的那些行，季号
+    必然互不相同，所以不存在"都就位了但还得并一下"的情况，只看归属就够。
+    """
+    if work is None:
+        # 目标 Work 还没建出来，这一键必须走 `_ensure_work`
+        return False
+    if work.media_type is MediaType.UNKNOWN and decision.media_type is not MediaType.UNKNOWN:
+        # Work 身上还缺的信息要靠这条裁决补齐，见 `_ensure_work`
+        return False
+    if work.year == UNKNOWN_YEAR and decision.year != UNKNOWN_YEAR:
+        return False
+    if any(row.work_id != work.id for row in rows):
+        return False
+    # 裁决锁了季号：整组该并成一行落在那一季。没锁就只换作品，季号各自不动，
+    # 归属对上就算落完了。
+    if decision.season is not None:
+        return all(row.season == decision.season for row in rows)
+    return True
 
 
 async def _ensure_work(
@@ -200,6 +279,7 @@ async def apply_canon_decisions(
     *,
     dry_run: bool = True,
     key: str | None = None,
+    limit: int | None = None,
     on_progress: Callable[[int], None] | None = None,
 ) -> ApplyReport:
     """把 `title_canon` 里 `status=decided` 的裁决落到库上。
@@ -207,6 +287,10 @@ async def apply_canon_decisions(
     Args:
         dry_run: 只统计，不写库。**默认开**。
         key: 只应用 `title_canon.norm_key` 等于它的那一条。
+        limit: 这一轮最多处理多少个**真有活要干**的键；None 表示不限。
+            额度花在筛完之后的那批上（见 `_already_settled`），不是花在
+            `decided` 的总条数上 —— 否则额度会被几千个"已经落完"的键吃掉，
+            一轮下来一件事都没干。
         on_progress: 每处理完一个键调一次，入参是累计重挂的 media 行数。
 
     按键提交，可中断续跑。
@@ -218,17 +302,25 @@ async def apply_canon_decisions(
         return report
 
     by_key = {d.norm_key: d for d in decisions}
-    members = await _media_ids_for_keys(session, set(by_key))
+    members = await _media_rows_for_keys(session, set(by_key))
+    works = await _existing_works(session, {_work_key_of(d) for d in decisions})
 
     junk_victims: list[uuid.UUID] = []
     live: list[tuple[TitleCanon, list[uuid.UUID]]] = []
     for canon_key, decision in by_key.items():
-        ids = members.get(canon_key) or []
+        rows = members.get(canon_key) or []
         if decision.is_junk:
             report.junk_keys += 1
-            junk_victims.extend(ids)
-        elif ids:
-            live.append((decision, ids))
+            junk_victims.extend(row.media_id for row in rows)
+        elif rows:
+            if _already_settled(decision, rows, works.get(_work_key_of(decision))):
+                report.settled += 1
+                continue
+            live.append((decision, [row.media_id for row in rows]))
+
+    if limit is not None and len(live) > limit:
+        report.deferred = len(live) - limit
+        live = live[:limit]
 
     for decision, ids in live[:SAMPLE_LIMIT]:
         season = "不动" if decision.season is None else str(decision.season)

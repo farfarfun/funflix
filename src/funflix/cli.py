@@ -788,6 +788,10 @@ def canon_merge(
         str | None,
         typer.Option("--key", help="只应用这一条裁决（title_canon.norm_key）"),
     ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="这一轮最多应用多少个真有活要干的键，用于分轮磨完积压"),
+    ] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
 ) -> None:
     """把 `title_canon` 里已裁决的结果落到 media / work 上。
@@ -796,6 +800,10 @@ def canon_merge(
     其余键把 media 重挂到裁决出的 Work 上；裁决给了具体季号的覆盖季号，
     给 null 的**不动**规则逐行判出的季号 —— null 的意思是"这个键没锁定某一季"，
     不是"第 0 季"。
+
+    每一轮都会把全部已裁决的键过一遍（新进的 media 得按老裁决归位），但其中
+    「上一轮已经落完、这一轮没新活」的会被整键跳过，报告里的**已就位跳过**就是
+    这个数。`--limit` 的额度只花在筛完剩下的那批上。
     """
     from funflix.base.db import session_scope
     from funflix.services.canon import apply_canon_decisions
@@ -805,12 +813,14 @@ def canon_merge(
 
     async def _do():
         async with session_scope() as session:
-            return await apply_canon_decisions(session, dry_run=not apply, key=key)
+            return await apply_canon_decisions(session, dry_run=not apply, key=key, limit=limit)
 
     report = _run(_do)
     _table(
         [
             ["已裁决条数", report.decisions],
+            ["已就位跳过", report.settled],
+            ["本轮没排上", report.deferred],
             ["判为垃圾的键", report.junk_keys],
             ["删除 media", report.junk_media_deleted],
             ["断开资源关联", report.links_detached],
