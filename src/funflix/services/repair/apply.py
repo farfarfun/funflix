@@ -195,6 +195,11 @@ async def _apply_deletes(
     await session.commit()
 
 
+#: 一批 retitle 失败后要退回去的计数。比 `_BATCH_COUNTERS` 短：这条路只刷
+#: 标题，不动身份，碰不到作品和链接那几个数。
+_RETITLE_COUNTERS = ("skipped", "retitled")
+
+
 async def _apply_retitles(
     session: AsyncSession, tasks: list[RepairTask], report: ApplyReport
 ) -> None:
@@ -202,51 +207,102 @@ async def _apply_retitles(
 
     `norm_key` 跟着刷：它是逐标题身份键（不是作品键），标题变了它就该变。
     作品键在 rehome 那条路上，这里不碰。
+
+    每批**单独扛并发写入冲突**，理由同 `_apply_rehomes`：这些 media 行并行的
+    parse 分片和 canon job 同时也在改，加锁顺序对不上 Postgres 就判死锁。
+    run 37734962378 的 repair 就是这么红的 —— 第一批刚开始刷就吃到
+    `deadlock detected`，整步退出 1，这一轮领到的 5000 条一条没落库。
+    rehome 路早就按批重试了，这条路当时漏了。
     """
+    # 只留主键往下传，ORM 对象由每批自己重新加载 —— 失败批次的回滚会让
+    # **整个会话**里的任务行过期（见 `_load_tasks`）。
+    ids = [task.id for task in tasks]
+    for start in range(0, len(ids), CHUNK):
+        batch_ids = ids[start : start + CHUNK]
+        if not await _retitle_batch_with_retry(session, batch_ids, report):
+            report.failed += len(batch_ids)
+
+
+async def _retitle_batch(
+    session: AsyncSession, batch: list[RepairTask], report: ApplyReport
+) -> None:
+    """刷一批的标题 / 类型 / 年份。一批一个事务，要么整批落库要么整批不动。"""
     now = utcnow()
-    for start in range(0, len(tasks), CHUNK):
-        batch = tasks[start : start + CHUNK]
-        found = select(Media.id, Media.title, Media.media_type, Media.year).where(
-            Media.id.in_([t.media_id for t in batch])
-        )
-        rows: dict[uuid.UUID, tuple[str, MediaType, int]] = {
-            row[0]: (row[1], row[2], row[3]) for row in (await session.execute(found)).all()
-        }
-        for task in batch:
-            current = rows.get(task.media_id)
-            if current is None:
-                task.status = RepairState.SKIPPED
-                task.applied_at = now
-                report.skipped += 1
-                continue
-            cur_title, cur_type, cur_year = current
-            # payload 是 JSON，取出来的都是 Any —— 缺字段就沿用当前值，
-            # 而不是让 `MediaType(None)` 在这里炸掉。
-            title = str(task.payload.get("title") or cur_title)
-            raw_type = task.payload.get("media_type")
-            media_type = MediaType(str(raw_type)) if raw_type else cur_type
-            raw_year = task.payload.get("year")
-            year = int(raw_year) if isinstance(raw_year, int) else cur_year
-            if (title, media_type, year) == current:
-                # scan 之后 parse 顺手改对了。
-                task.status = RepairState.SKIPPED
-                task.applied_at = now
-                report.skipped += 1
-                continue
-            await session.execute(
-                update(Media)
-                .where(Media.id == task.media_id)
-                .values(
-                    title=title[:500],
-                    norm_key=per_title_key(title)[:500],
-                    media_type=media_type,
-                    year=year,
-                )
-            )
-            task.status = RepairState.APPLIED
+    found = select(Media.id, Media.title, Media.media_type, Media.year).where(
+        Media.id.in_([t.media_id for t in batch])
+    )
+    rows: dict[uuid.UUID, tuple[str, MediaType, int]] = {
+        row[0]: (row[1], row[2], row[3]) for row in (await session.execute(found)).all()
+    }
+    for task in batch:
+        current = rows.get(task.media_id)
+        if current is None:
+            task.status = RepairState.SKIPPED
             task.applied_at = now
-            report.retitled += 1
-        await session.commit()
+            report.skipped += 1
+            continue
+        cur_title, cur_type, cur_year = current
+        # payload 是 JSON，取出来的都是 Any —— 缺字段就沿用当前值，
+        # 而不是让 `MediaType(None)` 在这里炸掉。
+        title = str(task.payload.get("title") or cur_title)
+        raw_type = task.payload.get("media_type")
+        media_type = MediaType(str(raw_type)) if raw_type else cur_type
+        raw_year = task.payload.get("year")
+        year = int(raw_year) if isinstance(raw_year, int) else cur_year
+        if (title, media_type, year) == current:
+            # scan 之后 parse 顺手改对了。
+            task.status = RepairState.SKIPPED
+            task.applied_at = now
+            report.skipped += 1
+            continue
+        await session.execute(
+            update(Media)
+            .where(Media.id == task.media_id)
+            .values(
+                title=title[:500],
+                norm_key=per_title_key(title)[:500],
+                media_type=media_type,
+                year=year,
+            )
+        )
+        task.status = RepairState.APPLIED
+        task.applied_at = now
+        report.retitled += 1
+    await session.commit()
+
+
+async def _retitle_batch_with_retry(
+    session: AsyncSession, ids: list[uuid.UUID], report: ApplyReport
+) -> bool:
+    """刷一批，撞上并发写入冲突就退避重跑。`False` 表示这批没刷成。
+
+    跟 `_rehome_batch_with_retry` 同构，恢复动作也只能在捕获到冲突之后做，
+    所以一样没套 `retry_on_write_conflict`（理由见那个函数）。
+    """
+    before = {name: getattr(report, name) for name in _RETITLE_COUNTERS}
+    what = f"这批 {len(ids)} 个改标题任务"
+    for attempt in range(WRITE_CONFLICT_ATTEMPTS):
+        batch = await _load_tasks(session, ids)
+        if not batch:
+            return True
+        try:
+            await _retitle_batch(session, batch, report)
+            return True
+        except Exception as err:
+            if not is_write_conflict(err):
+                raise
+            await session.rollback()
+            for name, value in before.items():
+                setattr(report, name, value)
+            if attempt == WRITE_CONFLICT_ATTEMPTS - 1:
+                logger.warning(
+                    f"{what}连续撞车 {WRITE_CONFLICT_ATTEMPTS} 次，留在 pending 待下一轮"
+                )
+                return False
+            delay = WRITE_CONFLICT_BACKOFF * (attempt + 1)
+            logger.warning(f"{what}落库撞车（第 {attempt + 1} 次），{delay:.1f}s 后重试")
+            await asyncio.sleep(delay)
+    return False  # pragma: no cover
 
 
 @dataclass(frozen=True, slots=True)

@@ -162,6 +162,28 @@ async def _pending_rehomes(session, titles: list[str]) -> None:
     await session.commit()
 
 
+async def _pending_retitles(session, titles: list[str]) -> None:
+    """每个干净标题配一行顶着**脏标题**的 media，外加一个 pending retitle。
+
+    `detected_at` 按顺序错开：`_claim` 就按它排序（见那个函数），
+    依赖批次顺序的测试不能让三条任务挤在同一个时刻上。
+    """
+    base = utcnow()
+    for index, title in enumerate(titles):
+        media = await _media_row(session, f"{title} 作者:某人", media_type=MediaType.MOVIE)
+        session.add(
+            RepairTask(
+                kind=RepairKind.RETITLE,
+                symptom=RepairSymptom.TITLE_DRIFT,
+                media_id=media.id,
+                payload={"title": title},
+                status=RepairState.PENDING,
+                detected_at=base + timedelta(seconds=index),
+            )
+        )
+    await session.commit()
+
+
 class TestPlanNoOp:
     """规则没变 → 一个任务都不建。这是整套机制能天天跑的前提。"""
 
@@ -1088,3 +1110,103 @@ class TestRequeue:
             )
             == 3
         )
+
+
+class TestRetitleSurvivesDeadlocks:
+    """刷标题这一步撞死锁，也只能牺牲一批，不能带走整个命令。
+
+    跟 `TestRehomeSurvivesDeadlocks` 同一个根因（并行 job 改同一批 media
+    行、加锁顺序对不上），但 rehome 路早就按批重试了、这条路当时漏了：run
+    37734962378 的 repair 第一批刚开始刷就吃到 `deadlock detected`，`repair
+    apply` 整步退出 1，这一轮领到的 5000 条一条没落库。
+    """
+
+    def _deadlock(self) -> DBAPIError:
+        orig = Exception("deadlock detected")
+        orig.sqlstate = "40P01"  # type: ignore[attr-defined]
+        return DBAPIError("UPDATE media ...", {}, orig)
+
+    @pytest.mark.asyncio
+    async def test_transient_deadlock_is_retried_and_the_batch_lands(
+        self, session, monkeypatch
+    ) -> None:
+        """冲突是瞬时的（对面已经提交完了），重跑一次就该过。"""
+        await _pending_retitles(session, ["流浪地球"])
+
+        real = apply_mod._retitle_batch
+        calls = {"n": 0}
+
+        async def flaky(*args, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise self._deadlock()
+            return await real(*args, **kw)
+
+        monkeypatch.setattr(apply_mod, "_retitle_batch", flaky)
+        monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+        assert calls["n"] == 2
+        assert (report.retitled, report.failed) == (1, 0)
+        titles = set(await session.scalars(select(Media.title)))
+        assert titles == {"流浪地球"}
+
+    @pytest.mark.asyncio
+    async def test_one_deadlocked_batch_does_not_take_down_the_others(
+        self, session, monkeypatch
+    ) -> None:
+        """重试耗尽的那一批留在 pending，后面的批次照常落库。"""
+        wanted = ["流浪地球", "疯狂的外星人", "我不是药神"]
+        await _pending_retitles(session, wanted)
+        monkeypatch.setattr(apply_mod, "CHUNK", 1)
+        monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
+
+        real = apply_mod._retitle_batch
+
+        async def flaky(session_, batch, report):
+            # `CHUNK=1`，按 `detected_at` 排序第一批就是「流浪地球」那条
+            if batch[0].payload["title"] == "流浪地球":
+                raise self._deadlock()
+            return await real(session_, batch, report)
+
+        monkeypatch.setattr(apply_mod, "_retitle_batch", flaky)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+        assert (report.retitled, report.failed) == (2, 1)
+        pending = list(
+            await session.scalars(
+                select(RepairTask).where(RepairTask.status == RepairState.PENDING)
+            )
+        )
+        assert [t.payload["title"] for t in pending] == ["流浪地球"]
+        landed = set(await session.scalars(select(Media.title)))
+        assert "疯狂的外星人" in landed and "我不是药神" in landed
+        assert "流浪地球 作者:某人" in landed, "没刷成的那行标题要原样留着"
+
+    @pytest.mark.asyncio
+    async def test_counters_are_not_double_counted_across_retries(
+        self, session, monkeypatch
+    ) -> None:
+        """重跑前计数要退回批次开始的值 —— 不退就把失败那次的改动算两遍。"""
+        await _pending_retitles(session, ["流浪地球", "疯狂的外星人"])
+        monkeypatch.setattr(apply_mod, "WRITE_CONFLICT_BACKOFF", 0)
+
+        real = apply_mod._retitle_batch
+        calls = {"n": 0}
+
+        async def flaky(session_, batch, report):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # 死锁是在 commit **之前**抛的：计数已经在内存里加上了，
+                # 对应的改动却随事务一起回滚。不能真去跑 `real` 再抛 ——
+                # 那样标题已经落库，重跑时会被判成「parse 顺手改对了」而跳过。
+                report.retitled += len(batch)
+                raise self._deadlock()
+            return await real(session_, batch, report)
+
+        monkeypatch.setattr(apply_mod, "_retitle_batch", flaky)
+
+        report = await apply_repairs(session, dry_run=False, force=True)
+        assert calls["n"] == 2
+        assert report.retitled == 2, "两条就是两条，不能因为重跑算成四条"
+        assert report.failed == 0
