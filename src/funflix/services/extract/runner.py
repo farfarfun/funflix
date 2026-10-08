@@ -695,6 +695,12 @@ async def _apply_tag_count_deltas(session: AsyncSession, deltas: dict[uuid.UUID,
     `Lock: transactionid` 等待，最长 57 秒。改成收尾时一条语句之后，行锁只从
     这条语句握到提交，窗口是毫秒级。
 
+    **上面那个「8 片比单进程还慢」只是改之前的事实，别再拿它当现行结论。**
+    2026-10-08 在 4 片 + 本机一个进程同时写库时采了三次 `pg_stat_activity`：
+    `pg_blocking_pids` 全是空的，一个等锁的后端都没有，几乎每个后端都停在
+    `Client:ClientRead`（库在等客户端发下一条语句）。两处计数都改完之后锁竞争
+    已经不是瓶颈了，CI 的片数也因此从 4 提到了 8（见 `.github/workflows/collect.yml`）。
+
     调用方必须保证**只有真的提交成功的 chunk 才把增量合并进来**——增量不幂等，
     回滚重试的 chunk 要是也算一份，计数就会偏高。（`all_touched` 没这个要求，
     因为 `refresh_counters_for_media` 是重算。）

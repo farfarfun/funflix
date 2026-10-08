@@ -74,17 +74,29 @@ jobs:
       - name: Collect
         run: uv run $UV_SYNC_EXTRAS funflix collect --limit 10000
 
-  # 分 4 片并行。落库全程只有一个消费者线程，所以单进程调大 `--concurrency`
+  # 分 8 片并行。落库全程只有一个消费者线程，所以单进程调大 `--concurrency`
   # 不会提速 —— 瓶颈是每条文档那两次数据库往返，不是抽取的 CPU。要提吞吐只能
   # 多开进程，而多开进程必须分片，否则各进程的翻页游标从同一处起步、
   # 把同一批文档重复解析一遍。各片按 `id` 末位十六进制字符取模，互斥且均匀
   # （见 `services/extract/concurrent_runner.py::shard_condition`）。
   #
-  # **为什么是 4 片 × 5000 条**：单片 5000 条在最坏情况下也远远跑不到
-  # 120 分钟的 timeout —— 节点被 timeout 掐掉本身是安全的（分片不写库，
-  # 掐掉只是让剩下的文档留在 pending），但每轮都红会把真实故障埋掉。
-  # 一轮 2 万条、一天 12 轮，这就是「少量多次」该有的量级；要加速改 `--limit`
-  # 比改片数安全，片数越多越容易在热行上互相等锁。
+  # **为什么从 4 片提到 8 片**：这里原来写的是「片数越多越容易在热行上互相
+  # 等锁」，依据是早先 8 片实测 2.6 条/s、比单进程的 4.6 条/s 还慢。那个结论
+  # 现在**已经不成立**了 —— 它的成因是标签和资源的计数自增在热行上握锁握到
+  # 外层事务提交，两处都改成了收尾时一条算术 UPDATE（见
+  # `services/extract/runner.py` 的 `_apply_tag_count_deltas` /
+  # `_apply_resource_seen_deltas`）。2026-10-08 在 4 片 + 本机一个进程同时写库
+  # 的时候采了三次 `pg_stat_activity`：`pg_blocking_pids` **全是空的**，没有
+  # 任何一个后端在等锁，而几乎每个后端都停在 `Client:ClientRead` ——
+  # 数据库在等客户端发下一条语句，服务端是闲的。
+  #
+  # 也就是说瓶颈纯粹是往返延迟：40 条文档只发 60 次 SQL（1.5 次/条，批量已经
+  # 没什么可省的），但每次往返 515ms。服务端既没在算也没在等锁，那加并发就是
+  # 线性的，4 片 → 8 片应该直接把 178 万份的积压清理时间减半。
+  #
+  # 闸门是时间而不是条数（见下面 Parse 那一步），所以加片数不会让单片跑过
+  # 120 分钟的 timeout。节点被 timeout 掐掉本身是安全的（分片不写库，掐掉
+  # 只是让剩下的文档留在 pending），但每轮都红会把真实故障埋掉。
   parse:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -92,7 +104,7 @@ jobs:
       # 一片挂了不影响其它片 —— 每片是独立的一批文档，没有共享产出。
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     concurrency:
       # 组名必须带上片号。不带的话四片会被 GitHub 当成同一组，
       # 互相排队（改 `cancel-in-progress: false` 之前是互相取消），
@@ -131,10 +143,16 @@ jobs:
       # 6600 秒 = 110 分钟，留 10 分钟给 setup 和收尾。到点收工是安全的：
       # 落库按 `--write-batch` 逐批提交，已经解析完的不会回滚，没排到的下一轮
       # 接着领（见 `services/extract/concurrent_runner.py::_ParseProducer.produce`）。
+      #
+      # 这个 110 分钟**以前是假的**：流水线的两条队列不限长，生产者按 extract
+      # 的速度把几十万条灌进内存，到点后它停了但程序要等队列排空才返回，于是
+      # run 37757448206 的四片全被 `timeout-minutes: 120` 砍掉，一个优雅退出的
+      # 都没有。队列限界之后收尾只要几十秒，这个数字才真正生效（见
+      # `concurrent_runner.py::run_parse_pipeline` 的「两条队列都是限界的」）。
       - name: Parse
         run: >
           uv run $UV_SYNC_EXTRAS funflix parse
-          --shard ${{ matrix.shard }}/4 --max-seconds 6600
+          --shard ${{ matrix.shard }}/8 --max-seconds 6600
 
   verify:
     runs-on: ubuntu-latest
