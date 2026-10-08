@@ -296,13 +296,37 @@ class BlockingRateLimiter:
                 time.sleep(interval - elapsed)
             self._last[provider] = time.monotonic()
 
+    def wait_time(self, provider: Provider) -> float:
+        """该网盘还要等多久才能发下一次请求，0 表示现在就能发。
+
+        给**严格轮转**的生产端用（见
+        `services/verify/concurrent_runner.py::_VerifyProducer.produce`）：轮到哪个
+        网盘就等哪个，但下脚之前得先知道要等多久 —— 不然没法跟 `max_seconds` 的
+        剩余预算比，一脚踩进 `acquire` 就可能把 job 睡过 GitHub Action 的硬超时，
+        连已经探完的结论都看不出跑没跑完。
+
+        只是查看，**不**消费令牌：返回 0 之后还得自己去 `try_acquire`。
+
+        Args:
+            provider: 要查的网盘类型。
+
+        Returns:
+            还需等待的秒数；0 表示令牌已就绪，或该网盘显式不限流。
+        """
+        interval = self._interval_for(provider)
+        if interval <= 0:
+            return 0.0
+        with self._lock_for(provider):
+            return max(0.0, interval - (time.monotonic() - self._last.get(provider, 0.0)))
+
     def try_acquire(self, provider: Provider) -> bool:
         """`acquire` 的非阻塞版：令牌就绪就消费掉并返回 True，否则立刻返回 False。
 
         给**按网盘拆队列**的生产端用（见
         `services/verify/concurrent_runner.py::_VerifyProducer`）：调用方手上有好
-        几个网盘的活，哪个网盘的令牌就绪就先干哪个，不能为了等某一个网盘把线程
-        睡在这里 —— 阻塞版 `acquire` 放在处理单元线程里正是这么把整条流水线拖慢的。
+        几个网盘的活，一个线程要管全部网盘，不能为了等某一个网盘把自己睡在这里 ——
+        阻塞版 `acquire` 放在处理单元线程里正是这么把整条流水线拖慢的。生产端现在
+        配 `wait_time` 一起用：先问要等多久、自己决定等不等，再来这里领令牌。
 
         Args:
             provider: 即将请求的网盘类型。

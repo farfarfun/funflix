@@ -105,19 +105,17 @@ logger = getLogger("funflix")
 
 
 class _VerifyProducer(BaseProducer):
-    """**按网盘拆队列**：每个网盘一条独立的翻页游标 + 一个本地缓冲区，
-    由各网盘自己的令牌桶决定下一条吐谁。
+    """**按网盘拆队列、严格轮转往外吐**：每个网盘一条独立的翻页游标 + 一个本地
+    缓冲区，`produce` 一条一条轮着发（一条阿里、一条夸克、一条 UC……）。
 
     为什么不是一条共享队列 —— 限流是按网盘算的（见
     `runner.PROVIDER_RATE_LIMITS`），而阿里云盘只扛得住 1 次/秒、夸克扛得住
     5 次/秒。共享队列 + 在**处理单元线程里**阻塞限流的话，8 个线程会挨个卡在
     阿里那把锁上睡觉，排在后面的夸克链接（队列里的大头）只能干等：实测 300 条
-    以阿里为主的资源跑了 5 分 05 秒，整条流水线被压到 1 条/秒 —— 等于整体吞吐
-    被**最慢的那个网盘**决定。
+    以阿里为主的资源跑了 5 分 05 秒，整条流水线被压到 1 条/秒。
 
-    拆开之后限流挪到生产端，而且用的是非阻塞的 `try_acquire`：哪个网盘的令牌
-    就绪就吐哪个，都没就绪才让生产者自己睡 `_IDLE_SLEEP`。处理单元线程因此
-    永远在做真正的网络请求，整体吞吐变成**各网盘速率之和**。
+    拆开之后限流挪到生产端，处理单元线程因此永远在做真正的网络请求。至于
+    「下一条吐谁」是严格轮转而不是"谁的令牌先就绪"，理由见 `produce`。
 
     还有一个副作用是必须的：翻页游标也得按网盘各自一条。共享一条游标时，
     「下一页」是按全局 `(last_checked_at, id)` 取的，一页里可能全是阿里 ——
@@ -147,9 +145,10 @@ class _VerifyProducer(BaseProducer):
             batch_size: 每个网盘每次翻页查询的条数。
             recheck_all: True 时忽略 `next_check_at`，把所有可校验 provider
                 的资源都当成待处理（强制全量复查）；False 时只取到期的。
-            rate_limiter: 按网盘限速的令牌桶。这里只用它的非阻塞接口
-                `try_acquire`，**不要**换成 `acquire` —— 生产者只有一个线程，
-                在这儿睡等某个网盘就把别的网盘也一起堵住了。
+            rate_limiter: 按网盘限速的令牌桶。这里用 `wait_time` + `try_acquire`
+                这一对，**不要**换成阻塞版 `acquire` —— 严格轮转确实要等轮到的
+                那个网盘（见 `produce`），但得先问清楚要等多久、跟 `max_seconds`
+                的剩余预算比一比，`acquire` 一脚踩进去就没有这个机会了。
             max_seconds: 墙上时间预算（秒），到点就停止产出；None 表示不设。
                 跟 `limit` 是两种不同的闸门，**要的是前者**：这条流水线的
                 吞吐由网盘限速决定（阿里 1 次/秒），所以"多少条"换算成
@@ -173,7 +172,10 @@ class _VerifyProducer(BaseProducer):
         self._sessionmaker = async_sessionmaker(
             self._engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
         )
-        self._order = list(CHECKABLE_PROVIDERS)
+        # 排序不是为了好看：`CHECKABLE_PROVIDERS` 是 `frozenset`，`list()` 它的
+        # 顺序跟着 `PYTHONHASHSEED` 每个进程都变。轮转顺序随机的话，同一批活每轮
+        # 吐出来的序列都不一样 —— 这条流水线一轮跑 80 分钟，不可复现等于查不动。
+        self._order = sorted(CHECKABLE_PROVIDERS, key=lambda p: p.value)
         self._turn = 0
         self._buffers: dict[Provider, list[dict[str, Any]]] = {p: [] for p in self._order}
         self._last_ts: dict[Provider, Any] = {p: None for p in self._order}
@@ -191,18 +193,40 @@ class _VerifyProducer(BaseProducer):
         self._aio_loop.run_until_complete(self._engine.dispose())
         self._aio_loop.close()
 
-    def _next_provider(self) -> Provider:
-        """轮转取下一个网盘。轮转而不是固定顺序，否则排在前面的网盘会一直抢到名额。"""
-        provider = self._order[self._turn % len(self._order)]
+    def _current_provider(self) -> Provider:
+        """轮转位置上的网盘。**不**前进 —— 前进是 `_advance` 的事。
+
+        读和前进分开，是严格轮转的关键：轮到的网盘还在冷却时位置必须留在原地，
+        下一次 `produce` 还得是它，否则就被后面的网盘插队了。
+        """
+        return self._order[self._turn % len(self._order)]
+
+    def _advance(self) -> None:
+        """轮转位置前进一格：轮到的网盘吐出了一条，或者确认它已经没活了。"""
         self._turn += 1
-        return provider
 
     def produce(self) -> Any:
-        """吐出下一条「所属网盘此刻允许发请求」的待校验资源。
+        """吐出轮转位置上那个网盘的下一条待校验资源。
+
+        **严格轮转**：一条阿里、一条夸克、一条 UC……走完一圈再回到阿里；某个
+        网盘的活干完了就从轮转里摘掉，所以只剩两家时自然变成 A C A C。轮到谁
+        就等谁的令牌，**不**让别的网盘趁它冷却插队。
+
+        为什么不是"哪个网盘令牌就绪就吐哪个" —— 那样快的网盘会在慢网盘的冷却
+        窗口里连吐一串：阿里 1.7 秒一条、夸克 0.2 秒一条，实际序列是
+        `夸克×8 → 阿里 → 夸克×8 → 阿里`。对夸克来说这就是实打实 5 次/秒的
+        **持续量**，而把阿里从 8% 打到 33% 限流的正是这种持续量（见
+        `runner.PROVIDER_RATE_LIMITS` 下面那段）。严格轮转在同一个网盘的相邻两次
+        请求之间塞进别的网盘，单网盘频次因此降到 `1 / 一圈时间`。
+
+        代价是整体吞吐变成 `还有活的网盘数 / 一圈时间`，而一圈时间由**最慢**的
+        网盘决定 —— 正是这个 docstring 开头"拆队列"要避开的东西，这里是刻意要
+        的：这条流水线用 `--max-seconds` 兜时间预算，少探几条下一轮接着探，可
+        一旦把某个网盘打到限流，那几条就得等几小时的退避才能重试。
 
         Returns:
             描述一条待校验资源的字典（resource_id/provider/share_id/url/passcode）；
-            还有活但所有网盘都在冷却时返回 `SKIP`，这一轮不往下游塞东西。
+            极少数情况下返回 `SKIP`（见下面那处注释），这一轮不往下游塞东西。
 
         Raises:
             StopIteration: 每个网盘都翻到最后一页、缓冲区也都空了，或者已经吐满
@@ -215,24 +239,35 @@ class _VerifyProducer(BaseProducer):
         if self._remaining_limit is not None and self._remaining_limit <= 0:
             raise StopIteration
 
-        # 每个网盘至多试一次：拿不到令牌就换下一个，不在这里等。
+        # 最多转一圈：中途遇到的空网盘就地摘掉，转满一圈说明全空了。
         for _ in range(len(self._order)):
-            provider = self._next_provider()
+            provider = self._current_provider()
             if not self._buffers[provider] and not self._exhausted[provider]:
                 self._aio_loop.run_until_complete(self._fetch_page(provider))
             if not self._buffers[provider]:
+                # 这个网盘没活了，把名额让给下一个 —— 不占轮转的位置。
+                self._advance()
                 continue
+
+            wait = self.rate_limiter.wait_time(provider)
+            if wait > 0:
+                if self._deadline is not None and time.monotonic() + wait >= self._deadline:
+                    # 等不到了。这时候跳去别的网盘恰恰是在破坏轮转，直接收工，
+                    # 剩下的活下一轮接着干。
+                    raise StopIteration
+                time.sleep(wait)
             if not self.rate_limiter.try_acquire(provider):
-                continue
+                # 睡醒了令牌反而更远了：自适应在这期间被处理单元线程拉长了间隔
+                # （见 `_VerifyProcessor._feed_back`）。轮转位置不动，下次还是它。
+                time.sleep(_IDLE_SLEEP)
+                return SKIP
+
+            self._advance()
             if self._remaining_limit is not None:
                 self._remaining_limit -= 1
             return self._buffers[provider].pop(0)
 
-        if all(self._exhausted.values()) and not any(self._buffers.values()):
-            raise StopIteration
-
-        time.sleep(_IDLE_SLEEP)
-        return SKIP
+        raise StopIteration
 
     async def _fetch_page(self, provider: Provider) -> None:
         """给某一个网盘翻一页，填进它自己的缓冲区。

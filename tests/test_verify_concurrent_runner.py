@@ -224,11 +224,16 @@ class TestRunVerifyPipeline:
 
 
 class TestProviderQueues:
-    """生产者按网盘拆队列：慢网盘的冷却不能挡住快网盘的活。
+    """生产者按网盘拆队列、严格轮转往外吐。
 
-    这是整条流水线吞吐的要害。限流以前在处理单元线程里阻塞着做，阿里云盘
-    （1 次/秒）会把线程一个个占去睡觉，夸克（5 次/秒，队列里的大头）只能排在
-    后面干等——实测 300 条跑了 5 分 05 秒，整体退化成 1 条/秒。
+    拆队列是为了不让慢网盘占住处理单元线程：限流以前在处理单元线程里阻塞着做，
+    阿里云盘（1 次/秒）会把线程一个个占去睡觉，夸克（5 次/秒，队列里的大头）
+    只能排在后面干等——实测 300 条跑了 5 分 05 秒，整体退化成 1 条/秒。
+
+    严格轮转是为了压住**单个网盘的持续频次**：生产端要是按"谁的令牌先就绪就吐
+    谁"，快网盘会在慢网盘的冷却窗口里连吐一串（`夸克×8 → 阿里 → 夸克×8`），
+    夸克那头就是实打实 5 次/秒的持续量。线上把阿里从 8% 打到 33% 限流的正是
+    这种持续量。
     """
 
     def _producer(self, db_url: str, *, batch_size: int, limiter) -> cr._VerifyProducer:
@@ -260,26 +265,132 @@ class TestProviderQueues:
         return asyncio.to_thread(run)
 
     @pytest.mark.asyncio
-    async def test_cooling_provider_does_not_block_the_others(self, db_url) -> None:
+    async def test_rotation_order_is_deterministic(self, db_url) -> None:
+        """轮转顺序必须是定好的，不能跟着 `PYTHONHASHSEED` 每个进程变。
+
+        `CHECKABLE_PROVIDERS` 是 `frozenset`，直接 `list()` 出来的顺序每次运行都
+        不一样。这条流水线一轮跑 80 分钟，序列不可复现就等于出了问题查不动 ——
+        这个测试本身就是这么被抓出来的：同一条命令跑五遍，三遍红两遍绿。
+        """
+        from funflix.base.enums import CHECKABLE_PROVIDERS
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        producer = self._producer(
+            db_url, batch_size=10, limiter=BlockingRateLimiter(rate_per_second=0.0)
+        )
+        await self._in_thread(producer, lambda: None)
+
+        assert producer._order == sorted(CHECKABLE_PROVIDERS, key=lambda p: p.value)
+
+    @pytest.mark.asyncio
+    async def test_providers_come_out_strictly_alternating(self, db_url) -> None:
+        """两家都有活时，吐出来的必须是一条一条交替，不是一家连吐一串。"""
         from funflix.services.verify.runner import BlockingRateLimiter
 
         async with open_session(db_url) as session:
-            session.add(make_resource(1, provider=Provider.ALIPAN, share_id="ali001"))
-            session.add_all([make_resource(n) for n in range(2, 5)])
+            session.add_all(
+                [
+                    make_resource(n, provider=Provider.ALIPAN, share_id=f"ali{n:03d}")
+                    for n in range(1, 4)
+                ]
+            )
+            session.add_all([make_resource(n) for n in range(4, 7)])
             await session.commit()
 
-        # 夸克不限速，阿里 1 次/秒
-        limiter = BlockingRateLimiter(rate_per_second=0.0, overrides={Provider.ALIPAN: 1.0})
-        # 先把阿里这一秒的令牌替它用掉，模拟"阿里正在冷却"
+        # 两家都不限速：序列只由轮转决定，不受令牌节奏干扰
+        limiter = BlockingRateLimiter(rate_per_second=0.0)
+        producer = self._producer(db_url, batch_size=10, limiter=limiter)
+        got = await self._in_thread(producer, lambda: [producer.produce() for _ in range(6)])
+
+        seq = [item["provider"] for item in got]
+        # 定序后 `_order` 是 alipan/ctfile/pan123/quark/uc，阿里在夸克前面，所以阿里先出
+        assert seq == [Provider.ALIPAN, Provider.QUARK] * 3, f"不是严格交替：{seq}"
+
+    @pytest.mark.asyncio
+    async def test_a_fast_provider_does_not_jump_the_queue(self, db_url) -> None:
+        """轮到的网盘还在冷却时，后面的网盘不许插队 —— 宁可等它。
+
+        这正是 33% 限流的来源：谁就绪吐谁的话，夸克会在阿里每一秒的冷却窗口里
+        连吐一串，对夸克就是 5 次/秒的持续量。
+        """
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        async with open_session(db_url) as session:
+            session.add_all(
+                [
+                    make_resource(n, provider=Provider.ALIPAN, share_id=f"ali{n:03d}")
+                    for n in range(1, 3)
+                ]
+            )
+            session.add_all([make_resource(n) for n in range(3, 6)])
+            await session.commit()
+
+        # 夸克不限速，阿里 10 次/秒（0.1 秒一条，够测出"等了"又不拖慢测试）
+        limiter = BlockingRateLimiter(rate_per_second=0.0, overrides={Provider.ALIPAN: 10.0})
+        # 先把阿里这一轮的令牌替它用掉，模拟"轮到阿里、可阿里正在冷却"
         assert limiter.try_acquire(Provider.ALIPAN) is True
 
         producer = self._producer(db_url, batch_size=10, limiter=limiter)
-        got = await self._in_thread(producer, lambda: [producer.produce() for _ in range(3)])
+        started = time.monotonic()
+        got = await self._in_thread(producer, lambda: [producer.produce() for _ in range(2)])
+        elapsed = time.monotonic() - started
 
-        # 三条夸克一条不落地吐了出来，没有一轮因为阿里在冷却而空转
-        assert [item["provider"] for item in got] == [Provider.QUARK] * 3
-        # 阿里那条还在它自己的缓冲区里排着，没被丢掉
-        assert len(producer._buffers[Provider.ALIPAN]) == 1
+        seq = [item["provider"] for item in got]
+        # 第一条仍然是阿里：生产者等满了它的冷却，没让夸克顶上来
+        assert seq == [Provider.ALIPAN, Provider.QUARK], f"夸克插队了：{seq}"
+        assert elapsed >= 0.1, f"没等阿里的冷却就吐了，只用了 {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_exhausted_provider_drops_out_of_the_rotation(self, db_url) -> None:
+        """一家的活干完了就从轮转里摘掉，剩下的继续交替（A B A B → A A A）。"""
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        async with open_session(db_url) as session:
+            session.add_all(
+                [
+                    make_resource(n, provider=Provider.ALIPAN, share_id=f"ali{n:03d}")
+                    for n in range(1, 4)
+                ]
+            )
+            # 夸克只有一条
+            session.add(make_resource(9))
+            await session.commit()
+
+        limiter = BlockingRateLimiter(rate_per_second=0.0)
+        producer = self._producer(db_url, batch_size=10, limiter=limiter)
+        got = await self._in_thread(producer, lambda: [producer.produce() for _ in range(4)])
+
+        seq = [item["provider"] for item in got]
+        assert seq == [
+            Provider.ALIPAN,
+            Provider.QUARK,
+            Provider.ALIPAN,
+            Provider.ALIPAN,
+        ], f"夸克耗尽后没有退化成阿里独跑：{seq}"
+
+    @pytest.mark.asyncio
+    async def test_rotation_waits_instead_of_spinning_on_one_provider(self, db_url) -> None:
+        """只剩一家时，轮转退化成"按它自己的节奏"，而不是空转或超速。"""
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        async with open_session(db_url) as session:
+            session.add_all(
+                [
+                    make_resource(n, provider=Provider.ALIPAN, share_id=f"ali{n:03d}")
+                    for n in range(1, 4)
+                ]
+            )
+            await session.commit()
+
+        limiter = BlockingRateLimiter(rate_per_second=0.0, overrides={Provider.ALIPAN: 20.0})
+        producer = self._producer(db_url, batch_size=10, limiter=limiter)
+        started = time.monotonic()
+        got = await self._in_thread(producer, lambda: [producer.produce() for _ in range(3)])
+        elapsed = time.monotonic() - started
+
+        assert [item["provider"] for item in got] == [Provider.ALIPAN] * 3
+        # 20 次/秒 = 0.05 秒一条，三条之间有两个间隔
+        assert elapsed >= 0.1, f"独跑时没按自己的节奏限流，只用了 {elapsed:.3f}s"
 
     @pytest.mark.asyncio
     async def test_each_provider_pages_on_its_own_cursor(self, db_url) -> None:

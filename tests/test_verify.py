@@ -580,3 +580,47 @@ class TestAdaptiveInterval:
         started = time.monotonic()
         limiter.acquire(Provider.ALIPAN)
         assert time.monotonic() - started >= 0.09
+
+
+class TestWaitTime:
+    """`BlockingRateLimiter.wait_time`：只问"还要等多久"，不动令牌。
+
+    生产端的严格轮转靠它（见 `services/verify/concurrent_runner.py::_VerifyProducer`
+    `.produce`）：轮到哪个网盘就等哪个，但得先拿这个数去跟 `max_seconds` 的剩余
+    预算比，否则一脚踩进阻塞版 `acquire` 就可能把 job 睡过 Action 的硬超时。
+    """
+
+    def _limiter(self, **kw):
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        return BlockingRateLimiter(**kw)
+
+    def test_a_fresh_provider_can_fire_right_away(self) -> None:
+        limiter = self._limiter(rate_per_second=1.0)
+        assert limiter.wait_time(Provider.QUARK) == 0.0
+
+    def test_reports_the_remaining_cooldown(self) -> None:
+        limiter = self._limiter(rate_per_second=10.0)
+        assert limiter.try_acquire(Provider.QUARK) is True
+        wait = limiter.wait_time(Provider.QUARK)
+        assert 0 < wait <= 0.1, f"0.1 秒间隔刚用掉令牌，该等的是剩下那点，拿到 {wait}"
+
+    def test_asking_does_not_consume_the_token(self) -> None:
+        """问多少次都不该把令牌问掉 —— 问完还得自己去 `try_acquire` 领。"""
+        limiter = self._limiter(rate_per_second=10.0)
+        for _ in range(5):
+            assert limiter.wait_time(Provider.QUARK) == 0.0
+        assert limiter.try_acquire(Provider.QUARK) is True, "被 wait_time 偷偷消费掉了"
+
+    def test_follows_the_adaptive_factor(self) -> None:
+        """自适应把间隔拉长后，等待时间要跟着长 —— 不然轮转会按旧节奏抢跑。"""
+        limiter = self._limiter(rate_per_second=10.0)
+        assert limiter.try_acquire(Provider.QUARK) is True
+        before = limiter.wait_time(Provider.QUARK)
+        limiter.intervals.on_rate_limited(Provider.QUARK)
+        assert limiter.wait_time(Provider.QUARK) > before
+
+    def test_unthrottled_providers_never_wait(self) -> None:
+        limiter = self._limiter(rate_per_second=0.0)
+        assert limiter.try_acquire(Provider.QUARK) is True
+        assert limiter.wait_time(Provider.QUARK) == 0.0
