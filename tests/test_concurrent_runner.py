@@ -334,6 +334,55 @@ async def _media_titles(url: str) -> list[str]:
         return list(await session.scalars(select(Media.title)))
 
 
+class TestBackpressure:
+    """生产者不能跑在落库前面太远 —— 两条队列都是限界的。
+
+    这是 `TestParseTimeBudget` 能成立的前提。队列无界时生产者按 extract 的
+    速度一路灌（纯 CPU 的规则抽取比落库快一个数量级），`max_seconds` 到点后
+    它确实停了，但 `run_parse_pipeline` 要等队列排空才返回 —— 几十万条按
+    1.46 条/s 排要几十小时，于是时间预算形同虚设，job 只能被外层
+    `timeout-minutes` 砍掉（run 37757448206 的四个分片都是这么死的），队列
+    里那些已经抽取完的也跟着白烧。详见 `run_parse_pipeline` 的 docstring。
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_slow_consumer_holds_the_producer_back(self, db_url, monkeypatch) -> None:
+        docs = 300
+        async with open_session(db_url) as session:
+            session.add_all([make_doc(n) for n in range(1, docs + 1)])
+            await session.commit()
+
+        # 把落库拖慢，制造出"抽取远快于落库"这个生产环境里的真实比例。
+        real = _ParseConsumer.consume_batch
+
+        def slow(self, items):
+            time.sleep(0.05)
+            return real(self, items)
+
+        monkeypatch.setattr(_ParseConsumer, "consume_batch", slow)
+
+        peak = 0
+
+        def record(enqueued: int, done: int) -> None:
+            nonlocal peak
+            peak = max(peak, enqueued)
+
+        run_parse_pipeline(
+            extractor_name="rule",
+            settings=Settings(database_url=db_url),
+            concurrency=2,
+            write_batch=1,
+            max_seconds=1.0,
+            on_progress=record,
+        )
+
+        # 限界之后在飞的条目上限是两条队列容量之和（这个配置下 8 + 8）加上
+        # 线程手里的那几条，所以入队数只能比落库数领先几十条。阈值放得很宽
+        # 是为了不跟调度抖动较劲 —— 真正要抓的是"无界"那种量级：队列不限长
+        # 时这里会直接冲到 300。
+        assert peak < 100, f"生产者跑得太远：入队 {peak} 条（共 {docs} 条）"
+
+
 class TestPipelinePending:
     def test_pending_sums_both_queue_backlogs(self) -> None:
         class _FakeProducer:

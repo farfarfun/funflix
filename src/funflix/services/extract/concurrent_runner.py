@@ -553,6 +553,33 @@ def run_parse_pipeline(
     已经吐出去的全部解析完、全部落库才返回，所以实际耗时会略超预算。设它的
     时候给外层超时留余量。为什么它比 `limit` 更适合 CI，见
     `_ParseProducer.produce`。
+
+    ## 两条队列都是限界的
+
+    funworker 的队列默认 `maxsize=0`（不限），而这条流水线的两端速度差一个
+    数量级：处理单元是 8 个线程跑纯 CPU 的规则抽取（`--extra llm` 不开时没有
+    网络调用），而消费者只有一个线程、每批 20 条要跟远端库来回，实测
+    **1.46 条/s**。不限界的后果有三个，run 37757448206 上三个都发生了：
+
+    - **到点收不了工。** 生产者按 extract 的速度一路塞，110 分钟能把几十万条
+      塞进队列；`max_seconds` 到点后它停了，但本函数要等队列排空才返回 ——
+      按 1.46 条/s 算要几十小时。于是时间预算形同虚设，job 被外层
+      `timeout-minutes: 120` 直接砍掉（四个分片都是"The operation was
+      canceled"，没有一个优雅退出过）。
+    - **白烧 extract。** 被砍掉时队列里那几十万条已经抽取完了，全在内存里，
+      随进程一起没了，下一轮要从头再抽一遍。
+    - **内存无上限。** 条目里带着 `doc.content` 全文。
+
+    限界之后生产者会卡在 `_put` 上（funworker 的 `_put` 是带超时轮询的阻塞
+    写，并且尊重停止信号，不会把停止请求堵死），于是整条流水线被最慢的那一
+    段自然限速：在飞的条目不超过两条队列的容量之和，到点后的收尾只要几十秒。
+    容量按两端各自的工作单元算 —— 入口要够喂满 `concurrency` 个线程，出口要
+    够让消费者随时攒满一个 `write_batch`，各给 4 倍余量。调小它不会降吞吐：
+    瓶颈本来就在消费者那一侧，处理单元迟早要等。
+
+    `services/verify/concurrent_runner.py` 和 `collect` 那条早就限界了，而且
+    verify 的注释里记的是同一句结论（"时间预算就形同虚设了"）—— 三条流水线
+    是一个形状，再加新的流水线时记得一起限上。
     """
     settings = settings or get_settings()
 
@@ -565,6 +592,8 @@ def run_parse_pipeline(
         processor_factory,
         _ParseConsumer,
         num_workers=max(1, concurrency),
+        input_maxsize=max(4 * max(1, concurrency), 2 * write_batch),
+        output_maxsize=max(4 * write_batch, 4 * max(1, concurrency)),
         producer_kwargs={
             "settings": settings,
             "extractor_override": extractor_name,
