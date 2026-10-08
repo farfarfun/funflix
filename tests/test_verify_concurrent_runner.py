@@ -615,3 +615,126 @@ class TestCountDue:
         await session.commit()
 
         assert await cr.count_due(session, recheck_all=False, limit=2) == 2
+
+
+class RateLimitedProbe:
+    """按 share_id 前缀返回指定结论，用来驱动限流反馈。"""
+
+    name = "fake"
+    needs_auth = False
+
+    def __init__(self, provider: Provider) -> None:
+        self.provider = provider
+
+    async def check(self, ref: LinkRef) -> CheckOutcome:
+        if ref.share_id.startswith("limited"):
+            return CheckOutcome(status=CheckStatus.RATE_LIMITED, detail="TooManyRequests")
+        if ref.share_id.startswith("err"):
+            return CheckOutcome(status=CheckStatus.ERROR, detail="ConnectTimeout")
+        return CheckOutcome(status=CheckStatus.VALID)
+
+
+class TestRateLimitFeedback:
+    """探测结论要回流到限流器，让它自己收敛到跑得通的速率。
+
+    `PROVIDER_RATE_LIMITS` 里的常数定不准：阿里云盘 1.0 次/秒在 25 条样本上
+    测出 8% 被限流，线上长跑（run 37706256433，80 分钟 3,657 次调用）是 33%，
+    1,339 次白打。差别是持续量顶穿了小时级配额，而配额看不见也会变 ——
+    所以速率只能按反馈走，见 `runner._IntervalTable`。
+    """
+
+    def _processor(self, **kw):
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        limiter = BlockingRateLimiter(rate_per_second=10.0, **kw)
+        return cr._VerifyProcessor(rate_limiter=limiter), limiter
+
+    def test_rate_limited_slows_that_provider_down(self) -> None:
+        proc, limiter = self._processor()
+        before = limiter._interval_for(Provider.QUARK)
+        proc._feed_back(Provider.QUARK, CheckStatus.RATE_LIMITED)
+        assert limiter._interval_for(Provider.QUARK) > before
+
+    def test_conclusive_results_walk_it_back(self) -> None:
+        proc, limiter = self._processor()
+        for _ in range(5):
+            proc._feed_back(Provider.QUARK, CheckStatus.RATE_LIMITED)
+        slowed = limiter._interval_for(Provider.QUARK)
+        for status in (CheckStatus.VALID, CheckStatus.INVALID, CheckStatus.NEED_PASSWORD):
+            proc._feed_back(Provider.QUARK, status)
+        assert limiter._interval_for(Provider.QUARK) < slowed
+
+    def test_error_and_unsupported_do_not_vote(self) -> None:
+        """连接超时两边都不能证明，没探针更是一次请求都没发。
+
+        上一轮线上 263 条 error 全是 `ConnectTimeout`：当成限流会把网盘无谓地
+        摁到底，当成成功又会在真被硬封时越打越快，所以两边都不投票。
+        """
+        proc, limiter = self._processor()
+        before = limiter._interval_for(Provider.QUARK)
+        for _ in range(20):
+            proc._feed_back(Provider.QUARK, CheckStatus.ERROR)
+            proc._feed_back(Provider.QUARK, CheckStatus.UNSUPPORTED)
+        assert limiter._interval_for(Provider.QUARK) == pytest.approx(before)
+        assert limiter.intervals.factors() == {}
+
+    @pytest.mark.asyncio
+    async def test_pipeline_shares_one_limiter_and_converges(self, db_url, monkeypatch) -> None:
+        """整条流水线跑一遍：限流器必须只有一个实例，而且真被反馈推慢了。
+
+        只有一个实例是硬要求 —— 生产者读它决定下一条吐谁、处理单元回写反馈，
+        各线程各建一份的话反馈就只影响自己那一份，等于白做。
+        """
+        monkeypatch.setattr(cr, "get_probe", lambda p: RateLimitedProbe(p))
+        captured: list = []
+        real = cr.BlockingRateLimiter
+
+        def capture(*args, **kwargs):
+            limiter = real(*args, **kwargs)
+            captured.append(limiter)
+            return limiter
+
+        monkeypatch.setattr(cr, "BlockingRateLimiter", capture)
+
+        async with open_session(db_url) as session:
+            session.add_all([make_resource(n, share_id=f"limited{n:04d}") for n in range(1, 7)])
+            await session.commit()
+
+        reports = cr.run_verify_pipeline(
+            settings=Settings(database_url=db_url), concurrency=2, rate=100.0
+        )
+
+        assert len(reports) == 6
+        assert all(r.status is CheckStatus.RATE_LIMITED for r in reports)
+        assert len(captured) == 1, "生产者和处理单元必须共用同一个限流器实例"
+        factors = captured[0].intervals.factors()
+        assert factors.get(Provider.QUARK, 1.0) > 1.0, "六条全被限流，速率却没放慢"
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_leaves_the_floor_alone(self, db_url, monkeypatch) -> None:
+        """全程顺利不该让它比实测下限更快 —— 那张表是风控线，不是加速起点。"""
+        monkeypatch.setattr(cr, "get_probe", lambda p: RateLimitedProbe(p))
+        captured: list = []
+        real = cr.BlockingRateLimiter
+
+        def capture(*args, **kwargs):
+            limiter = real(*args, **kwargs)
+            captured.append(limiter)
+            return limiter
+
+        monkeypatch.setattr(cr, "BlockingRateLimiter", capture)
+
+        async with open_session(db_url) as session:
+            session.add_all([make_resource(n) for n in range(1, 7)])
+            await session.commit()
+
+        reports = cr.run_verify_pipeline(
+            settings=Settings(database_url=db_url), concurrency=2, rate=100.0
+        )
+
+        assert all(r.status is CheckStatus.VALID for r in reports)
+        limiter = captured[0]
+        assert limiter.intervals.factors() == {}
+        assert limiter._interval_for(Provider.QUARK) == pytest.approx(
+            limiter.intervals.base_interval_for(Provider.QUARK)
+        )

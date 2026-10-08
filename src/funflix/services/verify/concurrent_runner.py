@@ -19,6 +19,12 @@
 `BlockingRateLimiter` 而不是 `asyncio.Lock` 版的 `RateLimiter`——后者绑在
 各自线程的事件循环上，不能跨线程用。
 
+速率本身不是写死的常数，而是按限流反馈收敛的：处理单元拿到探测结论后立刻
+回写给同一个限流器实例（`_VerifyProcessor._feed_back`），被限流就拉长该网盘的
+间隔、拿到明确结论就慢慢收回，`PROVIDER_RATE_LIMITS` 只当下限。原因是实测
+常数定不准：阿里云盘 1.0 次/秒在 25 条样本上只有 8% 被限流，线上长跑
+（run 37706256433，3,657 次调用）是 33%，差的是持续量顶穿了小时级配额。
+
 落库逻辑（写 `LinkCheck`、推进 `resource.check_status`/`next_check_at`、
 刷新作品的 `valid_resource_count`）留给消费者线程，复用
 `services/verify/runner.py::persist_check_outcome`。
@@ -88,6 +94,12 @@ async def count_due(session: AsyncSession, *, recheck_all: bool, limit: int | No
 #: 也是 1 次/秒，50ms 的粒度够用），以及 `BaseProducer._loop` 能及时看到停止信号 ——
 #: 睡在 `produce()` 里的时间是不响应 `stop()` 的。
 _IDLE_SLEEP = 0.05
+
+#: 算"网盘确实答复了我们"的结论，用来给限流器投赞成票。
+#:
+#: `UNSUPPORTED` 不在里面：那是没探针、根本没发请求，不构成任何速率证据。
+#: `ERROR` 也不在，理由见 `runner._IntervalTable.on_conclusive`。
+_CONCLUSIVE = frozenset({CheckStatus.VALID, CheckStatus.INVALID, CheckStatus.NEED_PASSWORD})
 
 logger = getLogger("funflix")
 
@@ -249,8 +261,10 @@ class _VerifyProducer(BaseProducer):
                         ),
                     )
                     # 没有能同时支撑 `provider =` 和这个排序的索引，PG 会扫一遍
-                    # 再排序。`resource` 全表只有 4 万行（对比 `raw_document` 的
-                    # 213 万），实测毫秒级，不值得为它加一条复合索引。
+                    # 再排序。`resource` 现在 92 万行，实测一页（500 条）
+                    # 300~900ms —— 不再是"毫秒级"了，但一页管 500 条、摊到每条
+                    # 约 2ms，相比探测本身的 1.3s 可以忽略，仍不值得加索引。
+                    # 真要加，索引得是 `(provider, last_checked_at NULLS FIRST, id)`。
                     .order_by(Resource.last_checked_at.nulls_first(), Resource.id)
                     .limit(self.batch_size)
                 )
@@ -275,12 +289,26 @@ class _VerifyProducer(BaseProducer):
 
 
 class _VerifyProcessor(BaseProcessor):
-    """并发跑 `probe.check()`，不碰数据库，**也不限流**。
+    """并发跑 `probe.check()`，不碰数据库，**也不限流**，但要把限流结论喂回去。
 
     限流在生产端（见 `_VerifyProducer`）：吐出来的每一条都已经占掉了它所属
     网盘的令牌，拿到就该立刻发请求。这里不能再 `acquire` 一次 —— 一次
     `acquire` 消费一个令牌，两头都收的话实际速率会变成设定值的一半。
+
+    反馈放在这里、而不是放在消费者里，是因为这里**第一手**拿到结论：消费者
+    要等攒够 `write_batch` 条或 `flush_interval` 秒才落库，隔着十几秒再回写，
+    这期间生产者还在按旧速率往外吐。喂回去的是 `rate_limiter`（所有线程共享
+    的同一个实例），由它按网盘调间隔，见 `runner._IntervalTable`。
     """
+
+    def __init__(self, *args: Any, rate_limiter: BlockingRateLimiter, **kwargs: Any) -> None:
+        """初始化处理单元。
+
+        Args:
+            rate_limiter: 生产端那一个限流器实例，这里**只回写反馈、不取令牌**。
+        """
+        super().__init__(*args, **kwargs)
+        self.rate_limiter = rate_limiter
 
     def on_start(self) -> None:
         """线程启动时建立专属事件循环，并初始化本线程的探针缓存。"""
@@ -339,7 +367,18 @@ class _VerifyProcessor(BaseProcessor):
             # 探针骨架本身已经兜底了自己的异常，这层纯防御性——防止未来新探针
             # 实现漏掉兜底时，一次异常把整条流水线拖垮。
             outcome = CheckOutcome(status=CheckStatus.ERROR, detail=f"{type(exc).__name__}: {exc}")
+        self._feed_back(provider, outcome.status)
         return {"resource_id": item["resource_id"], "outcome": outcome, "probe_name": probe.name}
+
+    def _feed_back(self, provider: Provider, status: CheckStatus) -> None:
+        """把这一次的结论喂给限流器，让它调整该网盘的节奏。
+
+        `ERROR` 不投票，理由见 `runner._IntervalTable.on_conclusive`。
+        """
+        if status is CheckStatus.RATE_LIMITED:
+            self.rate_limiter.intervals.on_rate_limited(provider)
+        elif status in _CONCLUSIVE:
+            self.rate_limiter.intervals.on_conclusive(provider)
 
 
 class _VerifyConsumer(BaseBatchConsumer):
@@ -485,10 +524,16 @@ def run_verify_pipeline(
     """
     settings = settings or get_settings()
     num_workers = max(1, concurrency)
+    # 生产者和全部处理单元线程共享同一个限流器实例：生产者读它决定下一条吐谁，
+    # 处理单元拿到探测结论后回写反馈（见 `_VerifyProcessor._feed_back`）。
+    # 每个线程各建一个的话，反馈就只影响自己那一份，等于没有反馈。
+    limiter = BlockingRateLimiter(rate_per_second=rate)
 
     pipeline = Pipeline.build(
         _VerifyProducer,
-        _VerifyProcessor,
+        # 传工厂而不是类：`Pipeline.build` 没有 `processor_kwargs`，要把共享的
+        # 限流器交给处理单元只能靠闭包。
+        lambda: _VerifyProcessor(rate_limiter=limiter),
         _VerifyConsumer,
         num_workers=num_workers,
         # 输入队列限长。限流挪到生产端之后，「已经占了令牌」和「请求真的发出去」
@@ -513,7 +558,7 @@ def run_verify_pipeline(
             "limit": limit,
             "batch_size": batch_size,
             "recheck_all": recheck_all,
-            "rate_limiter": BlockingRateLimiter(rate_per_second=rate),
+            "rate_limiter": limiter,
             "max_seconds": max_seconds,
         },
         consumer_kwargs={
@@ -537,6 +582,15 @@ def run_verify_pipeline(
         pipeline.stop()
     if on_progress is not None:
         on_progress(*_pipeline_counts(pipeline))
+
+    # 把自适应收敛到哪儿了打出来 —— 这是下一轮调 `PROVIDER_RATE_LIMITS` 下限
+    # 唯一可信的依据，比再拿几十条样本手测靠谱。
+    for provider, factor in sorted(limiter.intervals.factors().items(), key=lambda kv: -kv[1]):
+        base = limiter.intervals.base_interval_for(provider)
+        logger.info(
+            f"{provider.value} 被限流后自适应放慢到 {base * factor:.2f} 秒一次"
+            f"（基准 {base:.2f} 秒，放大 {factor:.1f} 倍）"
+        )
 
     consumer = pipeline.consumer
     assert isinstance(consumer, _VerifyConsumer)

@@ -466,3 +466,117 @@ class TestProviderRateOverrides:
         for _ in range(3):
             limiter.acquire(Provider.QUARK)
         assert time.monotonic() - started < 0.09
+
+
+class TestAdaptiveInterval:
+    """限流反馈：被限流就放慢，拿到明确结论就慢慢收回。
+
+    为什么需要自适应而不是把 `PROVIDER_RATE_LIMITS` 的常数再往下调一档 ——
+    那个常数定不准。阿里云盘 1.0 次/秒在 25 条样本上测出 8% 被限流，线上长跑
+    （run 37706256433，3,657 次调用）是 33%，差的是持续量顶穿了小时级配额。
+    配额看不见、也会变，所以实际速率只能靠反馈收敛。
+    """
+
+    def _table(self, **kw):
+        from funflix.services.verify.runner import _IntervalTable
+
+        kw.setdefault("rate_per_second", 10.0)
+        return _IntervalTable(**kw)
+
+    def test_rate_limited_lengthens_the_interval(self) -> None:
+        from funflix.services.verify.runner import _PENALTY_FACTOR
+
+        table = self._table()
+        base = table.interval_for(Provider.QUARK)
+        table.on_rate_limited(Provider.QUARK)
+        assert table.interval_for(Provider.QUARK) == pytest.approx(base * _PENALTY_FACTOR)
+
+    def test_penalty_only_touches_the_provider_that_complained(self) -> None:
+        table = self._table()
+        before = table.interval_for(Provider.ALIPAN)
+        table.on_rate_limited(Provider.QUARK)
+        assert table.interval_for(Provider.ALIPAN) == pytest.approx(before)
+
+    def test_conclusive_results_walk_the_interval_back(self) -> None:
+        table = self._table()
+        base = table.interval_for(Provider.QUARK)
+        for _ in range(5):
+            table.on_rate_limited(Provider.QUARK)
+        slowed = table.interval_for(Provider.QUARK)
+        assert slowed > base
+        for _ in range(50):
+            table.on_conclusive(Provider.QUARK)
+        assert table.interval_for(Provider.QUARK) < slowed
+
+    def test_never_goes_faster_than_the_measured_floor(self) -> None:
+        """`PROVIDER_RATE_LIMITS` 是下限，自适应只许往慢的方向走。
+
+        那张表是实测出来的风控线，不是调优起点；一路顺利就加速会直接撞回去。
+        """
+        table = self._table()
+        base = table.interval_for(Provider.QUARK)
+        for _ in range(500):
+            table.on_conclusive(Provider.QUARK)
+        assert table.interval_for(Provider.QUARK) == pytest.approx(base)
+
+    def test_slowdown_is_capped(self) -> None:
+        """封顶是防一段网络抖动把某个网盘永久摁死，见 `_MAX_INTERVAL_FACTOR`。"""
+        from funflix.services.verify.runner import _MAX_INTERVAL_FACTOR
+
+        table = self._table()
+        base = table.interval_for(Provider.QUARK)
+        for _ in range(200):
+            table.on_rate_limited(Provider.QUARK)
+        assert table.interval_for(Provider.QUARK) == pytest.approx(base * _MAX_INTERVAL_FACTOR)
+
+    def test_unthrottled_providers_stay_unthrottled(self) -> None:
+        """速率设成 0 是调用方明确要求别节流，反馈不能偷偷把它变成限流的。
+
+        `verify --resource-id` 单条校验和大量测试都依赖这个：一次调用就被罚
+        一下、下一次就开始睡，整个套件会慢得莫名其妙。
+        """
+        table = self._table(rate_per_second=0.0, overrides={})
+        for _ in range(10):
+            table.on_rate_limited(Provider.QUARK)
+        assert table.interval_for(Provider.QUARK) == 0.0
+        assert table.factors() == {}
+
+    def test_factors_report_only_the_slowed_providers(self) -> None:
+        table = self._table()
+        table.on_rate_limited(Provider.ALIPAN)
+        table.on_conclusive(Provider.QUARK)
+        assert list(table.factors()) == [Provider.ALIPAN]
+
+    def test_limiters_expose_the_same_table(self) -> None:
+        """两个限流器实现共用同一个类，退避逻辑不许在两处各长一份。
+
+        理由同 `base/backoff.py` 的模块 docstring：参数一旦悄悄分叉，
+        "为什么这一层重试得特别猛"会变成很难查的问题。
+        """
+        from funflix.services.verify.runner import (
+            BlockingRateLimiter,
+            RateLimiter,
+            _IntervalTable,
+        )
+
+        for cls in (RateLimiter, BlockingRateLimiter):
+            limiter = cls(rate_per_second=10.0)
+            assert isinstance(limiter.intervals, _IntervalTable), cls
+            limiter.intervals.on_rate_limited(Provider.QUARK)
+            assert limiter._interval_for(Provider.QUARK) == pytest.approx(0.15), cls
+
+    def test_feedback_actually_gates_requests(self) -> None:
+        """放慢之后真的要睡得更久 —— 不然系数只是个好看的数字。"""
+        import time
+
+        from funflix.services.verify.runner import BlockingRateLimiter
+
+        limiter = BlockingRateLimiter(rate_per_second=1000.0, overrides={Provider.ALIPAN: 50.0})
+        # 基准 20ms 一次，连罚 4 次后是 20ms × 1.5^4 ≈ 101ms
+        for _ in range(4):
+            limiter.intervals.on_rate_limited(Provider.ALIPAN)
+
+        limiter.acquire(Provider.ALIPAN)
+        started = time.monotonic()
+        limiter.acquire(Provider.ALIPAN)
+        assert time.monotonic() - started >= 0.09

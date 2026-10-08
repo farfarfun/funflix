@@ -53,9 +53,32 @@ _INVALID_CONFIRM_TIMES = 2
 #:
 #: 夸克在 5.0 次/秒下没有限流迹象（生产库 10,980 valid / 6,585 invalid），
 #: 所以是按网盘覆盖，而不是把全局速率调慢 —— 夸克才是队列里的大头。
+#:
+#: **这张表现在只是下限（最快允许多快），不是目标值。** 上面那 8% 是 25 条样本
+#: 推出来的，长跑完全不是这个数：run 37706256433 整轮 80 分钟全是阿里在跑
+#: （夸克那轮没有到期的），3,657 次调用里 1,339 次被限流（33%），折算每小时
+#: ~2,440 次。差别是**持续量** —— 25 条请求在任何小时级配额内都无感，长跑会
+#: 把它顶穿。配额看不见也会变，所以实际间隔交给 `_IntervalTable` 按限流反馈
+#: 自己收敛，这里只保证"不会比这更快"。
 PROVIDER_RATE_LIMITS: dict[Provider, float] = {
     Provider.ALIPAN: 1.0,
 }
+
+#: 吃到一次限流，就把该网盘的请求间隔乘上这个系数。
+_PENALTY_FACTOR = 1.5
+
+#: 该网盘给出一条明确结论，就把间隔乘上这个系数往回收。
+#:
+#: 跟 `_PENALTY_FACTOR` 一起决定收敛到的限流率：乘性拉长 / 乘性收回在
+#: `p·ln(1.5) + (1-p)·ln(0.99) = 0` 处平衡，解出 p ≈ 2.4%，即稳态下约四十条
+#: 里才白打一条。恢复调快（比如 0.95）会让它在更高的限流率上平衡。
+_RECOVERY_FACTOR = 0.99
+
+#: 间隔最多放大到基准值的多少倍。
+#:
+#: 封顶不是怕慢，是怕一段网络抖动把某个网盘永久摁死 —— 16 倍对阿里云盘是
+#: 16 秒一次，已远低于任何合理配额，再慢只能说明问题不在频次。
+_MAX_INTERVAL_FACTOR = 16.0
 
 
 def _interval_table(
@@ -83,6 +106,79 @@ def _interval_table(
     return to_interval(rate_per_second), {p: to_interval(r) for p, r in table.items()}
 
 
+class _IntervalTable:
+    """按网盘算的请求间隔，带限流反馈：吃到限流就拉长，探出结论就慢慢收回。
+
+    为什么要自适应、而不是把 `PROVIDER_RATE_LIMITS` 里的常数再调小一档 ——
+    那个常数没法定准。理由见那张表下面补的那段：同一个 1.0 次/秒，25 条样本
+    测出来 8% 限流，线上长跑是 33%。配额是看不见的、会随时间和账号变，再猜
+    一个数只是把同样的错往小挪一点。这里换成按反馈收敛：被限流说明打太快，
+    拉长间隔；拿到明确结论说明这个节奏网盘认，慢慢收回去。收敛点由
+    `_PENALTY_FACTOR` / `_RECOVERY_FACTOR` 决定，约 2.4% 限流率。
+
+    `PROVIDER_RATE_LIMITS` 继续当**下限**（最快允许多快），系数只放大不缩小，
+    所以自适应永远不会比那张实测表更激进。
+
+    两个限流器实现（`RateLimiter` / `BlockingRateLimiter`）共用这一个类，不是
+    图省代码 —— 退避曲线一旦在两处各复制一份就会悄悄分叉，`base/backoff.py`
+    的模块 docstring 讲的是同一件事。
+
+    线程安全：`BlockingRateLimiter` 的读者是 funworker 的生产者线程、写者是
+    8 个处理单元线程（见 `services/verify/concurrent_runner.py`），所以系数表
+    要加锁。锁只圈住几句算术，不跨任何阻塞调用，`RateLimiter` 在协程里用也
+    不会把事件循环卡住。
+    """
+
+    def __init__(
+        self, rate_per_second: float, overrides: dict[Provider, float] | None = None
+    ) -> None:
+        """按"全局速率 + 按网盘覆盖"建表，参数含义同 `_interval_table`。"""
+        self._default, self._base = _interval_table(rate_per_second, overrides)
+        self._lock = threading.Lock()
+        self._factors: dict[Provider, float] = {}
+
+    def base_interval_for(self, provider: Provider) -> float:
+        """该网盘的基准间隔（不含自适应系数），0 表示不限流。"""
+        return self._base.get(provider, self._default)
+
+    def interval_for(self, provider: Provider) -> float:
+        """该网盘此刻该用的间隔 = 基准间隔 × 自适应系数。"""
+        base = self.base_interval_for(provider)
+        if base <= 0:
+            # 显式不限流的网盘不参与自适应：把速率设成 0 是调用方明确要求别节流
+            # （测试、`verify --resource-id` 单条校验），反馈不该把它偷偷变成限流的。
+            return 0.0
+        with self._lock:
+            return base * self._factors.get(provider, 1.0)
+
+    def on_rate_limited(self, provider: Provider) -> None:
+        """该网盘回了限流：拉长间隔。"""
+        self._scale(provider, _PENALTY_FACTOR)
+
+    def on_conclusive(self, provider: Provider) -> None:
+        """该网盘给出了明确结论（valid / invalid / need_password）：往回收一点。
+
+        只认明确结论，**不认 `ERROR`**。连接超时两边都不能证明：既不说明我们
+        打太快（网络抖动长一个样），也不说明这个节奏是对的。两边都不投票，
+        比猜一边稳 —— 上一轮线上 263 条 error 全是 `ConnectTimeout`，当成限流
+        会把阿里无谓地摁到底，当成成功又会在真被硬封时越打越快。
+        """
+        self._scale(provider, _RECOVERY_FACTOR)
+
+    def _scale(self, provider: Provider, factor: float) -> None:
+        if self.base_interval_for(provider) <= 0:
+            return
+        with self._lock:
+            current = self._factors.get(provider, 1.0)
+            # 下夹到 1.0：基准值来自实测表，自适应只负责往慢的方向走。
+            self._factors[provider] = min(max(current * factor, 1.0), _MAX_INTERVAL_FACTOR)
+
+    def factors(self) -> dict[Provider, float]:
+        """各网盘当前的放大系数快照，给收尾日志用（1.0 的不收录）。"""
+        with self._lock:
+            return {p: f for p, f in self._factors.items() if f > 1.0}
+
+
 class RateLimiter:
     """每个网盘一个令牌桶。
 
@@ -91,7 +187,8 @@ class RateLimiter:
     不只是礼貌问题。
 
     各网盘的耐受度差一个数量级，所以速率也是按网盘算的，见
-    `PROVIDER_RATE_LIMITS`。
+    `PROVIDER_RATE_LIMITS`；实际间隔还会按限流反馈自适应，见 `_IntervalTable`，
+    反馈入口是 `self.intervals.on_rate_limited` / `on_conclusive`。
     """
 
     def __init__(
@@ -107,12 +204,12 @@ class RateLimiter:
                 不限流。
             overrides: 按网盘覆盖的速率，默认取 `PROVIDER_RATE_LIMITS`。
         """
-        self._interval, self._intervals = _interval_table(rate_per_second, overrides)
+        self.intervals = _IntervalTable(rate_per_second, overrides)
         self._locks: dict[Provider, asyncio.Lock] = {}
         self._last: dict[Provider, float] = {}
 
     def _interval_for(self, provider: Provider) -> float:
-        return self._intervals.get(provider, self._interval)
+        return self.intervals.interval_for(provider)
 
     async def acquire(self, provider: Provider) -> None:
         """按该网盘的令牌桶节奏阻塞等待，直到可以发起下一次请求。
@@ -144,6 +241,10 @@ class BlockingRateLimiter:
     共享同一个实例；这里用 `threading.Lock` + `time.monotonic()` 重写同一套
     令牌桶算法，所有处理单元线程共享同一个实例，"每个网盘每秒最多几次请求"
     才是全局生效，不会被并发线程数放大。
+
+    间隔会按限流反馈自适应（见 `_IntervalTable`）。这个类的反馈是**跨线程**
+    写入的：生产者线程读间隔决定吐谁，8 个处理单元线程拿到探测结论后回写，
+    `_IntervalTable` 内部自己加了锁。
     """
 
     def __init__(
@@ -159,13 +260,13 @@ class BlockingRateLimiter:
                 不限流。
             overrides: 按网盘覆盖的速率，默认取 `PROVIDER_RATE_LIMITS`。
         """
-        self._interval, self._intervals = _interval_table(rate_per_second, overrides)
+        self.intervals = _IntervalTable(rate_per_second, overrides)
         self._dict_lock = threading.Lock()
         self._locks: dict[Provider, threading.Lock] = {}
         self._last: dict[Provider, float] = {}
 
     def _interval_for(self, provider: Provider) -> float:
-        return self._intervals.get(provider, self._interval)
+        return self.intervals.interval_for(provider)
 
     def _lock_for(self, provider: Provider) -> threading.Lock:
         with self._dict_lock:
