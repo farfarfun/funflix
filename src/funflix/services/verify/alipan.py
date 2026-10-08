@@ -6,6 +6,9 @@
 - 有效：HTTP 200，返回 share_name / file_infos / expiration 等
 
 与夸克探针同样的原则：`classify` 判不出来返回 `None`，由骨架归到 ERROR。
+这个原则是为了"接口改版别把整库资源误杀"，但反过来也有代价 —— 一个**明确
+表示分享没了**的业务码漏在码表外面，就会被当成"判不出结论"无限重试下去，
+把阿里这个限速最紧的网盘的调用额度白烧掉。见 `_GONE_CODES` 的注释。
 """
 
 from __future__ import annotations
@@ -16,11 +19,28 @@ from funflix.base.enums import CheckStatus, Provider
 from funflix.services.verify.base import AnonymousHttpProbe, CheckOutcome, LinkRef
 
 #: 明确表示"分享没了"的错误码
+#:
+#: `ShareLink.Forbidden`（正文 `share_link is forbidden`）和
+#: `ShareLink.ContentInvalid` 是**后补的**，补之前它们落在 `classify` 的兜底
+#: `return None` 上、被骨架归成 ERROR —— 而 ERROR 的含义是"这不是关于链接的
+#: 结论"，`_next_check_at` 会给它排退避重试，封顶 6 小时一次、永远重试下去。
+#:
+#: 代价是实测出来的：生产库里 `ShareLink.Forbidden` 攒了 **17374 条探测历史、
+#: 只对应 2984 个去重 share_id**（平均每条白探 5.8 次），run 37797533687 那
+#: 一轮 verify 1852 条结论里 640 条是它，占阿里全部调用的 35%。而阿里是整个
+#: verify 阶段的闸门：按网盘限速 1 次/秒、被限流后还会自适应放慢（那轮放慢到
+#: 7.29 秒一次），这 35% 等于直接砍掉三分之一的校验吞吐。
+#:
+#: 判 INVALID 不是一条单向门：`_RECHECK_TTL` 给 INVALID 排 30 天后再确认一次，
+#: 连续两次（`_INVALID_CONFIRM_TIMES`）才彻底退休。真要是被风控临时封掉、
+#: 后来又放开了，30 天后那一次复查能捞回来。
 _GONE_CODES = {
     "NotFound.ShareLink",
     "ShareLink.Cancelled",
     "ShareLink.Expired",
     "ForbiddenShareLinkViolation",
+    "ShareLink.Forbidden",
+    "ShareLink.ContentInvalid",
 }
 _RATE_CODES = {"TooManyRequests", "Throttling"}
 

@@ -11,6 +11,23 @@ _BASE62 = "Tvd3hHA9QEkom14xpfaBJIMwgFYGPXn2sWCNORDr80KuUSl7bZcetizL5q6yVj"
 _GONE_HINTS = ("不存在", "已失效", "已过期", "已取消", "已删除", "违规")
 _PASSWORD_HINTS = ("提取码", "密码")
 
+#: 接口嫌**我们这个分享码本身**不成立的文案（`ShareKey格式异常`）—— 跟链接
+#: 状态无关，是抽取那一步给出了一个根本不是 123 云盘分享码的 `share_id`。
+#:
+#: 这类响应原先落在兜底 `return None` 上、被归成 ERROR，于是按退避无限重试；
+#: 可一个格式都不对的分享码再探一万次也还是这个回答。生产库里它攒了 29 条
+#: 历史、只对应 3 个去重 share_id —— 量不大，但跟阿里那 17374 条（见
+#: `alipan._GONE_CODES`）是同一类浪费。
+#:
+#: 判 UNSUPPORTED 而不是 INVALID：没有任何证据说这个分享失效了，我们只是
+#: **探不了它**。UNSUPPORTED 的复查间隔是 `None`，不再排队。
+_MALFORMED_KEY_HINTS = ("格式异常",)
+
+#: 接口嫌**我们带的提取码**不成立的文案（`SharePwd最大为4位`）。分享码本身
+#: 可能是好的，坏的是抽取出来的那串提取码，所以归 NEED_PASSWORD（等人工补
+#: 码、同样不自动复查）而不是 UNSUPPORTED。生产库里 3 个去重 share_id。
+_MALFORMED_PWD_HINTS = ("最大为",)
+
 
 def _owner_id(share_id: str) -> str | None:
     value = 0
@@ -28,8 +45,9 @@ def classify(payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
     `code == 0` 时看 `data`：`Expired` 为真判 INVALID，否则判 VALID 并带上
     首个文件的标题/大小。`code != 0` 时退化成看 `message` 文案：命中
     `_GONE_HINTS`（不存在/已失效等）判 INVALID，命中 `_PASSWORD_HINTS`
-    （提取码/密码）判 NEED_PASSWORD。其余情况看不懂，返回 `None` 交给骨架
-    归到 ERROR。
+    （提取码/密码）或 `_MALFORMED_PWD_HINTS` 判 NEED_PASSWORD，命中
+    `_MALFORMED_KEY_HINTS` 判 UNSUPPORTED。其余情况看不懂，返回 `None`
+    交给骨架归到 ERROR。
 
     Args:
         payload: 接口返回的 JSON 响应体。
@@ -62,6 +80,10 @@ def classify(payload: dict[str, Any], http_code: int) -> CheckOutcome | None:
         return CheckOutcome(CheckStatus.INVALID, http_code, message)
     if any(hint in message for hint in _PASSWORD_HINTS):
         return CheckOutcome(CheckStatus.NEED_PASSWORD, http_code, message)
+    if any(hint in message for hint in _MALFORMED_PWD_HINTS):
+        return CheckOutcome(CheckStatus.NEED_PASSWORD, http_code, message)
+    if any(hint in message for hint in _MALFORMED_KEY_HINTS):
+        return CheckOutcome(CheckStatus.UNSUPPORTED, http_code, message)
     return None
 
 

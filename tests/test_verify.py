@@ -127,6 +127,19 @@ class TestAlipanClassify:
         outcome = alipan_classify({"has_pwd": True, "share_name": "示例"}, 200)
         assert outcome.status is CheckStatus.NEED_PASSWORD
 
+    def test_a_forbidden_share_is_invalid_not_error(self) -> None:
+        """被封掉的分享要判失效 —— 归 ERROR 就是每 6 小时白探一次、永远探。
+
+        生产库里 `ShareLink.Forbidden` 攒了 17374 条探测历史、只对应 2984 个
+        去重 share_id，占阿里全部调用的 35%，而阿里是整个 verify 的闸门。
+        """
+        forbidden = alipan_classify(
+            {"code": "ShareLink.Forbidden", "message": "share_link is forbidden"}, 403
+        )
+        content = alipan_classify({"code": "ShareLink.ContentInvalid"}, 403)
+        assert forbidden.status is CheckStatus.INVALID
+        assert content.status is CheckStatus.INVALID
+
     def test_unknown_code_returns_none(self) -> None:
         assert alipan_classify({"code": "SomeNewError"}, 400) is None
 
@@ -152,6 +165,17 @@ class TestPan123Classify:
         missing = pan123_classify({"code": 5103, "message": "此分享不存在"}, 200)
         assert password.status is CheckStatus.NEED_PASSWORD
         assert missing.status is CheckStatus.INVALID
+
+    def test_a_malformed_request_is_not_retried_forever(self) -> None:
+        """接口嫌请求本身不成立时别归 ERROR —— 那会按退避无限重试。
+
+        分享码格式都不对的，再探一万次也还是这个回答，归 UNSUPPORTED（不再
+        排队）；坏的只是提取码的，归 NEED_PASSWORD（等人工补码，同样不复查）。
+        """
+        bad_key = pan123_classify({"code": 400, "message": "ShareKey格式异常"}, 200)
+        bad_pwd = pan123_classify({"code": 400, "message": "SharePwd最大为4位"}, 200)
+        assert bad_key.status is CheckStatus.UNSUPPORTED
+        assert bad_pwd.status is CheckStatus.NEED_PASSWORD
 
 
 class TestCTFileClassify:
