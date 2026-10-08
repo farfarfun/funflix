@@ -52,6 +52,7 @@ from funflix.services.counters import (
     refresh_media_counters,
     refresh_work_counters,
 )
+from funflix.services.extract.llm.client import LLMResult
 from funflix.services.text.normalize import series_norm_key
 
 #: 给每行夹具造一个独占的「旧归属」Work，norm_key 必须互不相同（它是唯一键）。
@@ -1249,6 +1250,182 @@ class TestPersistUnderConcurrentInserts:
         await resolver_mod._persist(session, self._decisions("甲", "乙", "丙", "丁", "戊"), "m")
 
         assert sizes == [2, 2, 1]
+
+
+class TestClassifyPersistsAsItGoes:
+    """阶段 2 边调边落。
+
+    这一阶段是整轮里最长的一截（生产库上 200 包跑了 57 分钟），而 job 的
+    `timeout-minutes` 是硬墙。攒到最后一次性落库的话，到点被砍就是一小时的
+    调用全烧掉、下一轮还得重新买一遍 —— 所以"已经调回来的必须已经在库里"
+    是这一阶段的正确性要求，不是优化。
+    """
+
+    TITLES = ("甲子风云录", "乙未山河志", "丙辰星辰纪")
+
+    class _StubClassifier:
+        """按 user message 里出现的标题应答，第 `boom_at` 次调用硬崩。
+
+        崩的是 `RuntimeError` 而不是 `LLMCallError` —— 后者 `_classify_pack`
+        自己会吞掉并计入 `classify_calls_failed`，模拟不出"被外力打断"。
+        """
+
+        model = "stub-model"
+
+        def __init__(self, titles: tuple[str, ...], *, boom_at: int) -> None:
+            self._titles = titles
+            self._boom_at = boom_at
+            self.calls = 0
+
+        async def extract(self, system: str, user: str):
+            self.calls += 1
+            # 必须真的让出一次事件循环。真实客户端在这里等网络 I/O，落库任务
+            # 就是趁这个空档跑的；桩里不让出的话三次调用会一口气跑完，
+            # 测出来的交错是假的（而且是偏乐观的那种假）。
+            await asyncio.sleep(0)
+            if self.calls == self._boom_at:
+                raise RuntimeError("被外力打断")
+            keys = [series_norm_key(t) for t in self._titles if series_norm_key(t) in user]
+            return LLMResult(
+                payload={
+                    "decisions": [
+                        {
+                            "key": k,
+                            "media_type": "tv",
+                            "year": None,
+                            "is_junk": False,
+                            "confidence": 0.9,
+                        }
+                        for k in keys
+                    ]
+                },
+                model=self.model,
+                input_tokens=10,
+                output_tokens=5,
+                latency_ms=1,
+            )
+
+    @pytest.mark.asyncio
+    async def test_earlier_packs_are_already_in_the_db_when_a_later_one_dies(
+        self, session, monkeypatch
+    ) -> None:
+        """第 3 包崩掉，前 2 包的裁决必须已经落库。
+
+        改回"攒到最后一次性落库"的话这里会查到 0 行 —— 异常把整轮带走了。
+        """
+        # 一包一个键、落一个键就提交一次，这样三包之间一定有两次落库机会。
+        monkeypatch.setattr(resolver_mod, "MAX_ENTRIES_PER_CALL", 1)
+        monkeypatch.setattr(resolver_mod, "PERSIST_CHUNK_SIZE", 1)
+
+        # 资源数倒序给，`_singles_pending` 按规模排序，包的顺序才是确定的。
+        for title, count in zip(self.TITLES, (30, 20, 10), strict=True):
+            session.add(_media(title, resource_count=count))
+        await session.commit()
+
+        client = self._StubClassifier(self.TITLES, boom_at=3)
+        with pytest.raises(RuntimeError, match="被外力打断"):
+            await resolver_mod.resolve_canon(
+                session,
+                dry_run=False,
+                limit=0,
+                classify_limit=3,
+                concurrency=1,
+                call_interval=0,
+                client=client,
+            )
+
+        decided = set(
+            await session.scalars(
+                select(TitleCanon.norm_key).where(TitleCanon.status == CanonState.DECIDED)
+            )
+        )
+        assert decided == {series_norm_key(t) for t in self.TITLES[:2]}
+
+    @pytest.mark.asyncio
+    async def test_a_commit_happens_before_the_last_call_is_made(
+        self, session, monkeypatch
+    ) -> None:
+        """**最重要的一条**：落库和调用必须交错。
+
+        上面那条测的是"抛异常时还能优雅收尾"，靠的是 `finally` 里的收工信号 ——
+        改回"攒到最后一次性落库"它照样能过。可生产上真正的威胁是
+        `timeout-minutes` 到点 **SIGKILL**，那时候 `finally` 一行都不跑，能
+        保命的只有"已经提交过的段"。所以这里直接断言事件序列是交错的：
+        最后一次调用发出之前，库里就必须已经有提交过的裁决了。
+        """
+        monkeypatch.setattr(resolver_mod, "MAX_ENTRIES_PER_CALL", 1)
+        monkeypatch.setattr(resolver_mod, "PERSIST_CHUNK_SIZE", 1)
+
+        events: list[str] = []
+        real_persist = resolver_mod._persist_chunk
+
+        async def spy(sess, chunk, model, prompt_version):
+            # 记的是**开始**落库的时刻。记完成时刻量不出东西：commit 里有好几个
+            # await，桩的「调用」是瞬时的，正好全挤进这个空档。
+            events.append(f"落库{len(chunk)}")
+            return await real_persist(sess, chunk, model, prompt_version)
+
+        monkeypatch.setattr(resolver_mod, "_persist_chunk", spy)
+
+        for title, count in zip(self.TITLES, (30, 20, 10), strict=True):
+            session.add(_media(title, resource_count=count))
+        await session.commit()
+
+        client = self._StubClassifier(self.TITLES, boom_at=0)
+        real_extract = client.extract
+
+        async def watched(system: str, user: str):
+            events.append("调用")
+            return await real_extract(system, user)
+
+        client.extract = watched  # type: ignore[method-assign]
+
+        await resolver_mod.resolve_canon(
+            session,
+            dry_run=False,
+            limit=0,
+            classify_limit=3,
+            concurrency=1,
+            call_interval=0,
+            client=client,
+        )
+
+        assert events.count("调用") == 3
+        assert events.count("落库1") == 3
+        # 最后一次调用发出之前就已经提交过 —— 这一条才是 SIGKILL 下保命的东西。
+        # 改回"攒到最后一次性落库"的话，所有「落库」都排在所有「调用」后面。
+        first_persist = events.index("落库1")
+        last_call = len(events) - 1 - events[::-1].index("调用")
+        assert first_persist < last_call, events
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_still_lands_everything(self, session, monkeypatch) -> None:
+        """没人打断时结果不变 —— 边调边落不能漏掉最后那不满一段的尾巴。"""
+        monkeypatch.setattr(resolver_mod, "MAX_ENTRIES_PER_CALL", 1)
+        monkeypatch.setattr(resolver_mod, "PERSIST_CHUNK_SIZE", 2)
+
+        for title, count in zip(self.TITLES, (30, 20, 10), strict=True):
+            session.add(_media(title, resource_count=count))
+        await session.commit()
+
+        report = await resolver_mod.resolve_canon(
+            session,
+            dry_run=False,
+            limit=0,
+            classify_limit=3,
+            concurrency=1,
+            call_interval=0,
+            client=self._StubClassifier(self.TITLES, boom_at=0),
+        )
+
+        # 3 条裁决、刷了两次（2 + 1），尾巴那一条也在。
+        assert report.classified == 3
+        decided = set(
+            await session.scalars(
+                select(TitleCanon.norm_key).where(TitleCanon.status == CanonState.DECIDED)
+            )
+        )
+        assert decided == {series_norm_key(t) for t in self.TITLES}
 
 
 def _canon(key: str, **kw) -> TitleCanon:

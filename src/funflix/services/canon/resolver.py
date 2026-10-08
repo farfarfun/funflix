@@ -728,10 +728,13 @@ async def resolve_canon(
         call_interval: 两次调用起跑时刻的最小间隔（秒），0 表示不节流。
         client: 注入用，测试传桩，**两个阶段共用它**。默认按 funsecret 的配置
             各构造一个 —— 两阶段的 `tool_schema` 不同，而它是构造时绑定的。
-        on_progress: 每个阶段落库后调一次，入参是累计已裁决的 key 数。
+        on_progress: 每次落库后调一次，入参是累计已裁决的 key 数。阶段 1 一轮
+            只落一次所以只调一次，阶段 2 是边调边落、会调很多次。
 
     可中断续跑：已经是 `decided` 的 key 会被跳过，块里全部 key 都裁决过的块
-    整块跳过。所以中断后重跑只打残局，不重复付费。
+    整块跳过。所以中断后重跑只打残局，不重复付费。阶段 2 还是**边调边落**的
+    （见下面那段注释），所以连「跑到一半被 job 超时砍掉」都只丢最后不到
+    `PERSIST_CHUNK_SIZE` 条，而不是丢掉整轮。
     """
     report = ResolveReport(dry_run=dry_run)
 
@@ -820,19 +823,58 @@ async def resolve_canon(
             tool_schema=prompts.CLASSIFY_TOOL_SCHEMA, tool_name=prompts.CLASSIFY_TOOL_NAME
         )
 
-        async def classify(pack: list[CanonEntry]) -> list[CanonDecision]:
-            async with gate:
-                return await _classify_pack(classify_client, pack, report, pacer)
+        # 这一阶段**边调边落**，不像阶段 1 那样等 gather 全完才落库。理由是时间：
+        # 一包一次调用要一分多钟，`classify_limit` 一上去这一步就是整轮里最长的
+        # 一截（200 包跑了 57 分钟），而 job 的 `timeout-minutes` 是硬墙。攒到
+        # 最后一次性落库的话，到点被砍就是一小时的调用全白烧，而且下一轮还得
+        # 重新买一遍。改成每攒够 `PERSIST_CHUNK_SIZE` 条就提交一段之后，被砍
+        # 最多只丢最后那不到一段。
+        #
+        # 并发调用和落库共用这一个 session，而异步 session 不是并发安全的 ——
+        # 所以落库只在下面这一个 `persist_landed` 任务里做，调用任务只往队列里
+        # 丢结果，谁都不碰 session。
+        landed: asyncio.Queue[list[CanonDecision] | None] = asyncio.Queue()
 
-        packed = await asyncio.gather(*(classify(pack) for pack in packs))
+        async def classify(pack: list[CanonEntry]) -> None:
+            decisions: list[CanonDecision] = []
+            try:
+                async with gate:
+                    decisions = await _classify_pack(classify_client, pack, report, pacer)
+            finally:
+                # 放在 finally 里：这一包抛了异常也得让落库任务收到一条，
+                # 不然它会一直等在队列上。
+                await landed.put(decisions)
 
-        typed = [d for result in packed for d in result]
-        classified, junk = await _persist(
-            session, typed, classify_client.model, CANON_CLASSIFY_PROMPT_VERSION
-        )
-        report.classified = classified
-        report.classify_junk = junk
-        if on_progress is not None:
-            on_progress(report.decided + classified)
+        async def persist_landed() -> None:
+            buffered: list[CanonDecision] = []
+
+            async def flush() -> None:
+                if not buffered:
+                    return
+                count, junk = await _persist(
+                    session, buffered, classify_client.model, CANON_CLASSIFY_PROMPT_VERSION
+                )
+                report.classified += count
+                report.classify_junk += junk
+                buffered.clear()
+                if on_progress is not None:
+                    on_progress(report.decided + report.classified)
+
+            while True:
+                item = await landed.get()
+                if item is None:
+                    break
+                buffered.extend(item)
+                if len(buffered) >= PERSIST_CHUNK_SIZE:
+                    await flush()
+            await flush()
+
+        persister = asyncio.create_task(persist_landed())
+        try:
+            await asyncio.gather(*(classify(pack) for pack in packs))
+        finally:
+            # 收工信号也放 finally：上面抛了异常，已经调回来的那些结果仍然该落库。
+            await landed.put(None)
+            await persister
 
     return report
