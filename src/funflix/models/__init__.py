@@ -9,6 +9,7 @@ from funflix.models.base import Base, TimestampMixin, UTCDateTime, utcnow
 from funflix.models.canon import CANON_PROMPT_VERSION, CanonState, TitleCanon
 from funflix.models.check import LinkCheck
 from funflix.models.extraction import Extraction
+from funflix.models.invite import InviteCode
 from funflix.models.media import NO_SEASON, UNKNOWN_YEAR, Media
 from funflix.models.raw import RawDocument
 from funflix.models.repair import (
@@ -30,6 +31,7 @@ __all__ = [
     "Base",
     "CanonState",
     "Extraction",
+    "InviteCode",
     "LinkCheck",
     "Media",
     "RawDocument",

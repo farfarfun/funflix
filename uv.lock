@@ -604,6 +604,18 @@ wheels = [
 ]
 
 [[package]]
+name = "funauth"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "bcrypt" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/64/d4ef82bef96d3809714db25537b87ed9a2f035ab8863319aa8b174cd7a18/funauth-0.1.1-py3-none-any.whl", hash = "sha256:d50fd3f071877b7872dd79a8237c78fcfa720ccc1812b11ba8fbe60318cc1a4c", size = 18667, upload-time = "2026-10-09T03:14:04.971Z" },
+]
+
+[[package]]
 name = "fundrive"
 version = "2.0.89"
 source = { registry = "https://pypi.org/simple" }
@@ -640,8 +652,8 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "alembic" },
     { name = "asyncpg" },
-    { name = "bcrypt" },
     { name = "farlog" },
+    { name = "funauth" },
     { name = "funsecret" },
     { name = "funworker" },
     { name = "httpx" },
@@ -677,8 +689,8 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "alembic", specifier = ">=1.13" },
     { name = "asyncpg", specifier = ">=0.29" },
-    { name = "bcrypt", specifier = ">=4.0" },
     { name = "farlog", specifier = ">=1.1.8" },
+    { name = "funauth", specifier = ">=0.1.1" },
     { name = "fundrive", marker = "extra == 'drives'", specifier = ">=2.0.85" },
     { name = "funsecret", specifier = ">=1.4.96" },
     { name = "funworker", specifier = ">=0.1.5" },

@@ -34,6 +34,7 @@ db_app = typer.Typer(help="数据库迁移与检查", no_args_is_help=True)
 source_app = typer.Typer(help="采集源管理与采集", no_args_is_help=True)
 sync_app = typer.Typer(help="本地库与远端库同步（自建 self-hosted runner）", no_args_is_help=True)
 user_app = typer.Typer(help="登录账号管理", no_args_is_help=True)
+invite_app = typer.Typer(help="注册邀请码管理", no_args_is_help=True)
 canon_app = typer.Typer(help="搜索结果归一（Work 实体 + 季子层）", no_args_is_help=True)
 repair_app = typer.Typer(help="持续修复（规则更新后把旧数据刷对）", no_args_is_help=True)
 app.add_typer(db_app, name="db")
@@ -42,6 +43,7 @@ app.add_typer(repair_app, name="repair")
 app.add_typer(source_app, name="source")
 app.add_typer(sync_app, name="sync")
 app.add_typer(user_app, name="user")
+app.add_typer(invite_app, name="invite")
 
 
 def _version_callback(value: bool) -> None:
@@ -1144,29 +1146,38 @@ def user_create(
         str | None,
         typer.Option("--password", help="不给的话会交互式输入（不回显）"),
     ] = None,
+    role: Annotated[
+        str,
+        typer.Option("--role", help="admin（能进运维区）或 guest（只能看站）"),
+    ] = "admin",
 ) -> None:
-    """创建一个「运维」区登录账号。"""
-    from sqlalchemy import select
+    """创建一个登录账号。
+
+    默认建 `admin` —— 这条命令一直就是建运维账号用的，默认值保持它原来的含义。
+    `guest` 正常由自助注册（凭邀请码）产生，手工建一个一般只为补发口令。
+    """
+    from funauth import UsernameTaken, UserRole
 
     from funflix.base.db import session_scope
-    from funflix.models import User
-    from funflix.security import hash_password
+    from funflix.services.account import accounts
+
+    try:
+        parsed_role = UserRole(role)
+    except ValueError:
+        _fail(f"角色只能是 admin 或 guest：{role}")
 
     if password is None:
         password = typer.prompt("密码", hide_input=True, confirmation_prompt=True)
 
-    async def _do() -> bool:
+    async def _do() -> None:
         async with session_scope() as session:
-            existing = await session.scalar(select(User).where(User.username == username))
-            if existing is not None:
-                return False
-            session.add(User(username=username, password_hash=hash_password(password)))
-            await session.commit()
-            return True
+            await accounts.create_user(session, username, password, parsed_role)
 
-    if not _run(_do):
-        _fail(f"用户名已存在：{username}")
-    _ok(f"已创建用户 {username}")
+    try:
+        _run(_do)
+    except UsernameTaken as err:
+        _fail(str(err))
+    _ok(f"已创建用户 {username}（{parsed_role.value}）")
 
 
 @user_app.command("set-password")
@@ -1178,23 +1189,15 @@ def user_set_password(
     ] = None,
 ) -> None:
     """重置某个账号的密码。"""
-    from sqlalchemy import select
-
     from funflix.base.db import session_scope
-    from funflix.models import User
-    from funflix.security import hash_password
+    from funflix.services.account import accounts
 
     if password is None:
         password = typer.prompt("新密码", hide_input=True, confirmation_prompt=True)
 
     async def _do() -> bool:
         async with session_scope() as session:
-            user = await session.scalar(select(User).where(User.username == username))
-            if user is None:
-                return False
-            user.password_hash = hash_password(password)
-            await session.commit()
-            return True
+            return await accounts.set_password(session, username, password)
 
     if not _run(_do):
         _fail(f"用户不存在：{username}")
@@ -1204,39 +1207,34 @@ def user_set_password(
 @user_app.command("list")
 def user_list() -> None:
     """列出全部账号。"""
-    from sqlalchemy import select
-
     from funflix.base.db import session_scope
     from funflix.models import User
+    from funflix.services.account import accounts
 
     async def _do() -> list[User]:
         async with session_scope() as session:
-            return list(await session.scalars(select(User).order_by(User.username)))
+            return await accounts.list_users(session)
 
     users = _run(_do)
     if not users:
         typer.echo("暂无账号")
         return
     _table(
-        [[u.username, "启用" if u.is_active else "已停用", u.created_at] for u in users],
-        ["用户名", "状态", "创建时间"],
+        [
+            [u.username, u.role.value, "启用" if u.is_active else "已停用", u.created_at]
+            for u in users
+        ],
+        ["用户名", "角色", "状态", "创建时间"],
     )
 
 
 def _set_active(username: str, *, active: bool) -> None:
-    from sqlalchemy import select
-
     from funflix.base.db import session_scope
-    from funflix.models import User
+    from funflix.services.account import accounts
 
     async def _do() -> bool:
         async with session_scope() as session:
-            user = await session.scalar(select(User).where(User.username == username))
-            if user is None:
-                return False
-            user.is_active = active
-            await session.commit()
-            return True
+            return await accounts.set_active(session, username, active)
 
     if not _run(_do):
         _fail(f"用户不存在：{username}")
@@ -1253,6 +1251,88 @@ def user_enable(username: Annotated[str, typer.Argument(help="登录用户名")]
 def user_disable(username: Annotated[str, typer.Argument(help="登录用户名")]) -> None:
     """停用一个账号（保留记录，只是不能再登录）。"""
     _set_active(username, active=False)
+
+
+# --- invite --------------------------------------------------------------------
+
+
+@invite_app.command("create")
+def invite_create(
+    uses: Annotated[int, typer.Option("--uses", help="这张码总共能换出几个账号")] = 1,
+    days: Annotated[
+        int | None,
+        typer.Option("--days", help="多少天后过期；不给则永不过期"),
+    ] = None,
+    note: Annotated[str | None, typer.Option("--note", help="备注，自己记这张给谁的")] = None,
+) -> None:
+    """签发一张注册邀请码。
+
+    注册出来的账号一律是 `guest`（只能看站，进不了运维区），所以这张码即使外传，
+    最坏结果也只是多几个看站的人。
+    """
+    from funflix.base.db import session_scope
+    from funflix.models import InviteCode
+    from funflix.services.account import accounts
+
+    if uses < 1:
+        _fail(f"可用次数至少是 1：{uses}")
+    if days is not None and days < 1:
+        _fail(f"有效天数至少是 1：{days}")
+
+    async def _do() -> InviteCode:
+        async with session_scope() as session:
+            return await accounts.issue_invite(
+                session, max_uses=uses, expires_in_days=days, note=note
+            )
+
+    code = _run(_do)
+    expiry = "永不过期" if code.expires_at is None else f"{days} 天后过期"
+    _ok(f"已创建邀请码 {code.code}（{uses} 次 / {expiry}）")
+
+
+@invite_app.command("list")
+def invite_list() -> None:
+    """列出全部邀请码及其当前状态。"""
+    from funflix.base.db import session_scope
+    from funflix.models import InviteCode
+    from funflix.services.account import accounts
+
+    async def _do() -> list[InviteCode]:
+        async with session_scope() as session:
+            return await accounts.list_invites(session)
+
+    codes = _run(_do)
+    if not codes:
+        typer.echo("暂无邀请码")
+        return
+    _table(
+        [
+            [
+                c.code,
+                f"{c.used_count}/{c.max_uses}",
+                accounts.describe_invite_status(c),
+                c.expires_at or "—",
+                c.note or "—",
+            ]
+            for c in codes
+        ],
+        ["码", "已用/总数", "状态", "过期时间", "备注"],
+    )
+
+
+@invite_app.command("revoke")
+def invite_revoke(code: Annotated[str, typer.Argument(help="要吊销的邀请码")]) -> None:
+    """吊销一张邀请码（保留记录，只是换不出账号了）。"""
+    from funflix.base.db import session_scope
+    from funflix.services.account import accounts
+
+    async def _do() -> bool:
+        async with session_scope() as session:
+            return await accounts.revoke_invite(session, code)
+
+    if not _run(_do):
+        _fail(f"邀请码不存在：{code}")
+    _ok(f"已吊销邀请码 {code}")
 
 
 # --- sync ----------------------------------------------------------------------

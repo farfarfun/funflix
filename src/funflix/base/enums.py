@@ -134,3 +134,9 @@ class CheckStatus(StrEnum):
     RATE_LIMITED = "rate_limited"
     UNSUPPORTED = "unsupported"
     ERROR = "error"
+
+
+# 账号角色 `UserRole` 不在这里 —— 它和登录逻辑一起住在 funauth，`from funauth
+# import UserRole`。本文件只放本仓业务自己的枚举，角色的取值要和 funauth 里的
+# 判定（`Accounts.require_role`）、以及 `User.role` 列的 `enum_col` 对上，复制
+# 一份过来迟早分叉。

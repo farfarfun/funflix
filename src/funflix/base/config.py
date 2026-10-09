@@ -153,9 +153,12 @@ class Settings(BaseSettings):
     #: 会导致没走 HTTPS 的场景下 cookie 直接发不出去、登录了也白登录。
     #: 确认部署链路全程 HTTPS 后，生产可显式配置 FUNFLIX_SESSION_COOKIE_SECURE=true。
     session_cookie_secure: bool = False
-    #: 注册入口默认关闭——账号应由运营在服务端用 `funflix user create` 创建，
-    #: 避免部署到公网后任何人都能自己注册一个「运维」账号。
-    registration_enabled: bool = False
+    #: 注册入口默认开启——真正的闸门是邀请码（`invite_code` 表），注册出来的
+    #: 账号一律是 `guest`、碰不到运维区，而且表里没签发过码时谁都注册不了。
+    #: 从前默认关闭是因为那时注册出来的就是「运维」账号，公网上谁都能自己开一个；
+    #: 现在那个风险不存在了，再默认关着只会让拿着有效邀请码的人吃 403，
+    #: 还得先去设一个环境变量。真要彻底焊死注册入口才配 false。
+    registration_enabled: bool = True
 
     # --- 后台 worker（见 docs/DESIGN.md §5）---
     #: API 进程内是否顺带跑后台 worker。

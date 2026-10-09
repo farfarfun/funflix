@@ -1,34 +1,30 @@
 """登录账号。
 
-只支撑「运维」区的登录态，不是面向读者的用户体系——没有邮箱、找回密码、
-角色分级这些字段，需要时再加。
+列定义全部来自 `funauth.UserMixin`，这里只负责把它落成本仓 `Base` 上的一张
+具体表。角色两级：`GUEST` 能进站看内容，`ADMIN` 额外能进「运维」区。
+
+唯一约束刻意留在本仓而不是 mixin 里 —— 约束名会进迁移、进 `ON CONFLICT`，
+已经建好的生产库里那个名字是什么样就得是什么样，不能由 funauth 的版本决定。
 """
 
 from __future__ import annotations
 
-import uuid
-
 import sqlalchemy as sa
-from sqlalchemy.orm import Mapped, mapped_column
+from funauth import UserMixin
 
-from funflix.models.base import Base, PkType, TimestampMixin, uuid7
+from funflix.models.base import Base, TimestampMixin
 
 
-class User(TimestampMixin, Base):
-    """运维区的登录账号：用户名 + bcrypt 密码哈希 + 启用标记。
+class User(UserMixin, TimestampMixin, Base):
+    """登录账号：用户名 + bcrypt 密码哈希 + 角色 + 启用标记。
 
-    不存明文密码，也不做可逆加密。停用走 `is_active` 而不是删除行，避免
-    session 里的 user_id 变成悬空引用后又被新账号复用。
+    用本仓的 `TimestampMixin` 而不是 funauth 自带的那份：两边 DDL 一致（都是
+    `DateTime(timezone=True)`），但本仓所有表的时间列应当来自同一处定义。
+
+    字段语义见 `funauth.UserMixin`；对这张表的全部操作走
+    `funflix.services.account.accounts`。
     """
 
     __tablename__ = "user"
-
-    id: Mapped[uuid.UUID] = mapped_column(PkType, primary_key=True, default=uuid7)
-    username: Mapped[str] = mapped_column(sa.String(64), nullable=False)
-    #: bcrypt 哈希（含盐），不存明文，也不用可逆加密
-    password_hash: Mapped[str] = mapped_column(sa.String(128), nullable=False)
-    #: 停用而不是删除：保留创建/修改记录，且不会让 session 里存的 user_id 变成
-    #: 悬空引用后又被别的新账号复用
-    is_active: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=True)
 
     __table_args__ = (sa.UniqueConstraint("username", name="uq_user_username"),)
