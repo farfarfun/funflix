@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funflix"
-version = "1.0.31"
+version = "1.0.32"
 description = "影视资源分享文本的结构化采集、解析与网盘链接校验"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -40,7 +40,7 @@ dependencies = [
 
     # 登录 / 角色 / 邀请码注册的全部实现。本仓只在 models 里把它的 mixin 落成
     # 具体表、在 services/account.py 里绑一个实例，bcrypt 也由它带进来。
-    "funauth>=0.2.1",
+    "funauth>=0.2.2",
 ]
 license-files = ["LICENSE"]
 
