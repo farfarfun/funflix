@@ -617,7 +617,7 @@ wheels = [
 
 [[package]]
 name = "fundrive"
-version = "2.0.89"
+version = "2.0.91"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "farlog" },
@@ -629,7 +629,7 @@ dependencies = [
     { name = "urllib3" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/35/1dc61d964d189e8d76bf032dd809a444135bc6a664d13ea0c727bb4b751d/fundrive-2.0.89-py3-none-any.whl", hash = "sha256:00ac713b356586d432dba9ce6ba0d501744e799468e8b2c0d8912e9a5d8b4e2c", size = 291007, upload-time = "2026-10-02T12:23:23.847Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/cb/47e44116de50c78f3db9ef77def5f34749d4eb5b9304ff02b01527379a70/fundrive-2.0.91-py3-none-any.whl", hash = "sha256:927523294bb16f19969ce4bf23e8a65b31df6a27213ee73a440ab354ba4a36ba", size = 302499, upload-time = "2026-10-10T03:38:47.545Z" },
 ]
 
 [[package]]
@@ -646,7 +646,7 @@ wheels = [
 
 [[package]]
 name = "funflix"
-version = "1.0.33"
+version = "1.0.34"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
