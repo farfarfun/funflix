@@ -162,7 +162,11 @@ class TestDialectDispatch:
 @pytest.mark.asyncio
 class TestTrgmSearch:
     async def test_finds_by_substring(self, pg_session) -> None:
-        await _seed(pg_session)
+        works = await _seed(pg_session)
+        # 必须真的挂上资源：空壳作品默认不进结果（见 `SearchQuery.include_empty`），
+        # 不挂的话这条用例会在「关键词没匹配上」和「被空壳过滤挡掉」之间分辨不出来。
+        await _add_season(pg_session, works[0], season=1)
+        await _add_season(pg_session, works[2], season=1)
         rows = await PgTrgmSearchBackend().search(pg_session, SearchQuery(keyword="误杀"))
         assert {w.title for w in rows} == {"误杀2", "误杀瞒天记"}
 
@@ -170,8 +174,13 @@ class TestTrgmSearch:
         """count 与 search 是两条独立语句，过滤条件必须一致。
 
         不一致的话 total 和实际能翻到的行数对不上，前端翻页器会指向空页。
+
+        三部都挂上资源，否则空壳过滤会把结果清成 0 —— 两边都是 0 照样"一致"，
+        这条用例就验不到任何东西了。
         """
-        await _seed(pg_session)
+        works = await _seed(pg_session)
+        for work in works:
+            await _add_season(pg_session, work, season=1)
         backend = PgTrgmSearchBackend()
         for keyword in ["误杀", "流浪", "不存在的剧", ""]:
             query = SearchQuery(keyword=keyword, limit=100)
@@ -201,6 +210,9 @@ class TestTrgmSearch:
         works = await _seed(pg_session)
         for season in (1, 2, 3):
             await _add_season(pg_session, works[0], season=season)
+        # 《误杀瞒天记》也要有资源，否则它作为空壳被默认过滤掉，这条用例就只剩
+        # 一行结果，"一部剧只占一行"也就无从验证了。
+        await _add_season(pg_session, works[2], season=1)
 
         backend = PgTrgmSearchBackend()
         query = SearchQuery(keyword="误杀", limit=100)
@@ -273,29 +285,90 @@ class TestResourceFiltersCrossSeasons:
 
 
 @pytest.mark.asyncio
+class TestEmptyWorksAreHiddenByDefault:
+    """空壳作品（一条资源都没有）**默认**就不进结果，不需要带任何筛选参数。
+
+    这是线上报出来的问题：界面上一大片「0 条资源」，点进去什么都没有。
+    `db prune-works` 会删它们，但空壳是流水线持续产出的中间态（资源被清理 /
+    季被搬走 / 作品被合并），两次清理之间照样会攒出一批 —— 所以搜索层必须自己拦。
+
+    和 `valid_only` 是两件事：那个要求「有一条**校验通过**的资源」，这个只要求
+    「有资源」。一条还没校验的链接对使用者仍然可能有用，不该被藏起来。
+    """
+
+    async def test_bare_work_is_invisible(self, pg_session) -> None:
+        await _seed(pg_session)
+        backend = PgTrgmSearchBackend()
+        query = SearchQuery(keyword="误杀", limit=100)
+        assert await backend.search(pg_session, query) == []
+        assert await backend.count(pg_session, query) == 0, "count 必须和 search 用同一套过滤"
+
+    async def test_unchecked_resource_is_enough(self, pg_session) -> None:
+        """只要有资源就可见，不要求校验通过 —— 否则等于偷偷打开了 valid_only。"""
+        works = await _seed(pg_session)
+        await _add_season(pg_session, works[0], season=1, check_status=CheckStatus.UNCHECKED)
+
+        backend = PgTrgmSearchBackend()
+        query = SearchQuery(keyword="误杀", limit=100)
+        assert [w.title for w in await backend.search(pg_session, query)] == ["误杀2"]
+        assert await backend.count(pg_session, query) == 1
+
+    async def test_include_empty_brings_them_back(self, pg_session) -> None:
+        """运维要看清理前的全量时还能拿到。"""
+        await _seed(pg_session)
+        backend = PgTrgmSearchBackend()
+        query = SearchQuery(keyword="误杀", include_empty=True, limit=100)
+        assert {w.title for w in await backend.search(pg_session, query)} == {"误杀2", "误杀瞒天记"}
+        assert await backend.count(pg_session, query) == 2
+
+    async def test_a_season_without_resources_does_not_count(self, pg_session) -> None:
+        """挂着季但季上没有资源，照样是空壳。
+
+        这正是 `db prune-works` 以前收不干净的那一类：`NOT EXISTS media` 判它
+        不空，于是它留在库里继续显示成「0 条资源」。
+        """
+        works = await _seed(pg_session)
+        pg_session.add(
+            Media(
+                title="误杀2 第1季",
+                norm_key="误杀2-1",
+                media_type=works[0].media_type,
+                year=works[0].year,
+                aliases=[],
+                work_id=works[0].id,
+                season=1,
+            )
+        )
+        await pg_session.commit()
+
+        backend = PgTrgmSearchBackend()
+        assert await backend.count(pg_session, SearchQuery(keyword="误杀2", limit=100)) == 0
+
+
+@pytest.mark.asyncio
 class TestNonVideoIsHiddenByDefault:
     """小说/漫画默认不进搜索结果，显式传 `media_type` 才看得到。"""
 
     async def test_book_is_excluded_unless_asked_for(self, pg_session) -> None:
-        pg_session.add_all(
-            [
-                Work(
-                    title="大主宰",
-                    norm_key="大主宰",
-                    media_type=MediaType.ANIME,
-                    year=2023,
-                    aliases=[],
-                ),
-                Work(
-                    title="大主宰（小说）",
-                    norm_key="大主宰小说",
-                    media_type=MediaType.BOOK,
-                    year=0,
-                    aliases=[],
-                ),
-            ]
+        anime = Work(
+            title="大主宰",
+            norm_key="大主宰",
+            media_type=MediaType.ANIME,
+            year=2023,
+            aliases=[],
         )
+        book = Work(
+            title="大主宰（小说）",
+            norm_key="大主宰小说",
+            media_type=MediaType.BOOK,
+            year=0,
+            aliases=[],
+        )
+        pg_session.add_all([anime, book])
         await pg_session.commit()
+        # 两部都挂资源：这条用例验的是类型可见性，不该被空壳过滤顺带藏掉。
+        await _add_season(pg_session, anime, season=1)
+        await _add_season(pg_session, book, season=1)
 
         backend = PgTrgmSearchBackend()
         default = await backend.search(pg_session, SearchQuery(keyword="大主宰", limit=100))
@@ -311,16 +384,17 @@ class TestNonVideoIsHiddenByDefault:
 
         生产库里 40 多万部作品是这个值，把它当非影视排掉等于把它们整体藏起来。
         """
-        pg_session.add(
-            Work(
-                title="某部没判出类型的剧",
-                norm_key="某部没判出类型的剧",
-                media_type=MediaType.UNKNOWN,
-                year=0,
-                aliases=[],
-            )
+        work = Work(
+            title="某部没判出类型的剧",
+            norm_key="某部没判出类型的剧",
+            media_type=MediaType.UNKNOWN,
+            year=0,
+            aliases=[],
         )
+        pg_session.add(work)
         await pg_session.commit()
+        # 挂上资源，否则它会因为「空壳」而不可见，验不到「类型未知仍可见」。
+        await _add_season(pg_session, work, season=1)
 
         rows = await PgTrgmSearchBackend().search(
             pg_session, SearchQuery(keyword="没判出类型", limit=100)

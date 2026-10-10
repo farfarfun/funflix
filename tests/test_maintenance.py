@@ -34,6 +34,8 @@ from funflix.services.maintenance import (
     PRUNE_MIN_AGE,
     cleanup_resources,
     data_tables,
+    prune_empty_media,
+    prune_empty_shells,
     prune_empty_works,
     recount_tags,
     relink_checks,
@@ -716,13 +718,182 @@ class TestRelinkChecks:
         assert len(remaining) == 2, "第一批已经提交，不该被第二批的异常带走"
 
 
+class TestPruneEmptyMedia:
+    """空壳季（没有任何 resource 关联）要删掉。
+
+    这是空壳链条的上游，也是「作品级清理收不干净」的原因：一部作品挂着几个零
+    资源的季时，`prune_empty_works` 的 `NOT EXISTS media` 判它不空，于是它留在
+    库里继续在界面上显示成一行「0 条资源」。
+
+    `refresh_media_counters` 顺手删零资源季只覆盖**它被调到的那一批**
+    （见 `services/counters.py`），存量里从没被刷到的行要靠这里兜。
+    """
+
+    def _season(self, title: str, *, age=PRUNE_MIN_AGE * 2) -> Media:
+        """一行没有任何资源的 media，连带它所属的作品。
+
+        `created_at` 两级都要显式写老：`prune_empty_media` 只删静置够久的季，
+        而删完季之后作品也要够老才轮得到 `prune_empty_works`。
+        """
+        media = _media(title)
+        media.created_at = utcnow() - age
+        media.work.created_at = utcnow() - age
+        return media
+
+    @pytest.mark.asyncio
+    async def test_deletes_a_season_with_no_resources(self, session) -> None:
+        session.add(self._season("空季"))
+        await session.commit()
+
+        report = await prune_empty_media(session)
+        assert report.deleted == 1
+        assert await session.scalar(select(func.count()).select_from(Media)) == 0
+
+    @pytest.mark.asyncio
+    async def test_keeps_a_season_that_still_has_a_resource(self, session) -> None:
+        live = _media("有资源")
+        live.resources = [_resource(1)]
+        session.add_all([live, self._season("空季")])
+        await session.commit()
+
+        report = await prune_empty_media(session)
+        assert report.deleted == 1
+        assert set(await session.scalars(select(Media.title))) == {"有资源"}
+
+    @pytest.mark.asyncio
+    async def test_does_not_trust_a_stale_resource_count(self, session) -> None:
+        """判定只看有没有资源关联，不看 `media.resource_count`。
+
+        那是事后重算的冗余列，漏刷一次就会让**有资源**的季看着像空壳 ——
+        而删行是不可逆的。
+        """
+        # 有资源、但计数还没刷到（看起来像空壳）
+        live = _media("计数没刷到")
+        live.resources = [_resource(1)]
+        live.resource_count = 0
+        # 真空季、但计数停留在旧值（看起来像有内容）
+        shell = self._season("计数是旧的")
+        shell.resource_count = 7
+        session.add_all([live, shell])
+        await session.commit()
+
+        report = await prune_empty_media(session)
+        assert report.deleted == 1
+        assert set(await session.scalars(select(Media.title))) == {"计数没刷到"}
+
+    @pytest.mark.asyncio
+    async def test_a_freshly_created_season_is_left_alone(self, session) -> None:
+        """刚建出来的不碰 —— 理由同 `prune_empty_works` 的静置窗口。"""
+        session.add(self._season("刚建的", age=timedelta(0)))
+        await session.commit()
+
+        report = await prune_empty_media(session)
+        assert report.deleted == 0
+        assert await session.scalar(select(func.count()).select_from(Media)) == 1
+
+    @pytest.mark.asyncio
+    async def test_zeroes_the_owning_work_counters(self, session) -> None:
+        """删完季要把所属作品的计数滚下来，否则作品会停在旧值上。
+
+        停在旧值的后果不只是显示错：搜索层的空壳过滤走的是真实存在性，但
+        界面上那行「3 季 / 7 条」是直接读这两个冗余列的。
+        """
+        shell = self._season("空季")
+        shell.work.season_count = 3
+        shell.work.resource_count = 7
+        session.add(shell)
+        await session.commit()
+        work_id = shell.work_id
+
+        await prune_empty_media(session)
+        work = await session.get(Work, work_id)
+        assert work is not None, "删季不该连带删掉作品，那是 prune_empty_works 的活"
+        assert (work.season_count, work.resource_count) == (0, 0)
+
+    @pytest.mark.asyncio
+    async def test_limit_caps_the_round_and_reports_the_rest(self, session, monkeypatch) -> None:
+        monkeypatch.setattr(maintenance, "PRUNE_CHUNK", 2)
+        session.add_all([self._season(f"空季{i}") for i in range(5)])
+        await session.commit()
+
+        report = await prune_empty_media(session, limit=3)
+        assert (report.deleted, report.remaining) == (3, 2)
+
+        again = await prune_empty_media(session, limit=3)
+        assert (again.deleted, again.remaining) == (2, 0)
+        assert await session.scalar(select(func.count()).select_from(Media)) == 0
+
+
+class TestPruneEmptyShells:
+    """两级串起来跑：先删空季，再删空作品。
+
+    顺序是这里唯一要紧的事 —— 先删作品的话，那些还挂着空季的作品在
+    `NOT EXISTS media` 下看着不空，一轮下来界面上的「0 条资源」一行都不会少。
+    """
+
+    def _shell(self, title: str) -> Media:
+        media = _media(title)
+        media.created_at = utcnow() - PRUNE_MIN_AGE * 2
+        media.work.created_at = utcnow() - PRUNE_MIN_AGE * 2
+        return media
+
+    @pytest.mark.asyncio
+    async def test_one_round_clears_the_whole_chain(self, session) -> None:
+        """「只有空季的作品」一轮就该整条清掉，季和作品都不剩。
+
+        能一轮收敛是因为作品那一级的 `NOT EXISTS media` 在删完季**之后**才求值。
+        顺序写反的话这里会剩下一个作品 —— 正是线上那行「0 条资源」。
+        """
+        session.add(self._shell("只有空季的作品"))
+        await session.commit()
+
+        report = await prune_empty_shells(session)
+        assert (report.media.deleted, report.works.deleted) == (1, 1)
+        assert await session.scalar(select(func.count()).select_from(Media)) == 0
+        assert await session.scalar(select(func.count()).select_from(Work)) == 0
+
+        again = await prune_empty_shells(session)
+        assert again.deleted == 0, "幂等：没东西可删时一行都不该再动"
+
+    @pytest.mark.asyncio
+    async def test_a_work_with_resources_survives(self, session) -> None:
+        live = _media("有资源")
+        live.resources = [_resource(1)]
+        live.created_at = utcnow() - PRUNE_MIN_AGE * 2
+        live.work.created_at = utcnow() - PRUNE_MIN_AGE * 2
+        session.add_all([live, self._shell("只有空季的作品")])
+        await session.commit()
+
+        await prune_empty_shells(session)
+        assert set(await session.scalars(select(Work.title))) == {"有资源"}
+        assert set(await session.scalars(select(Media.title))) == {"有资源"}
+
+    @pytest.mark.asyncio
+    async def test_limit_applies_per_level_and_needs_another_round(self, session) -> None:
+        """`limit` 是**每级**各自的上限，不是两级合计。
+
+        带 `limit` 时就不再一轮收敛了：没排上的空季会把它们的作品一起留到下一轮。
+        CI 那一步就是带 `--limit` 跑的，所以这条行为必须钉住。
+        """
+        session.add_all([self._shell(f"空壳{i}") for i in range(3)])
+        await session.commit()
+
+        first = await prune_empty_shells(session, limit=2)
+        assert (first.media.deleted, first.media.remaining) == (2, 1)
+        assert first.works.deleted == 2, "删掉的那两个季的作品这一轮就被捎上了"
+        assert first.deleted == 4
+
+        second = await prune_empty_shells(session, limit=2)
+        assert (second.media.deleted, second.works.deleted) == (1, 1)
+        assert await session.scalar(select(func.count()).select_from(Work)) == 0
+
+
 class TestPruneEmptyWorks:
     """空壳作品（没有任何 media 指向）要删掉。
 
-    这些行是 rehome / merge 的残留。搜索默认不过滤它们（见
-    `services/search.py::_apply_filters`：只有 `valid_only` 那条路才要求有
-    校验通过的资源），所以空壳会直接出现在列表页里、点进去什么都没有 ——
-    生产库实测 36,223 行、占作品总数 17.9%。
+    这些行是 rehome / merge 的残留 —— 生产库实测 36,223 行、占作品总数 17.9%。
+    搜索层现在会把它们挡在结果外（见 `services/search.py::_apply_filters` 的
+    空壳过滤），但那只是不显示；行还在库里占着 `norm_key`，仍然要删。
     """
 
     def _work(self, title: str, *, age=PRUNE_MIN_AGE * 2) -> Work:

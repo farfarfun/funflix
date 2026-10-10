@@ -566,35 +566,45 @@ def db_cleanup_resources(
 def db_prune_works(
     limit: Annotated[
         int | None,
-        typer.Option("--limit", help="这一轮最多删多少行，用于分轮磨完积压；默认删到没有为止"),
+        typer.Option("--limit", help="每一级最多删多少行，用于分轮磨完积压；默认删到没有为止"),
     ] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="跳过确认")] = False,
 ) -> None:
-    """删掉没有任何 media 指向的空壳作品。
+    """删掉空壳：先删没有资源的季，再删没有季的作品。
 
-    这些行是 rehome / merge 的残留：media 搬走或被合并掉之后原作品就空了。
-    搜索默认不过滤它们（只有 `--valid-only` 那条路才过滤），所以空壳会直接
-    出现在列表页和关键词搜索里，点进去什么都没有。
+    空壳是一条链 —— 资源没了季就空了，季没了作品就空了。季那一级是 rehome /
+    merge 和资源清理的残留，作品那一级是 media 搬走或被合并掉之后没人负责删的
+    原作品。两级都会在界面上显示成一行「0 条资源」，点进去什么都没有。
 
-    判定只认「真的没有 media 指向」，不信 `season_count` 这类冗余计数 ——
-    理由见 `services/maintenance.py::_empty_work_ids`。
+    顺序不能反：先删作品的话，那些还挂着空季的作品看着不空，一轮下来界面上的
+    「0 条资源」一行都不会少。不带 `--limit` 时一轮就收敛；带了就反复跑到两个
+    删除数都是 0 —— 每一步都是幂等的。
+
+    判定只认「真的没有下级」，不信 `season_count` / `resource_count` 这类冗余
+    计数 —— 理由见 `services/maintenance.py::_empty_work_ids`。
     """
     from funflix.base.db import session_scope
-    from funflix.services.maintenance import prune_empty_works
+    from funflix.services.maintenance import prune_empty_shells
 
-    if not yes and not typer.confirm("将删除没有任何季的空壳作品，继续？"):
+    if not yes and not typer.confirm("将删除没有资源的空壳季和没有季的空壳作品，继续？"):
         raise typer.Abort()
 
     async def _do():
         async with session_scope() as session:
-            return await prune_empty_works(session, limit=limit)
+            return await prune_empty_shells(session, limit=limit)
 
     report = _run(_do)
     _table(
-        [["删除空壳", report.deleted], ["本轮没排上", report.remaining]],
+        [
+            ["删除空壳季", report.media.deleted],
+            ["删除空壳作品", report.works.deleted],
+            ["本轮没排上", report.remaining],
+        ],
         ["项", "数量"],
     )
-    _ok("空壳作品清理完成")
+    if report.remaining:
+        _warn(f"还有 {report.remaining} 行没排上（--limit 截断），再跑一轮")
+    _ok("空壳清理完成")
 
 
 @db_app.command("relink-checks")

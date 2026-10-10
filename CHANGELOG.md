@@ -273,6 +273,22 @@
 
 ### 修复
 
+- **界面上一大片「0 条资源」的作品，点进去什么都没有**。两处都漏了：
+  - 搜索层从不过滤空壳（`services/search.py`）。`valid_only` 那条路要求「有一条
+    校验通过的资源」，而**不带任何筛选**的列表页和关键词搜索把空壳一起吐出去。
+    现在 `SearchQuery` 默认排除「一条资源都没有」的作品，运维要看清理前的全量
+    可以传 `include_empty=True`。判据用真实存在性而不是 `Work.resource_count > 0`
+    —— 后者是事后重算的冗余列，漏刷一次就会把**有资源**的作品也藏起来，藏错比
+    多显示一行严重得多。
+  - `db prune-works` 只删得掉作品那一级（`services/maintenance.py`）。一部作品挂
+    着几个**零资源的季**时，`NOT EXISTS media` 判它不空，于是它留在库里继续显示
+    成「0 条资源」—— 零资源的季本来只由 `refresh_media_counters` 顺手删，而那只
+    覆盖它被调到的那一批，存量漏在外面。新增 `prune_empty_media()` /
+    `prune_empty_shells()`，命令现在先删空季再删空作品。顺序不能反，而按这个
+    顺序不带 `--limit` 时一轮就收敛（作品那一级的 `NOT EXISTS` 是删完季之后才
+    求值的）。删季复用 `refresh_counters_for_media`，不另写一遍 DELETE —— 清
+    `media_tag`、重算标签 `media_count`、把作品计数往上滚一层这三件事那边已经
+    处理好了，自己写一遍必然漏掉其中一件。
 - **一次死锁就让 `repair apply` 每轮只排掉 500 条**（`services/repair/apply.py`）。
   rehome 按 `CHUNK=500` 分批提交，但整步没有并发冲突兜底：一轮领 5000 条分 10
   批，第二批撞上 `DeadlockDetectedError` 就让整步退出 1，**后面 8 批一条都不跑**。

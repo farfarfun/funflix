@@ -610,6 +610,82 @@ class PruneWorksReport:
     remaining: int = 0
 
 
+@dataclass(slots=True)
+class PruneMediaReport:
+    """`prune_empty_media` 的执行结果。
+
+    Attributes:
+        deleted: 删掉的空壳季数。
+        remaining: 这一轮 `limit` 没排上的空壳季数，下一轮接着删。
+    """
+
+    deleted: int = 0
+    remaining: int = 0
+
+
+def _empty_media_ids(cutoff: datetime):
+    """选出「没有任何 resource 关联」且已经静置够久的季 id。
+
+    和 `_empty_work_ids` 同一个判据形状：走 `NOT EXISTS` 而不是信
+    `media.resource_count == 0`。那是 `services/counters.py` 事后重算的冗余列，
+    一条没被刷到的路径就能让它停在旧值上 —— 删行不能建立在可能过期的列上。
+
+    静置窗口的理由也一样：建 media 和挂 `media_resource` 虽然在同一个事务里
+    （`canon/apply.py`），但窗口是给将来可能拆开提交的路径留的余量。
+    """
+    return select(Media.id).where(
+        ~select(media_resource.c.resource_id).where(media_resource.c.media_id == Media.id).exists(),
+        Media.created_at < cutoff,
+    )
+
+
+async def prune_empty_media(session: AsyncSession, *, limit: int | None = None) -> PruneMediaReport:
+    """删掉没有任何资源关联的空壳季。
+
+    这是空壳链条的**上游**：一条资源都没有的季对用户是死链，而它又让所属作品
+    看着"有季"，于是 `prune_empty_works` 的 `NOT EXISTS media` 判据也救不了那部
+    作品 —— 界面上就是一行「0 条资源」点进去什么都没有。先删季、再删作品，
+    两步合起来才能把空壳清干净。
+
+    `refresh_media_counters` 顺手删零资源季只对**它被调到的那一批**生效
+    （见 `services/counters.py`），存量里从没被刷到的行要靠这里兜。
+
+    删除本身复用 `refresh_counters_for_media`，不另写一遍 DELETE：那边已经处理了
+    删季要连带的三件事 —— 清 `media_tag`、把受影响标签的 `media_count` 重算、
+    以及把所属作品的计数往上滚一层。自己写一遍必然漏掉其中一件。
+
+    Args:
+        session: 数据库会话。
+        limit: 这一轮最多删多少行；None 表示删到没有为止。分轮的理由同
+            `prune_empty_works`。
+
+    Returns:
+        删掉的行数，以及这一轮没排上、留给下一轮的行数。
+    """
+    report = PruneMediaReport()
+    cutoff = utcnow() - PRUNE_MIN_AGE
+    budget = limit
+
+    while budget is None or budget > 0:
+        size = PRUNE_CHUNK if budget is None else min(PRUNE_CHUNK, budget)
+        victims = list(await session.scalars(_empty_media_ids(cutoff).limit(size)))
+        if not victims:
+            return report
+        # 这一步**就是**删除：`refresh_media_counters` 对「关联表里查不到」的
+        # media 走孤儿路径，而 `_empty_media_ids` 选出来的恰好全是这种行。
+        await refresh_counters_for_media(session, victims)
+        await session.commit()
+        report.deleted += len(victims)
+        if budget is not None:
+            budget -= len(victims)
+
+    report.remaining = (
+        await session.scalar(select(func.count()).select_from(_empty_media_ids(cutoff).subquery()))
+        or 0
+    )
+    return report
+
+
 def _empty_work_ids(cutoff: datetime):
     """选出「没有任何 media 指向」且已经静置够久的作品 id。
 
@@ -670,6 +746,57 @@ async def prune_empty_works(session: AsyncSession, *, limit: int | None = None) 
         await session.scalar(select(func.count()).select_from(_empty_work_ids(cutoff).subquery()))
         or 0
     )
+    return report
+
+
+@dataclass(slots=True)
+class PruneShellsReport:
+    """`prune_empty_shells` 的执行结果 —— 季和作品两级分开报，便于定位空壳是
+    哪一级产生的。
+
+    Attributes:
+        media: 季级清理结果。
+        works: 作品级清理结果。
+    """
+
+    media: PruneMediaReport = field(default_factory=PruneMediaReport)
+    works: PruneWorksReport = field(default_factory=PruneWorksReport)
+
+    @property
+    def deleted(self) -> int:
+        """两级一共删了多少行。"""
+        return self.media.deleted + self.works.deleted
+
+    @property
+    def remaining(self) -> int:
+        """两级一共还剩多少行没排上 —— 也就是「还要不要再跑一轮」。"""
+        return self.media.remaining + self.works.remaining
+
+
+async def prune_empty_shells(
+    session: AsyncSession, *, limit: int | None = None
+) -> PruneShellsReport:
+    """把空壳清一遍：**先删没有资源的季，再删没有季的作品**。
+
+    顺序不能反。空壳是一条链：资源没了 → 季空了 → 作品空了。先删作品的话，
+    那些"还挂着空季"的作品在 `NOT EXISTS media` 下看着不空，一轮下来界面上的
+    「0 条资源」一行都不会少。
+
+    反过来按这个顺序，不带 `limit` 时**一轮就收敛**：作品那一级的
+    `NOT EXISTS media` 是删完季**之后**才求值的，刚被删空的那批作品这一轮就捎上
+    了。带 `limit` 时才需要反复跑 —— 没排上的空季会把它们的作品一起留到下一轮。
+    每一步都是幂等的，跑到两级的 `deleted` 都是 0 就是真的干净了。
+
+    Args:
+        session: 数据库会话。
+        limit: 每一级各自最多删多少行（不是两级合计），None 表示删到没有为止。
+
+    Returns:
+        两级各自的删除数与剩余数。
+    """
+    report = PruneShellsReport()
+    report.media = await prune_empty_media(session, limit=limit)
+    report.works = await prune_empty_works(session, limit=limit)
     return report
 
 

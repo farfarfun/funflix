@@ -65,6 +65,13 @@ class SearchQuery:
     year: int | None = None
     #: 只返回至少有一条可用资源的作品
     valid_only: bool = False
+    #: 连一条资源都没有的作品也返回。默认 **False** —— 这种行对用户是死链，
+    #: 点进去什么都没有。打开它只有一个用途：运维要看清理前的全量。
+    #:
+    #: 为什么必须在搜索层拦而不是只靠 `db prune-works` 定期删：空壳是流水线
+    #: **持续产出**的中间态（资源被清理 / 季被搬走 / 作品被合并），两次清理之间
+    #: 照样会攒出一批。过滤是常态保障，删除是收尾。
+    include_empty: bool = False
     #: 只返回至少有一条该网盘资源的作品
     provider: Provider | None = None
     limit: int = 20
@@ -139,6 +146,14 @@ def _apply_filters(stmt: Select, query: SearchQuery) -> Select:
         stmt = stmt.where(Work.media_type.in_(sorted(VIDEO_MEDIA_TYPES)))
     if query.year is not None:
         stmt = stmt.where(Work.year == query.year)
+    if not query.include_empty and not query.valid_only:
+        # 空壳作品（一条资源都没有）不进结果。`valid_only` 的条件更严，
+        # 已经蕴含「至少有一条资源」，再加一条 EXISTS 只是让规划器多干活。
+        #
+        # 判据用真实存在性而不是 `Work.resource_count > 0`：那是 `counters.py`
+        # 事后重算的冗余列，漏刷一次就会把**有资源**的作品也藏起来 —— 藏错比
+        # 多显示一行严重得多。代价是多穿一层 EXISTS，与 `valid_only` 同形状。
+        stmt = stmt.where(_resource_exists())
     if query.valid_only:
         # 至少有一条校验通过的资源。用 EXISTS 而不是 JOIN —— 后者会因为
         # 一部作品有多条资源而产生重复行，还得再 DISTINCT。
