@@ -100,6 +100,20 @@
 
 ### 变更
 
+- **空壳过滤的 `count` 从 875ms 降到 337ms**（`services/search.py`）。这道过滤落在
+  翻页要的总数上，每个列表页都要付一次。两处各省一半：
+  - 不碰 `resource` 表。`media_resource.resource_id` 是 `ondelete="CASCADE"` 的
+    外键，关联行不可能比资源行活得久 —— 存在一条关联行就等于存在一条资源，
+    那一层 JOIN 是纯开销（生产库核对：孤儿关联行 0 行，两种写法数出来一致）。
+    875ms → 467ms。
+  - 子查询嵌成两层（`work → media`，`media → media_resource`）而不是平铺 JOIN。
+    语义相同，但规划器先在 `media` 和关联表之间做半连接再和 `work` 散列，不用
+    把 184 万行关联表整个摊进一次大散列（会溢写临时文件）。467ms → 337ms。
+    新增 `_has_any_resource()`，带条件的 `_resource_exists()` 保持平铺 —— 那种
+    情况嵌套没有收益（`valid_only` 444→407ms、`provider` 537→548ms，都在噪声里），
+    因为条件落在 `resource` 上，那张表怎么写都得碰。
+  另外 `valid_only` / `provider` 在场时不再另加空壳过滤：两者都要求「存在一条
+  满足更严条件的资源」，已经蕴含「至少有一条资源」，多加一道只是让规划器白跑。
 - **`clean_title` 补了十类发布噪声，生产库 99,640 行 work 里 34,684 行（34.8%）
   标题会变干净、3,832 个 `norm_key` collapse 掉**（`services/text/normalize.py`）。
   都是拿全库重算一遍扫出来的真实残渣，按行数排：
@@ -279,7 +293,8 @@
     现在 `SearchQuery` 默认排除「一条资源都没有」的作品，运维要看清理前的全量
     可以传 `include_empty=True`。判据用真实存在性而不是 `Work.resource_count > 0`
     —— 后者是事后重算的冗余列，漏刷一次就会把**有资源**的作品也藏起来，藏错比
-    多显示一行严重得多。
+    多显示一行严重得多。生产库实测这不是假想：10,255 行显示「0 条资源」的作品里
+    有 1,831 行**真的有资源**，只是计数没刷到（已重算）。
   - `db prune-works` 只删得掉作品那一级（`services/maintenance.py`）。一部作品挂
     着几个**零资源的季**时，`NOT EXISTS media` 判它不空，于是它留在库里继续显示
     成「0 条资源」—— 零资源的季本来只由 `refresh_media_counters` 顺手删，而那只

@@ -31,7 +31,14 @@ async def _work(session: AsyncSession, title: str) -> Work:
     return work
 
 
-async def _season(session: AsyncSession, work: Work, *, resources: int = 1) -> Media:
+async def _season(
+    session: AsyncSession,
+    work: Work,
+    *,
+    resources: int = 1,
+    provider: Provider = Provider.QUARK,
+    check_status: CheckStatus = CheckStatus.UNCHECKED,
+) -> Media:
     """给作品挂一季，再挂 `resources` 条资源（0 条 = 空季）。"""
     media = Media(
         title=f"{work.title} 第1季",
@@ -48,10 +55,10 @@ async def _season(session: AsyncSession, work: Work, *, resources: int = 1) -> M
         share_id = uuid.uuid4().hex[:12]
         now = utcnow()
         resource = Resource(
-            provider=Provider.QUARK,
+            provider=provider,
             share_id=share_id,
             url=f"https://pan.quark.cn/s/{share_id}",
-            check_status=CheckStatus.UNCHECKED,
+            check_status=check_status,
             first_seen_at=now,
             last_seen_at=now,
         )
@@ -115,3 +122,49 @@ class TestEmptyWorksHiddenByDefault:
         assert titles == ["有资源的作品"]
         assert bare.title not in titles
         assert await count_works(session, SearchQuery(limit=100)) == 1
+
+
+@pytest.mark.asyncio
+class TestNarrowerFiltersSubsumeTheEmptyCheck:
+    """`valid_only` / `provider` 在场时 `_apply_filters` **不再**另加空壳过滤。
+
+    理由是那两个条件都要求「存在一条满足更严条件的资源」，已经蕴含「至少有一条
+    资源」，多加一道只是让规划器白跑一遍。这里盯的就是「蕴含」这个前提 ——
+    它要是不成立，省掉那道过滤就等于把空壳放出去了，而且只在带筛选的路径上漏，
+    最难发现。
+    """
+
+    async def test_provider_filter_still_hides_empty_works(self, session) -> None:
+        await _work(session, "空壳作品")
+        query = SearchQuery(keyword="空壳", provider=Provider.QUARK, limit=100)
+        assert await search_works(session, query) == []
+        assert await count_works(session, query) == 0
+
+    async def test_valid_only_still_hides_empty_works(self, session) -> None:
+        await _work(session, "空壳作品")
+        query = SearchQuery(keyword="空壳", valid_only=True, limit=100)
+        assert await search_works(session, query) == []
+        assert await count_works(session, query) == 0
+
+    async def test_provider_filter_still_excludes_other_providers(self, session) -> None:
+        """省掉空壳过滤不能让 provider 本身变松 —— 挂了别家网盘的作品照样不出现。"""
+        work = await _work(session, "只有百度链接的作品")
+        await _season(session, work, resources=1, provider=Provider.BAIDU)
+
+        quark = SearchQuery(keyword="百度链接", provider=Provider.QUARK, limit=100)
+        assert await search_works(session, quark) == []
+        assert await count_works(session, quark) == 0
+
+        baidu = SearchQuery(keyword="百度链接", provider=Provider.BAIDU, limit=100)
+        assert [w.title for w in await search_works(session, baidu)] == [work.title]
+        assert await count_works(session, baidu) == 1
+
+    async def test_include_empty_still_wins_over_narrower_filters(self, session) -> None:
+        """`include_empty` 管的是空壳那一道，管不到 `provider` —— 两者独立。
+
+        打开它不该把「没有该网盘资源」的作品也放出来，否则运维看到的全量里会
+        混进一批根本不匹配筛选条件的行。
+        """
+        await _work(session, "空壳作品")
+        query = SearchQuery(keyword="空壳", provider=Provider.QUARK, include_empty=True, limit=100)
+        assert await count_works(session, query) == 0

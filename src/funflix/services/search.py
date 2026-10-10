@@ -69,8 +69,10 @@ class SearchQuery:
     #: 点进去什么都没有。打开它只有一个用途：运维要看清理前的全量。
     #:
     #: 为什么必须在搜索层拦而不是只靠 `db prune-works` 定期删：空壳是流水线
-    #: **持续产出**的中间态（资源被清理 / 季被搬走 / 作品被合并），两次清理之间
-    #: 照样会攒出一批。过滤是常态保障，删除是收尾。
+    #: **持续产出**的中间态（作品先建行、media 随后挂上，以及资源被清理 /
+    #: 季被搬走 / 作品被合并），而 `PRUNE_MIN_AGE` 的静置窗口是故意留的 ——
+    #: 删早了会删掉正在入库的行。生产库实测产出速率约每小时 1,000 行，也就是
+    #: 任何时刻都有一千行左右坐在闸门里删不掉。过滤是常态保障，删除是收尾。
     include_empty: bool = False
     #: 只返回至少有一条该网盘资源的作品
     provider: Provider | None = None
@@ -121,12 +123,54 @@ def _resource_exists(*conditions: Any):
 
     比季级搜索多穿一层：资源挂在 `media`（季）上，而筛选的主体是 `work`，
     所以要 `work → media → media_resource → resource` 走完四张表。
+
+    只问「有没有资源」不要用这个，用 `_has_any_resource` —— 那条路不必碰
+    `resource` 表。
+
+    两个函数的子查询形状**故意不一样**，不要去统一：`_has_any_resource` 嵌成
+    两层能省一半时间，而这里带条件的情况嵌起来没有收益（生产库 `count` 全量实测，
+    `valid_only` 444ms→407ms、`provider` 537ms→548ms，都在噪声里）—— 条件落在
+    `resource` 上，那张表无论怎么写都得碰，嵌套省掉的恰恰是不必碰它这件事。
     """
     return (
         select(media_resource.c.media_id)
         .join(Media, Media.id == media_resource.c.media_id)
         .join(Resource, Resource.id == media_resource.c.resource_id)
         .where(Media.work_id == Work.id, *conditions)
+        .exists()
+    )
+
+
+def _has_any_resource():
+    """「这部作品下至少有一条资源」—— 不带条件时的专用形状，只走三张表。
+
+    **为什么可以不碰 `resource` 表**：`media_resource.resource_id` 是
+    `ondelete="CASCADE"` 的外键（见 `models/association.py`），关联行不可能比
+    它指向的资源行活得久 —— 存在一条关联行就等于存在一条资源。生产库核对过：
+    孤儿关联行 0 行，两种写法数出来一致。
+
+    **为什么要嵌成两层**而不是 `media JOIN media_resource`：两种写法语义相同，
+    但规划器对嵌套形式给的计划好得多 —— 它先在 `media` 和 `media_resource`
+    之间做半连接，再和 `work` 散列，不用把 184 万行关联表整个摊进一次大散列。
+
+    生产库实测（31 万作品 / 32 万季 / 184 万关联，`count` 全量、缓存预热后中位）：
+
+    | 写法 | 耗时 |
+    | --- | --- |
+    | 不带空壳过滤（基线） | 110ms |
+    | 四表 `_resource_exists()` | 875ms |
+    | 三表（去掉 `resource`） | 467ms |
+    | 嵌套两层（本函数） | **337ms** |
+
+    `count` 是翻页每次都要的，所以这 2.6 倍直接落在每个列表页上。拿 20 行的
+    `search` 两种写法都是亚毫秒（半连接够到 `limit` 就短路），差别只在 `count`。
+    """
+    return (
+        select(Media.id)
+        .where(
+            Media.work_id == Work.id,
+            select(media_resource.c.media_id).where(media_resource.c.media_id == Media.id).exists(),
+        )
         .exists()
     )
 
@@ -146,14 +190,17 @@ def _apply_filters(stmt: Select, query: SearchQuery) -> Select:
         stmt = stmt.where(Work.media_type.in_(sorted(VIDEO_MEDIA_TYPES)))
     if query.year is not None:
         stmt = stmt.where(Work.year == query.year)
-    if not query.include_empty and not query.valid_only:
-        # 空壳作品（一条资源都没有）不进结果。`valid_only` 的条件更严，
-        # 已经蕴含「至少有一条资源」，再加一条 EXISTS 只是让规划器多干活。
+    # 下面两个筛选都要求「存在一条满足更严条件的资源」，已经蕴含了「至少有一条
+    # 资源」。它们在场时再加一道空壳过滤只是让规划器多干一遍活，结果一行不差。
+    narrower = query.valid_only or query.provider is not None
+    if not query.include_empty and not narrower:
+        # 空壳作品（一条资源都没有）不进结果。
         #
         # 判据用真实存在性而不是 `Work.resource_count > 0`：那是 `counters.py`
         # 事后重算的冗余列，漏刷一次就会把**有资源**的作品也藏起来 —— 藏错比
-        # 多显示一行严重得多。代价是多穿一层 EXISTS，与 `valid_only` 同形状。
-        stmt = stmt.where(_resource_exists())
+        # 多显示一行严重得多。生产库实测过这不是假想：10,255 行显示「0 条资源」
+        # 的作品里有 1,831 行**真的有资源**，只是计数没刷到。
+        stmt = stmt.where(_has_any_resource())
     if query.valid_only:
         # 至少有一条校验通过的资源。用 EXISTS 而不是 JOIN —— 后者会因为
         # 一部作品有多条资源而产生重复行，还得再 DISTINCT。
