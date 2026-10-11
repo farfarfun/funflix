@@ -4,6 +4,25 @@
 
 ## [未发布]
 
+## [1.0.34] - 2026-10-10
+
+### 破坏性变更
+
+- **作品身份与搜索结果改为两层模型。** `media` 不再以
+  `(norm_key, media_type, year)` 标识；现在 `work.norm_key` 唯一，`media` 以
+  `(work_id, season)` 唯一。搜索结果从季级 media 聚合为作品级 work，因此依赖旧
+  身份列、逐季结果数量或旧去重语义的调用方必须改为读取 work 及其季级关联。
+
+### 迁移
+
+- 升级现有数据库时，先执行 `funflix db upgrade d6e7f8a9b0c1`，再执行
+  `funflix db reset --keep-documents`、`funflix db upgrade head`、
+  `funflix parse --limit 20000`、`funflix db relink-checks`，最后按需运行
+  `funflix canon resolve --apply` 和 `funflix canon merge --apply`。该流程保留原文、
+  校验历史和采集源，但会重建 media/work 数据。
+- `c5d6e7f8a9b0` 的降级只能恢复表结构；收口后的同一作品多季可能无法重新满足旧的
+  `(norm_key, media_type, year)` 唯一约束。迁移会拒绝这种降级，须先人工处理重复数据。
+
 ### 新增
 
 - **作品实体改成两层：`work`（一部剧）+ `media`（一季）**。搜「大主宰」原先返回

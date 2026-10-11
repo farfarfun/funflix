@@ -5,6 +5,7 @@ build/
 dist/
 .venv/
 venv/
+uv.lock
 
 .env
 *.db
