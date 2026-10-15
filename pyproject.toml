@@ -7,6 +7,13 @@ name = "funflix"
 version = "1.0.35"
 description = "影视资源分享文本的结构化采集、解析与网盘链接校验"
 readme = "README.md"
+# 组织统一下限是 3.10，这里抬到 3.12 是有依据的例外（todo-list#970 核实）：
+# 源码用到 3.11 的 `enum.StrEnum`（base/enums.py、models/tag.py 共 7 个枚举，
+# 直接落成 VARCHAR 值，换成 `(str, Enum)` 在 3.10/3.11 上 `str()` 会变成
+# `Class.NAME`，会改变入库和日志的内容）、3.11 的 `datetime.UTC`，以及 3.12 的
+# PEP 695 泛型写法（`class Page[T]`、`def _chunks[T]`）。
+# 同时本包的唯一部署形态是 fundeploy 管的 funflix-api 服务，机器上本来就要求
+# Python 3.12+，降低下限换不来任何可装性收益。
 requires-python = ">=3.12"
 license = "MIT"
 keywords = ["media", "netdisk", "sqlalchemy"]
