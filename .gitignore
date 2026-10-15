@@ -6,6 +6,9 @@ dist/
 .venv/
 venv/
 
+# uv 的锁文件是本地生成物，不入版本管理（组织规范 §5）
+uv.lock
+
 .env
 *.db
 *.db-wal

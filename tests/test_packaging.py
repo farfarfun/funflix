@@ -11,7 +11,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-#: 全组织统一的 Python 下限。funflix-api 也是这个值。
+#: 本包的 Python 下限。组织统一下限是 3.10，这里是记录在 `pyproject.toml`
+#: 注释里的例外（StrEnum / datetime.UTC / PEP 695 泛型）。funflix-api 同值。
 PYTHON_FLOOR = (3, 12)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
