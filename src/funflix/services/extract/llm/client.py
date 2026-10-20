@@ -150,11 +150,10 @@ class OpenAICompatClient:
         return self._client
 
     async def extract(self, system: str, user: str) -> LLMResult:
-        """以强制工具调用的方式请求一次 chat completion，并解析出工具参数。
+        """请求一次 chat completion，并解析工具参数。
 
-        `tool_choice` 被硬编码为 `TOOL_SCHEMA` 对应的函数，不给模型"用自然语言
-        回答"的选项，保证返回值要么是合法的工具参数，要么在 `_extract_tool_arguments`
-        里按具体失败原因抛出 `LLMCallError`。
+        使用自动工具选择以兼容不支持强制指定工具的推理模型；未调用工具时
+        `_extract_tool_arguments` 会抛出 `LLMCallError`。
 
         Args:
             system: system prompt。
@@ -182,8 +181,7 @@ class OpenAICompatClient:
                     {"role": "user", "content": user},
                 ],
                 tools=[self._tool_schema],
-                # 强制走工具，不给模型"用自然语言回答"的选项
-                tool_choice={"type": "function", "function": {"name": self._tool_name}},
+                tool_choice="auto",
             )
         except APIError as exc:
             # SDK 自己重试完 `max_retries` 次之后仍然失败的，会原样抛 `APIError`

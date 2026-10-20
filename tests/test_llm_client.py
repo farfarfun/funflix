@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -44,6 +45,32 @@ def _client(exc: BaseException) -> OpenAICompatClient:
 
 
 class TestGatewayFailuresAreWrapped:
+    async def test_thinking_model_can_use_automatic_tool_choice(self) -> None:
+        class _Gateway:
+            def __init__(self) -> None:
+                self.chat = self.completions = self
+
+            async def create(self, **kwargs: Any) -> Any:
+                assert kwargs["tool_choice"] == "auto"
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        function=SimpleNamespace(arguments='{"items": []}')
+                                    )
+                                ]
+                            )
+                        )
+                    ],
+                    usage=None,
+                )
+
+        client = OpenAICompatClient(base_url="https://gateway.invalid/v1", api_key="k", model="m")
+        client._client = _Gateway()
+        assert (await client.extract("sys", "user")).payload == {"items": []}
+
     async def test_api_error_becomes_llm_call_error(self) -> None:
         # 刻意不构造真的 `RateLimitError` —— 它要求传一个 SDK 版本相关的
         # response 对象（openai 3.x 换到了 httpx2），测试不该绑在那上面。

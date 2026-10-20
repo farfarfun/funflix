@@ -794,6 +794,9 @@ async def resolve_canon(
     if dry_run:
         return report
 
+    # 后续模型调用可能持续一小时以上；释放扫描留下的只读事务和连接。
+    await session.rollback()
+
     gate = asyncio.Semaphore(concurrency)
     pacer = _Pacer(call_interval)
 

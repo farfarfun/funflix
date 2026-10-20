@@ -1465,6 +1465,8 @@ class TestClassifyPersistsAsItGoes:
         real_extract = client.extract
 
         async def watched(system: str, user: str):
+            if not events:
+                assert not session.in_transaction()
             events.append("调用")
             return await real_extract(system, user)
 
