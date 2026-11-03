@@ -49,6 +49,8 @@ class TestBinding:
         # TimestampMixin 用的是本仓那份，不是 funauth 自带的
         assert {"created_at", "updated_at"} <= set(table.columns.keys())
         assert {c.name for c in table.constraints if c.name} >= {"uq_user_username"}
+        assert {"oidc_issuer", "oidc_subject"} <= set(table.columns.keys())
+        assert {c.name for c in table.constraints if c.name} >= {"uq_user_oidc_identity"}
 
     def test_invite_table_shape(self) -> None:
         table = InviteCode.__table__

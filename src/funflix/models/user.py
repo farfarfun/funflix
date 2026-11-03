@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from funauth import UserMixin
+from sqlalchemy.orm import Mapped, mapped_column
 
 from funflix.models.base import Base, TimestampMixin
 
@@ -27,4 +28,10 @@ class User(UserMixin, TimestampMixin, Base):
 
     __tablename__ = "user"
 
-    __table_args__ = (sa.UniqueConstraint("username", name="uq_user_username"),)
+    __table_args__ = (
+        sa.UniqueConstraint("username", name="uq_user_username"),
+        sa.UniqueConstraint("oidc_issuer", "oidc_subject", name="uq_user_oidc_identity"),
+    )
+
+    oidc_issuer: Mapped[str | None] = mapped_column(sa.String(255))
+    oidc_subject: Mapped[str | None] = mapped_column(sa.String(255))
