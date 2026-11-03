@@ -214,9 +214,6 @@ funflix source collect
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `FUNFLIX_DATABASE_URL` | `sqlite+aiosqlite:///~/.farfarfun/funflix/funflix.db` | 切 PG 改成 `postgresql+asyncpg://...`；默认是绝对路径，换目录执行读写的也是同一份库 |
-| `FUNFLIX_SESSION_SECRET` | 随机（每次重启变化） | 会话 cookie 签名密钥；多进程/需跨重启保留会话的部署必须固定配置 |
-| `FUNFLIX_SESSION_MAX_AGE` | `2592000`（30 天） | 会话 cookie 有效期（秒） |
-| `FUNFLIX_SESSION_COOKIE_SECURE` | `false` | 会话 cookie 是否加 Secure 标记；确认部署链路全程 HTTPS 后再打开 |
 | `FUNFLIX_REGISTRATION_ENABLED` | `false` | 是否开放自助注册；默认关闭，账号由 `funflix user create` 创建 |
 | `FUNFLIX_LOG_LEVEL` | `INFO` | |
 | `FUNFLIX_INGEST_MAX_BATCH` | `200` | 单批提交上限 |

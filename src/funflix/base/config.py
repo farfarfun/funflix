@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from functools import lru_cache
 from pathlib import Path
 
@@ -141,18 +140,6 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
 
     # --- 账号体系（见 api/v1/auth.py）---
-    #: 会话 cookie 的签名密钥。不配的话每次进程重启都会生成一个新的随机值——
-    #: 单进程部署够用（重启后老会话失效，重新登录即可）；多进程/会跨重启保留
-    #: 会话的生产部署，必须显式配置 FUNFLIX_SESSION_SECRET 为一个固定的随机串，
-    #: 否则同一个 cookie 在不同进程间无法互相验证。
-    session_secret: str = Field(default_factory=lambda: secrets.token_hex(32))
-    #: 会话 cookie 有效期，默认 30 天
-    session_max_age: int = 60 * 60 * 24 * 30
-    #: 是否给会话 cookie 加 Secure 标记（只在 HTTPS 下才会被发送）。
-    #: 默认关闭——这个服务常见部署形态是自建/反代到内网 HTTP，强制 Secure
-    #: 会导致没走 HTTPS 的场景下 cookie 直接发不出去、登录了也白登录。
-    #: 确认部署链路全程 HTTPS 后，生产可显式配置 FUNFLIX_SESSION_COOKIE_SECURE=true。
-    session_cookie_secure: bool = False
     #: 注册入口默认开启——真正的闸门是邀请码（`invite_code` 表），注册出来的
     #: 账号一律是 `guest`、碰不到运维区，而且表里没签发过码时谁都注册不了。
     #: 从前默认关闭是因为那时注册出来的就是「运维」账号，公网上谁都能自己开一个；

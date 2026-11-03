@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funflix"
-version = "1.0.37"
+version = "1.0.38"
 description = "影视资源分享文本的结构化采集、解析与网盘链接校验"
 readme = "README.md"
 # 组织统一下限是 3.10，这里抬到 3.12 是有依据的例外（todo-list#970 核实）：
